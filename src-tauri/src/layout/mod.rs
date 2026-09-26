@@ -772,6 +772,12 @@ impl Engine {
                 }
                 self.resize_column(width as i64, false)?;
             }
+            Command::SetWindowColumnWidth { window_id, width } => {
+                if width == 0 {
+                    return Err(invalid("Column width must be positive"));
+                }
+                self.resize_window_column(&window_id, width as i64, false)?;
+            }
             Command::AdjustColumnWidth { delta } => {
                 self.resize_column(delta as i64, true)?;
             }

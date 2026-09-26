@@ -84,6 +84,7 @@ export type Command =
   | { type: 'moveWindow'; direction: Direction }
   | { type: 'cycleWidth' }
   | { type: 'setColumnWidth'; width: number }
+  | { type: 'setWindowColumnWidth'; windowId: WindowId; width: number }
   | { type: 'adjustColumnWidth'; delta: number }
   | { type: 'adjustWindowHeight'; delta: number }
   | { type: 'resetWindowHeights' }

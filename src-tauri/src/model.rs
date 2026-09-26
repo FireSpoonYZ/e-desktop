@@ -197,6 +197,10 @@ pub enum Command {
     SetColumnWidth {
         width: u32,
     },
+    SetWindowColumnWidth {
+        window_id: WindowId,
+        width: u32,
+    },
     AdjustColumnWidth {
         delta: i32,
     },

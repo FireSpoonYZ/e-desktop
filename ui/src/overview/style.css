@@ -9,7 +9,14 @@
 .overview-page > header { margin-bottom: 12px; }
 .overview-scroll { overflow-x: auto; padding: 3px 3px 9px; }
 .overview-columns { display: flex; align-items: stretch; gap: 10px; width: max-content; min-width: 100%; }
-.overview-column { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+.overview-column { position: relative; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+.overview-page[data-drop-ready="true"] { outline: 2px dashed var(--focus); outline-offset: 2px; }
+.overview-page[data-drop-target="true"] { outline-style: solid; box-shadow: inset 0 0 0 2px var(--focus); }
+.overview-width { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.overview-width input { box-sizing: border-box; width: 100%; min-width: 0; color: var(--text); background: var(--background); border: 1px solid var(--border); padding: 4px; }
+.overview-resize { position: absolute; top: 0; bottom: 0; right: -6px; width: 10px; padding: 0; border: 0; border-radius: 0; background: transparent; cursor: ew-resize; touch-action: none; }
+.overview-resize:not(:disabled):hover, .overview-resize:not(:disabled):active { background: var(--focus); opacity: .6; }
+.overview-window-focus:not(:disabled) { cursor: grab; touch-action: none; user-select: none; }
 .overview-window { display: flex; flex-direction: column; min-width: 0; background: var(--background); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .overview-window[data-focused="true"] { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
 .overview-window-focus { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; flex: 1; width: 100%; min-height: 100px; padding: 12px; text-align: left; border: 0; border-radius: 0; background: transparent; overflow-wrap: anywhere; }

@@ -80,6 +80,7 @@ enum StrictCommand {
     MoveWindow { direction: Direction },
     CycleWidth {},
     SetColumnWidth { width: u32 },
+    SetWindowColumnWidth { window_id: String, width: u32 },
     AdjustColumnWidth { delta: i32 },
     AdjustWindowHeight { delta: i32 },
     ResetWindowHeights {},
