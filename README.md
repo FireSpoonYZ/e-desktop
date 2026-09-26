@@ -50,6 +50,10 @@ Windows 调试可执行文件：`target/debug/e-desktop.exe`。去掉 `--debug` 
 | 上述组合增加 `Shift` | 把当前窗口移至对应页面 |
 | `Ctrl+Alt+N` | 新增/进入空页面 |
 | `Ctrl+Alt+R` | 循环列宽：1/3、1/2、2/3、完整视口 |
+| `Ctrl+Alt+Left/Right` | 向左 / 右滚动当前显示器视口 |
+| `Ctrl+Alt+Shift+Left/Right` | 减少 / 增加当前列宽 50 物理像素 |
+| `Ctrl+Alt+Shift+Up/Down` | 增加 / 减少聚焦窗口高度 50 物理像素 |
+| `Ctrl+Alt+Shift+R` | 当前列恢复等高 |
 | `Ctrl+Alt+C` | 居中当前窗口 |
 | `Ctrl+Alt+V` | 切换浮动 |
 | `Ctrl+Alt+F` | 切换布局全屏（填满预留后的视口） |
@@ -57,7 +61,9 @@ Windows 调试可执行文件：`target/debug/e-desktop.exe`。去掉 `--debug` 
 | `Ctrl+Alt+Backspace` | 暂停并还原 |
 | `Ctrl+Alt+Q` | 还原后退出 |
 
-全局快捷键可能与现有软件冲突，注册失败会显示具体组合；其余已注册组合仍可使用。此次测试机的 `Ctrl+Alt+L`、`Ctrl+Alt+R` 被占用，对应功能仍有命令面板入口，列宽操作已通过面板实测。当前尚无快捷键配置界面。在空页面或没有聚焦窗口时，先选择一个窗口再执行移动、列宽等动作。
+全局快捷键可能与现有软件冲突，注册失败会显示具体组合；其余已注册组合仍可使用。此次测试机的 `Ctrl+Alt+L`、`Ctrl+Alt+R` 被占用，对应功能仍有命令面板入口，列宽操作已通过面板实测。支持通过 JSON 文件修改快捷键并自动热加载，尚无设置界面。在空页面或没有聚焦窗口时，先选择一个窗口再执行移动、列宽等动作。
+
+顶栏的横向滚动区支持按钮、滚轮与触控板；命令面板提供列宽、高度调整及恢复等高。尺寸命令仅适用于平铺、非全屏窗口。配置还支持按应用名和标题设置新窗口的浮动、列宽、显示器及页面；已有窗口不因重载而重新排列。格式、默认路径和示例见 [配置文档](docs/configuration.md)。
 
 ## 可复现的 Windows 实窗检查
 
@@ -65,12 +71,14 @@ Windows 调试可执行文件：`target/debug/e-desktop.exe`。去掉 `--debug` 
 powershell -NoProfile -File scripts/windows-smoke.ps1
 ```
 
-脚本创建三个可丢弃的 WinForms 窗口，Rust example 将操作严格限定到该测试进程。检查列宽/堆叠、浮动切页恢复、布局全屏、可用显示器之间的移动、停用还原、正常关闭和失效 ID 拒绝，并输出 JSON 证据路径。不要并发运行该脚本。它不会启动完整 Tauri GUI；GUI 的验证记录见下文。
+脚本创建三个可丢弃的 WinForms 窗口，Rust example 将操作严格限定到该测试进程。检查任意列宽/增减列宽、堆叠高度调整/恢复等高、自由滚动、浮动切页恢复、布局全屏、可用显示器之间的移动、停用还原、正常关闭和失效 ID 拒绝，并输出 JSON 证据路径。不要并发运行该脚本。它不会启动完整 Tauri GUI；GUI 的验证记录见下文。
 
 ## 文档与边界
 
 - [实现契约](docs/implementation-contract.md)
+- [配置、快捷键和窗口规则](docs/configuration.md)
 - [Windows 验证记录](docs/validation/windows-2026-09-26.md)
+- [尺寸、滚动、配置和规则验收](docs/validation/windows-2026-09-26-niri-next.md)
 - [Windows 后端边界与人工检查](src-tauri/src/platform/windows/SMOKE.md)
 - [macOS 接入与验证步骤](src-tauri/src/platform/macos/README.md)
 

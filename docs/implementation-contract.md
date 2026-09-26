@@ -8,9 +8,10 @@ Shared source of truth: `src-tauri/src/model.rs` and `ui/src/model.ts`. Rust own
 - `get_snapshot() -> Snapshot`; `execute(command) -> Result<Snapshot, AppError>`; JS calls `invoke('execute', { command })`.
 - `snapshot` events carry the full state. UI subscribes before fetching its initial snapshot and treats subsequent events as authoritative.
 - Native surface commands: `open_surface({surface, monitorId?})`, `dismiss_surface({surface})`, `quit()`. Surface is `overview` or `commands`; invalid explicit monitor IDs are rejected. `surface-opened` carries the selected monitor ID or null.
-- Commands: refresh, enable, disable, focusWindow(windowId), focusDirection(direction), switchPage(monitorId,pageId), addPage(monitorId), moveWindowToPage(windowId,pageId), moveWindow(direction), cycleWidth, centerFocused, scroll(monitorId,delta), toggleFloating, toggleFullscreen, closeWindow(windowId). Directions are left/right/up/down. Scroll delta is signed physical horizontal pixels. Implicit commands address the focused window or active monitor.
+- Commands: refresh, enable, disable, focusWindow(windowId), focusDirection(direction), switchPage(monitorId,pageId), addPage(monitorId), moveWindowToPage(windowId,pageId), moveWindow(direction), cycleWidth, setColumnWidth(width), adjustColumnWidth(delta), adjustWindowHeight(delta), resetWindowHeights, centerFocused, scroll(monitorId,delta), toggleFloating, toggleFullscreen, closeWindow(windowId). Directions are left/right/up/down. Scroll delta is signed physical horizontal pixels. Implicit commands address the focused window or active monitor.
 - Rect uses physical screen pixels: signed x/y and unsigned width/height, including negative monitor origins. Native work areas remain unchanged. MonitorState.viewport reserves a 44 CSS px topbar and 56 CSS px rail, converted using scaleFactor.
 - Monitors own independent pages and activePage; pages retain viewportX, ordered columns and floatingWindows. Columns contain top-to-bottom window IDs. Native metadata lives in Snapshot.windows[].native.
+- Sizing commands (including cycleWidth) require a focused tiled, non-fullscreen window. Width is clamped to the viewport; explicit zero is rejected. Stack heights use session-local per-window weights, always positive and exactly filling the viewport; reset restores equal shares. Impossible geometry (more rows than viewport pixels) rejects the transaction.
 - Floating windows leave tiling. Layout fullscreen fills the usable viewport; it is not OS-native fullscreen. Existing floating geometry survives minimized/iconic enumeration. Layout state is session-local.
 - BackendStatus separates availability and individual capabilities. `ready` does not imply every capability. No sample/fabricated windows or silent unsupported enumeration.
 
@@ -32,6 +33,7 @@ Engine::new(BackendStatus) -> Self;
 Engine::snapshot(&self) -> &Snapshot;
 Engine::set_backend(&mut self, BackendStatus); // no layout reset
 Engine::set_viewports(&mut self, BTreeMap<MonitorId, Rect>);
+Engine::set_window_rules(&mut self, Vec<WindowRule>) -> Result<(), AppError>; // validates atomically, new IDs only
 Engine::reconcile(&mut self, SystemSnapshot) -> Result<Transition, AppError>;
 Engine::dispatch(&mut self, Command) -> Result<Transition, AppError>;
 
@@ -45,7 +47,7 @@ Backend::restore(&mut self) -> Result<(), AppError>;
 
 `Transition` contains an updated snapshot and ordered native actions. Commands commit layout transactionally. Close emits a request; a window is removed after native enumeration confirms its lifetime ended.
 
-Integration creates and retains Backend on a dedicated OS thread, including non-Send macOS AX objects. A bounded request queue separates IPC from native work. Blocking native requests never run on the WebView/Cocoa main thread. Native enumeration is polled at 500 ms while idle. Runtime backend status is synchronized into Engine before capability checks. Viewport overrides are supplied before reconciliation.
+Integration creates and retains Backend on a dedicated OS thread, including non-Send macOS AX objects. A bounded request queue separates IPC from native work. Blocking native requests never run on the WebView/Cocoa main thread. Native enumeration and configuration contents are checked on a 500 ms deadline, including under queued command traffic. Runtime backend status is synchronized into Engine before capability checks. Viewport overrides are supplied before reconciliation.
 
 Background reconciliation does not force foreground focus. Unchanged placements are skipped when the observed native state still matches. Native apply failures refresh metadata; Placement/Restore failures pause automatic layout and attempt recovery.
 
@@ -67,7 +69,11 @@ Each monitor has a topbar and rail; dynamic labels use `topbar-N` and `pagerail-
 
 All components receive `{snapshot, onCommand, busy?}`. TopBar also receives `onOpenOverview`, `onOpenCommands`, optional `onQuit`; PageRail accepts optional monitorId; Overview and CommandPalette accept onDismiss. Components do not invoke IPC or implement a second layout state machine. App owns IPC errors; shell consumes rejected promises, while transient surfaces dismiss only after successful commands.
 
-Overview displays actual metadata and geometry with explicit unavailable previews. Command palette handles selection, IME composition, focus containment and escape dismissal. Native thumbnails, pointer-follow focus, networking/mobile/LLM services and persistent layout configuration are outside this iteration.
+Overview displays actual metadata and geometry with explicit unavailable previews. Command palette handles selection, IME composition, focus containment and escape dismissal. Topbar scrolling targets only its selected monitor; the dedicated wheel region converts to physical pixels and batches input with one request in flight. Palette sizing commands use the same Rust command contract.
+
+JSON configuration supplies replace-all shortcut bindings and ordered initial window rules; see [configuration](configuration.md). Invalid configuration retains the last accepted mapping/rules. Registration failures preserve the old mapping with best-effort rollback and visible errors. Rule matching is literal case-insensitive app/title substring matching, with later matching action fields taking precedence. Rules affect only new IDs; paused discovery does not perform native actions. Missing monitor/page targets fall back without creating pages or activating background pages.
+
+Native thumbnails, pointer-follow focus, networking/mobile/LLM services and persistent session layouts remain outside this iteration.
 
 ## Validation
 
