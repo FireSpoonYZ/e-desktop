@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { Rect } from '../model';
 
@@ -13,7 +13,51 @@ export interface PreviewStatus {
   state: 'ready' | 'hidden' | 'unavailable' | 'sourceGone' | 'failed';
   message: string;
 }
+export type PreviewRequest = (session: number, slots: PreviewSlot[]) => Promise<PreviewStatus[]>;
 type Bounds = Pick<DOMRectReadOnly, 'left' | 'top' | 'right' | 'bottom'>;
+
+/** Coalesce geometry updates; only the latest reply may update this opening. */
+export function previewQueue(session: number, request: PreviewRequest, receive: (statuses: PreviewStatus[]) => void) {
+  let slots: PreviewSlot[] = [], revision = 0, pending = false, disposed = false;
+  const push = (next: PreviewSlot[]) => {
+    if (disposed) return;
+    slots = next; revision++;
+    void drain();
+  };
+  const drain = async () => {
+    if (pending) return;
+    pending = true;
+    const current = revision, sent = slots;
+    try {
+      const statuses = await request(session, sent);
+      if (!disposed && current === revision) receive(statuses);
+    } catch (cause) {
+      if (!disposed && current === revision) receive(sent.map(({ windowId }) => ({ windowId, state: 'failed',
+        message: cause && typeof cause === 'object' && 'message' in cause ? String(cause.message) : String(cause) })));
+    } finally {
+      pending = false;
+      if (current !== revision) void drain();
+    }
+  };
+  return { push, refresh: () => { if (!pending && !disposed && slots.length) push(slots); },
+    dispose: () => { if (!disposed) { push([]); disposed = true; } } };
+}
+
+export function usePreviewFeed(session: number | null, request?: PreviewRequest) {
+  const [statuses, setStatuses] = useState<Record<string, PreviewStatus>>({});
+  const queue = useRef<ReturnType<typeof previewQueue> | null>(null);
+  useLayoutEffect(() => {
+    setStatuses({});
+    if (session === null || !request) return;
+    const feed = previewQueue(session, request, (next) => setStatuses(Object.fromEntries(next.map((item) => [item.windowId, item]))));
+    queue.current = feed;
+    // DWM updates pixels itself. This only refreshes source availability/registration.
+    const timer = setInterval(feed.refresh, 500);
+    return () => { clearInterval(timer); feed.dispose(); queue.current = null; };
+  }, [session, request]);
+  const publish = useCallback((slots: PreviewSlot[]) => queue.current?.push(slots), []);
+  return { statuses, publish };
+}
 
 /** Round inward: fractional CSS pixels must never paint into adjacent controls. */
 export function physicalPreviewSlot(windowId: string, bounds: Bounds, visible: Bounds, scale: number): PreviewSlot | null {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import test from 'node:test';
 import ts from 'typescript';
 import { createElement } from 'react';
@@ -14,7 +14,7 @@ function moduleUrl(relative) {
     target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.ReactJSX,
   } });
   outputText = outputText.replace(/from ['"]([^'"]+)['"]/g, (_, specifier) => `from '${specifier.startsWith('.')
-    ? moduleUrl(new URL(`${specifier}.ts`, file).href) : import.meta.resolve(specifier)}'`);
+    ? moduleUrl(new URL(`${specifier}${existsSync(new URL(`${specifier}.ts`, file)) ? ".ts" : ".tsx"}`, file).href) : import.meta.resolve(specifier)}'`);
   const url = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
   modules.set(file.href, url);
   return url;

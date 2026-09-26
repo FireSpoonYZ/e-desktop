@@ -20,6 +20,7 @@ use crate::{
         Snapshot,
     },
     platform::Backend,
+    preview::{PreviewSession, PreviewSlot, PreviewStatus},
     rules::WindowRule,
     shortcuts::{Shortcuts, normalize_key},
 };
@@ -54,6 +55,11 @@ enum Request {
     Command(Command, Option<Reply>),
     Show(Surface, Option<String>),
     Dismiss(Surface),
+    Previews(
+        u64,
+        Vec<PreviewSlot>,
+        mpsc::SyncSender<Result<Vec<PreviewStatus>, AppError>>,
+    ),
     Shortcut(String),
     Quit,
 }
@@ -121,6 +127,29 @@ fn dismiss_surface(surface: String, state: tauri::State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+async fn sync_previews(
+    window: tauri::WebviewWindow,
+    session: u64,
+    slots: Vec<PreviewSlot>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PreviewStatus>, AppError> {
+    if window.label() != "overview" {
+        return Err(error(
+            ErrorCode::InvalidCommand,
+            "实时预览仅供概览窗口使用。",
+        ));
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    send(&state, Request::Previews(session, slots, tx))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv()
+            .map_err(|_| error(ErrorCode::BackendUnavailable, "窗口控制器已停止。"))?
+    })
+    .await
+    .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?
+}
+
+#[tauri::command]
 fn quit(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     send(&state, Request::Quit)
 }
@@ -134,6 +163,7 @@ struct Controller {
     placements: Placements,
     animation: ScrollAnimation,
     animation_duration: Duration,
+    preview_session: PreviewSession,
 }
 
 impl Controller {
@@ -146,6 +176,7 @@ impl Controller {
             window_rules: vec![],
             placements: Placements::new(),
             animation: ScrollAnimation::default(),
+            preview_session: PreviewSession::default(),
             animation_duration: Duration::from_millis(u64::from(
                 Config::default().animation_duration_ms,
             )),
@@ -314,6 +345,7 @@ impl Controller {
     }
 
     fn stop(&mut self) -> Result<(), AppError> {
+        self.clear_previews();
         self.animation.cancel();
         self.placements.clear();
         // Always turn off automatic reflow, even when one native restore fails.
@@ -377,6 +409,57 @@ impl Controller {
             transition.actions
         };
         self.apply(&actions)
+    }
+
+    fn clear_previews(&mut self) {
+        self.preview_session.end();
+        #[cfg(target_os = "windows")]
+        if let Some(backend) = &mut self.backend {
+            backend.clear_previews();
+        }
+    }
+
+    fn preview_capable(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self
+            .backend
+            .as_ref()
+            .is_some_and(Backend::previews_available);
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+
+    fn sync_previews(
+        &mut self,
+        app: &tauri::AppHandle,
+        session: u64,
+        slots: &[PreviewSlot],
+    ) -> Result<Vec<PreviewStatus>, AppError> {
+        // An old cleanup/request must not clear or repopulate a newly opened overview.
+        if !self.preview_session.accepts(session) {
+            return Ok(vec![]);
+        }
+        if slots.len() > self.engine.snapshot().windows.len() {
+            return Err(error(ErrorCode::InvalidCommand, "预览窗口数量无效。"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let window = app
+                .get_webview_window("overview")
+                .ok_or_else(|| error(ErrorCode::BackendUnavailable, "概览窗口不存在。"))?;
+            let hwnd = window
+                .hwnd()
+                .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?;
+            self.backend
+                .as_mut()
+                .ok_or_else(|| error(ErrorCode::BackendUnavailable, "原生窗口后端尚未连接。"))?
+                .sync_previews(hwnd.0 as usize, slots)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = app;
+            Ok(vec![])
+        }
     }
 
     fn finish_animation(&mut self) -> Result<(), AppError> {
@@ -480,6 +563,7 @@ fn show_surface(
     snapshot: &Snapshot,
     surface: Surface,
     monitor_id: Option<&str>,
+    preview_session: Option<u64>,
 ) -> Result<(), AppError> {
     let window = app
         .get_webview_window(surface.label())
@@ -531,7 +615,7 @@ fn show_surface(
     app.emit_to(
         surface.label(),
         "surface-opened",
-        monitor.map(|m| &m.monitor.id),
+        serde_json::json!({ "monitorId": monitor.map(|m| &m.monitor.id), "previewSession": preview_session }),
     )
     .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))
 }
@@ -729,11 +813,25 @@ fn run_controller(
                     controller.record(issue);
                     continue;
                 }
-                if let Err(issue) = show_surface(&app, &snapshot, surface, monitor_id.as_deref()) {
+                controller.clear_previews();
+                let available =
+                    matches!(surface, Surface::Overview) && controller.preview_capable();
+                let session = controller.preview_session.begin(available);
+                if let Err(issue) =
+                    show_surface(&app, &snapshot, surface, monitor_id.as_deref(), session)
+                {
+                    controller.clear_previews();
                     controller.record(issue);
                 }
             }
+            Ok(Request::Previews(session, slots, reply)) => {
+                let result = controller.sync_previews(&app, session, &slots);
+                let _ = reply.send(result);
+            }
             Ok(Request::Dismiss(surface)) => {
+                if matches!(surface, Surface::Overview) {
+                    controller.clear_previews();
+                }
                 if let Some(window) = app.get_webview_window(surface.label()) {
                     let _ = window.hide();
                 }
@@ -789,6 +887,7 @@ pub fn run() {
             execute,
             open_surface,
             dismiss_surface,
+            sync_previews,
             quit
         ])
         .setup(move |app| {
@@ -803,6 +902,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "overview" {
+                let _ = send(
+                    &window.state::<AppState>(),
+                    Request::Dismiss(Surface::Overview),
+                );
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let state = window.state::<AppState>();

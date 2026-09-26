@@ -7,3 +7,5 @@ pub mod model;
 pub mod platform;
 pub mod rules;
 pub mod shortcuts;
+
+pub mod preview;

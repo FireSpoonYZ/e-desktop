@@ -12,7 +12,7 @@ const { outputText } = ts.transpileModule(source, {
 });
 const compiled = outputText.replace(/(['"])(react(?:\/jsx-runtime)?)\1/g,
   (_, quote, name) => `${quote}${import.meta.resolve(name)}${quote}`);
-const { physicalPreviewSlot, WindowPreview } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { physicalPreviewSlot, WindowPreview, previewQueue } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
 const bounds = { left: -10.2, top: 20.2, right: 100.6, bottom: 80.8 };
 test('preview physical rectangles round inward and intersect scrolling clips at fractional DPI', () => {
@@ -45,4 +45,28 @@ test('preview placeholders distinguish unsupported, pending, gone and failed wit
   assert.match(ready, /aria-label="窗口实时预览"/);
   assert.doesNotMatch(ready, /<small>/);
   assert.doesNotMatch(ready, /button|tabindex|onclick/i);
+});
+
+
+test('preview IPC serializes, coalesces geometry, drops stale replies and clears after disposal', async () => {
+  const calls = [], received = [];
+  const feed = previewQueue(7, (session, slots) => new Promise((resolve, reject) => calls.push({ session, slots, resolve, reject })),
+    (statuses) => received.push(statuses));
+  const a = [{ windowId: 'a' }], b = [{ windowId: 'b' }], c = [{ windowId: 'c' }];
+  feed.push(a); feed.push(b); feed.push(c);
+  assert.equal(calls.length, 1);
+  calls[0].resolve([{ windowId: 'a', state: 'ready' }]); await Promise.resolve();
+  assert.deepEqual(received, []);
+  assert.deepEqual(calls[1].slots, c);
+  assert.equal(calls[1].session, 7);
+  calls[1].reject(new Error('gone')); await Promise.resolve();
+  assert.equal(received[0][0].state, 'failed');
+  feed.refresh();
+  feed.dispose(); feed.push(a); feed.refresh();
+  calls[2].resolve([{ windowId: 'c', state: 'ready' }]); await Promise.resolve();
+  assert.equal(received.length, 1);
+  assert.deepEqual(calls[3].slots, []);
+  calls[3].resolve([]); await Promise.resolve();
+  feed.dispose(); feed.refresh();
+  assert.equal(calls.length, 4);
 });

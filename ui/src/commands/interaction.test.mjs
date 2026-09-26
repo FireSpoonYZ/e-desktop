@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import test from 'node:test';
 import ts from 'typescript';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -16,7 +16,7 @@ function moduleUrl(relative) {
   } });
   outputText = outputText.replace(/from ['"]([^'"]+)['"]/g, (_, specifier) => {
     const url = specifier.startsWith('.')
-      ? moduleUrl(new URL(`${specifier}.ts`, file).href)
+      ? moduleUrl(new URL(`${specifier}${existsSync(new URL(`${specifier}.ts`, file)) ? ".ts" : ".tsx"}`, file).href)
       : import.meta.resolve(specifier);
     return `from '${url}'`;
   });
@@ -106,7 +106,7 @@ test('overview renders ordered proportional columns, focused state and real dest
   assert.match(html, /data-focused="true"/);
   assert.match(html, /aria-pressed="true"/);
   assert.match(html, /<option value="p2">Main · 第二页<\/option>/);
-  assert.match(html, /预览不可用/);
+  assert.match(html, /此平台不支持实时预览/);
   assert.match(html, /此页没有平铺窗口/);
   assert.match(html, /aria-current="page"/);
 });

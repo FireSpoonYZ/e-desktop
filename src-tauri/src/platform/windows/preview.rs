@@ -1,35 +1,7 @@
 //! DWM resources only: never save, move, restore, or activate a source window.
 use super::*;
-use serde::{Deserialize, Serialize};
+pub use crate::preview::{PreviewSlot, PreviewState, PreviewStatus};
 use std::collections::HashSet;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreviewSlot {
-    pub window_id: String,
-    /// Destination client-area physical pixels, not screen coordinates.
-    pub rect: Rect,
-    /// Visible part of the placeholder, excluding scrolling ancestors and controls.
-    pub clip: Rect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PreviewState {
-    Ready,
-    Hidden,
-    Unavailable,
-    SourceGone,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreviewStatus {
-    pub window_id: String,
-    pub state: PreviewState,
-    pub message: String,
-}
 
 struct Thumbnail {
     handle: isize,

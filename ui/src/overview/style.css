@@ -30,3 +30,5 @@
 .overview-floating > div { display: flex; gap: 10px; overflow-x: auto; padding: 3px; }
 .overview-floating .overview-window { flex: 0 0 220px !important; }
 .overview-missing { padding: 8px; color: var(--muted); }
+
+.overview-window-focus:disabled { opacity: 1; }

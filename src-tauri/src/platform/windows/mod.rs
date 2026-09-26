@@ -201,7 +201,7 @@ impl Backend {
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
             capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, ..Capabilities::default() },
-            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. DWM preview API requires overview host integration; no pointer-focus implementation.".into() }
+            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. DWM live overview previews for visible sources; no pointer-focus implementation.".into() }
     }
     fn alive(&self, e: &Entry) -> bool {
         let h = e.hwnd as HWND;

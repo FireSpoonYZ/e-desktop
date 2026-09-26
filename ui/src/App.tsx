@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onSurfaceOpened, openSurface, quit } from './bridge';
+import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onSurfaceOpened, openSurface, quit, syncPreviews } from './bridge';
 import type { Surface } from './bridge';
 import { emptySnapshot } from './model';
 import type { OnCommand } from './model';
@@ -19,6 +19,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(0);
   const [overlayMonitor, setOverlayMonitor] = useState<string | null>(null);
+  const [previewSession, setPreviewSession] = useState<number | null>(null);
   const executing = useRef(false);
 
   useEffect(() => {
@@ -36,8 +37,8 @@ export default function App() {
       });
       if (disposed) { unlisten(); return; }
       cleanups.push(unlisten);
-      const reopen = await onSurfaceOpened((monitorId) => {
-        if (!disposed) { setOpening((value) => value + 1); setOverlayMonitor(monitorId); setLocalError(null); }
+      const reopen = await onSurfaceOpened(({ monitorId, previewSession }) => {
+        if (!disposed) { setOpening((value) => value + 1); setOverlayMonitor(monitorId); setPreviewSession(previewSession); setLocalError(null); }
       });
       if (disposed) { reopen(); return; }
       cleanups.push(reopen);
@@ -71,6 +72,7 @@ export default function App() {
   }, [snapshot.monitors]);
   const onDismiss = useCallback(() => {
     if (surface === 'overview' || surface === 'commands') {
+      setPreviewSession(null);
       void dismissSurface(surface).catch((cause: unknown) => setLocalError(errorMessage(cause)));
     }
   }, []);
@@ -86,7 +88,7 @@ export default function App() {
 
   return <main className={`desktop-surface desktop-surface--${surface}`}>
     {surface === 'pagerail' ? <PageRail {...props} monitorId={monitor?.monitor.id} />
-      : surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} />
+      : surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
       : surface === 'commands' ? <CommandPalette key={opening} {...props} onDismiss={onDismiss} />
       : <TopBar {...props} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
         onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }} />}

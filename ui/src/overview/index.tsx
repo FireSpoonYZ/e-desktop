@@ -2,9 +2,13 @@ import { useEffect, useId, useRef, useState } from 'react';
 import type { OverviewProps, Page, WindowId } from '../model';
 import { useCommand, useSurface } from '../commands/surface';
 import { canInteract, moveCommand, overviewScale, sizingTarget, trackDrag, trackResize, widthCommand } from './pointer';
+import { WindowPreview, usePreviewFeed, usePreviewSlots } from './previews';
+import type { PreviewRequest } from './previews';
 import './style.css';
 
-export function Overview({ snapshot, onCommand, onDismiss, busy = false }: OverviewProps) {
+export function Overview({ snapshot, onCommand, onDismiss, busy = false, previewSession = null, syncPreviews }: OverviewProps & {
+  previewSession?: number | null; syncPreviews?: PreviewRequest;
+}) {
   const id = useId();
   const { root, onKeyDown } = useSurface(onDismiss);
   const { run, pending, error } = useCommand(onCommand);
@@ -17,6 +21,9 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false }: Overv
   const suppressClick = useRef(false);
   const [preview, setPreview] = useState<{ columnId: string; width: number } | null>(null);
   const resizing = useRef<{ valid: () => boolean; cancel: () => void } | null>(null);
+  const previewsAvailable = previewSession !== null && !!syncPreviews;
+  const { statuses, publish } = usePreviewFeed(previewSession, syncPreviews);
+  usePreviewSlots(root, { available: previewsAvailable, active: !dropPreview && !preview, onSlotsChange: publish });
   const pageAt = (event: PointerEvent) => document.elementFromPoint(event.clientX, event.clientY)
     ?.closest<HTMLElement>('[data-overview-page]')?.dataset.overviewPage ?? null;
   useEffect(() => {
@@ -71,7 +78,8 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false }: Overv
           if (!blocked && ready) void run({ type: 'focusWindow', windowId }, onDismiss);
         }}>
         <strong>{native.title || '无标题窗口'}</strong><span>{native.appName || '未知应用'}</span>
-        <small>预览不可用{window.fullscreen ? ' · 布局全屏' : ''}{window.floating ? ' · 浮动' : ''}</small>
+        <WindowPreview windowId={windowId} available={previewsAvailable} status={statuses[windowId]} />
+        {(window.fullscreen || window.floating) && <small>{window.fullscreen ? '布局全屏' : '浮动'}</small>}
       </button>
       <label className="overview-move">移动到页面
         <select aria-label={`移动 ${native.title || '无标题窗口'} 到页面`} value=""
