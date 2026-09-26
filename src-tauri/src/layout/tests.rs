@@ -1,5 +1,434 @@
 use super::*;
 
+#[test]
+fn sizing_commands_use_the_frozen_physical_pixel_ipc_contract() {
+    for (command, value) in [
+        (
+            Command::SetColumnWidth { width: u32::MAX },
+            serde_json::json!({"type":"setColumnWidth","width":u32::MAX}),
+        ),
+        (
+            Command::AdjustColumnWidth { delta: i32::MIN },
+            serde_json::json!({"type":"adjustColumnWidth","delta":i32::MIN}),
+        ),
+        (
+            Command::AdjustWindowHeight { delta: i32::MAX },
+            serde_json::json!({"type":"adjustWindowHeight","delta":i32::MAX}),
+        ),
+        (
+            Command::ResetWindowHeights,
+            serde_json::json!({"type":"resetWindowHeights"}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&command).unwrap(), value);
+        assert_eq!(serde_json::from_value::<Command>(value).unwrap(), command);
+    }
+    for value in [
+        serde_json::json!({"type":"setColumnWidth","width":-1}),
+        serde_json::json!({"type":"setColumnWidth","width":4294967296_u64}),
+        serde_json::json!({"type":"adjustColumnWidth","delta":2147483648_i64}),
+        serde_json::json!({"type":"adjustWindowHeight","delta":-2147483649_i64}),
+    ] {
+        assert!(serde_json::from_value::<Command>(value).is_err());
+    }
+}
+
+fn stacked_engine() -> Engine {
+    let mut e = engine();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0].columns[0].windows,
+        ["2", "1", "3"]
+    );
+    e
+}
+
+fn assert_column_coverage(e: &Engine, actions: &[NativeAction]) {
+    for monitor in &e.snapshot.monitors {
+        for column in monitor.pages.iter().flat_map(|p| &p.columns) {
+            let mut y = monitor.viewport.y as i64;
+            for id in &column.windows {
+                let rect = placement(actions, id).0;
+                assert!(rect.height > 0);
+                assert_eq!(rect.y as i64, y);
+                assert_eq!(rect.width, column.width);
+                y += rect.height as i64;
+            }
+            assert_eq!(
+                y,
+                monitor.viewport.y as i64 + monitor.viewport.height as i64
+            );
+        }
+    }
+}
+
+fn assert_rejected_unchanged(e: &mut Engine, command: Command) {
+    let before = serde_json::to_value(e.snapshot()).unwrap();
+    let weights = e.height_weights.clone();
+    let next_id = e.next_id;
+    let page_focus = e.page_focus.clone();
+    let fullscreen_restore = e.fullscreen_restore.clone();
+    let placements = serde_json::to_value(e.placements().unwrap()).unwrap();
+    let error = e.dispatch(command).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidCommand);
+    assert!(!error.message.is_empty());
+    assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+    assert_eq!(e.height_weights, weights);
+    assert_eq!(e.next_id, next_id);
+    assert_eq!(e.page_focus, page_focus);
+    assert_eq!(e.fullscreen_restore, fullscreen_restore);
+    assert_eq!(
+        serde_json::to_value(e.placements().unwrap()).unwrap(),
+        placements
+    );
+}
+
+#[test]
+fn sizing_rejects_paused_unfocused_floating_and_fullscreen_atomically() {
+    for state in 0..4 {
+        let mut e = stacked_engine();
+        e.dispatch(Command::AdjustWindowHeight { delta: 100 })
+            .unwrap();
+        match state {
+            0 => {
+                e.dispatch(Command::Disable).unwrap();
+            }
+            1 => {
+                e.dispatch(Command::AddPage {
+                    monitor_id: "a".into(),
+                })
+                .unwrap();
+            }
+            2 => {
+                e.dispatch(Command::ToggleFloating).unwrap();
+            }
+            3 => {
+                e.dispatch(Command::ToggleFullscreen).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        for command in [
+            Command::SetColumnWidth { width: 700 },
+            Command::AdjustColumnWidth { delta: -50 },
+            Command::AdjustWindowHeight { delta: 50 },
+            Command::ResetWindowHeights,
+            Command::CycleWidth,
+        ] {
+            assert_rejected_unchanged(&mut e, command);
+        }
+    }
+}
+
+#[test]
+fn column_widths_clamp_extreme_pixels_without_focus_or_monitor_changes() {
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    let other = serde_json::to_value(&e.snapshot.monitors[1]).unwrap();
+    // Sizing needs placement, not native focus capability.
+    e.snapshot.backend.capabilities.focus = false;
+    assert_rejected_unchanged(&mut e, Command::SetColumnWidth { width: 0 });
+    for (command, width) in [
+        (Command::SetColumnWidth { width: 1 }, 1),
+        (Command::AdjustColumnWidth { delta: i32::MIN }, 1),
+        (Command::AdjustColumnWidth { delta: i32::MAX }, 1200),
+        (Command::SetColumnWidth { width: u32::MAX }, 1200),
+        (Command::SetColumnWidth { width: 777 }, 777),
+        (Command::AdjustColumnWidth { delta: -7 }, 770),
+        (Command::AdjustColumnWidth { delta: 0 }, 770),
+        (Command::CycleWidth, 800),
+    ] {
+        let t = e.dispatch(command).unwrap();
+        let (rect, clip, minimized) = placement(&t.actions, "3");
+        assert_eq!(rect.width, width);
+        assert!(!minimized);
+        assert_eq!(clip, None);
+        assert!(rect.x >= 0 && rect.x as i64 + width as i64 <= 1200);
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+        assert_eq!(
+            serde_json::to_value(&e.snapshot.monitors[1]).unwrap(),
+            other
+        );
+    }
+    let mut native = system();
+    native.focused_window = Some("3".into());
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(placement(&t.actions, "3").0.width, 800);
+}
+
+#[test]
+fn window_height_adjustments_cover_exactly_and_reset_only_the_current_column() {
+    let mut e = stacked_engine();
+    e.dispatch(Command::Scroll {
+        monitor_id: "a".into(),
+        delta: -100,
+    })
+    .unwrap();
+    let scroll = e.snapshot.monitors[0].pages[0].viewport_x;
+    for (delta, height) in [
+        (101, 401),
+        (-51, 350),
+        (0, 350),
+        (i32::MAX, 898),
+        (i32::MIN, 1),
+    ] {
+        let t = e.dispatch(Command::AdjustWindowHeight { delta }).unwrap();
+        assert_eq!(placement(&t.actions, "1").0.height, height);
+        assert_column_coverage(&e, &t.actions);
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, scroll);
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+    }
+    let weights = e.height_weights.clone();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    let t = e
+        .dispatch(Command::AdjustWindowHeight { delta: i32::MIN })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "4").0.height, 900);
+    e.dispatch(Command::ResetWindowHeights).unwrap();
+    assert_eq!(e.height_weights, weights);
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    let t = e.dispatch(Command::ResetWindowHeights).unwrap();
+    assert!(e.height_weights.is_empty());
+    for id in ["1", "2", "3"] {
+        assert_eq!(placement(&t.actions, id).0.height, 300);
+    }
+    assert_column_coverage(&e, &t.actions);
+}
+
+#[test]
+fn height_preferences_follow_reorder_split_merge_viewport_and_close() {
+    let mut e = stacked_engine();
+    e.dispatch(Command::AdjustWindowHeight { delta: 100 })
+        .unwrap();
+    let weights = e.height_weights.clone();
+    let t = e
+        .dispatch(Command::MoveWindow {
+            direction: Direction::Up,
+        })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.height, 400);
+    assert_eq!(placement(&t.actions, "1").0.y, 0);
+    assert_column_coverage(&e, &t.actions);
+    let t = e
+        .dispatch(Command::MoveWindow {
+            direction: Direction::Left,
+        })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.height, 900);
+    assert_column_coverage(&e, &t.actions);
+    let t = e
+        .dispatch(Command::MoveWindow {
+            direction: Direction::Right,
+        })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.height, 400);
+    assert_column_coverage(&e, &t.actions);
+    assert_eq!(e.height_weights, weights);
+    let viewport = Rect {
+        x: 23,
+        y: 71,
+        width: 1000,
+        height: 601,
+    };
+    e.set_viewports(BTreeMap::from([("a".into(), viewport)]));
+    let t = e.reconcile(system()).unwrap();
+    assert_column_coverage(&e, &t.actions);
+    assert!(placement(&t.actions, "1").0.height > placement(&t.actions, "2").0.height);
+    assert_eq!(e.height_weights, weights);
+    e.set_viewports(BTreeMap::new());
+    let mut native = system();
+    native.monitors[0].bounds.height = 1301;
+    native.monitors[0].work_area.height = 1301;
+    let t = e.reconcile(native.clone()).unwrap();
+    assert_column_coverage(&e, &t.actions);
+    assert!(placement(&t.actions, "1").0.height > placement(&t.actions, "2").0.height);
+    e.dispatch(Command::CloseWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    assert_eq!(e.height_weights, weights); // Close may be cancelled.
+    native.windows.retain(|w| w.id != "2");
+    let t = e.reconcile(native.clone()).unwrap();
+    assert!(!e.height_weights.contains_key("2"));
+    assert_column_coverage(&e, &t.actions);
+    assert!(placement(&t.actions, "1").0.height > placement(&t.actions, "3").0.height);
+    let t = e.dispatch(Command::ResetWindowHeights).unwrap();
+    assert_column_coverage(&e, &t.actions);
+    let a = placement(&t.actions, "1").0.height;
+    let b = placement(&t.actions, "3").0.height;
+    assert_eq!(a.abs_diff(b), 1);
+    native.windows.retain(|w| w.id != "1");
+    native.focused_window = Some("3".into());
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(placement(&t.actions, "3").0.height, 1301);
+    assert_column_coverage(&e, &t.actions);
+}
+
+#[test]
+fn sizing_handles_maximum_viewport_dimensions_without_overflow() {
+    let mut e = stacked_engine();
+    let mut native = system();
+    let area = Rect {
+        x: i32::MIN,
+        y: i32::MIN,
+        width: u32::MAX,
+        height: u32::MAX,
+    };
+    native.monitors[0].bounds = area;
+    native.monitors[0].work_area = area;
+    e.reconcile(native).unwrap();
+    e.dispatch(Command::SetColumnWidth { width: u32::MAX })
+        .unwrap();
+    for (delta, width) in [
+        (i32::MAX, u32::MAX),
+        (i32::MIN, i32::MAX as u32),
+        (i32::MIN, 1),
+        (i32::MAX, 2147483648),
+    ] {
+        let t = e.dispatch(Command::AdjustColumnWidth { delta }).unwrap();
+        assert_eq!(placement(&t.actions, "1").0.width, width);
+    }
+    for delta in [i32::MAX, i32::MIN, i32::MIN, i32::MAX] {
+        let t = e.dispatch(Command::AdjustWindowHeight { delta }).unwrap();
+        assert_column_coverage(&e, &t.actions);
+    }
+}
+
+#[test]
+fn height_preferences_survive_minimum_viewport_and_give_new_siblings_a_fair_share() {
+    let mut e = stacked_engine();
+    e.dispatch(Command::AdjustWindowHeight { delta: 100 })
+        .unwrap();
+    let weights = e.height_weights.clone();
+    e.set_viewports(BTreeMap::from([(
+        "a".into(),
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 3,
+        },
+    )]));
+    let t = e.reconcile(system()).unwrap();
+    assert_column_coverage(&e, &t.actions);
+    e.dispatch(Command::AdjustWindowHeight { delta: i32::MAX })
+        .unwrap();
+    assert_eq!(e.height_weights, weights);
+    e.set_viewports(BTreeMap::new());
+    let mut native = system();
+    native.windows.push(window("5", "a"));
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(placement(&t.actions, "1").0.height, 400);
+    e.dispatch(Command::FocusWindow {
+        window_id: "5".into(),
+    })
+    .unwrap();
+    let t = e
+        .dispatch(Command::MoveWindow {
+            direction: Direction::Left,
+        })
+        .unwrap();
+    assert_column_coverage(&e, &t.actions);
+    assert!((224..=226).contains(&placement(&t.actions, "5").0.height));
+    assert_eq!(e.height_weights, weights);
+}
+
+#[test]
+fn insufficient_height_rejects_reconcile_and_merge_without_partial_changes() {
+    let mut e = stacked_engine();
+    e.dispatch(Command::AdjustWindowHeight { delta: 100 })
+        .unwrap();
+    let before = serde_json::to_value(e.snapshot()).unwrap();
+    let weights = e.height_weights.clone();
+    e.set_viewports(BTreeMap::from([(
+        "a".into(),
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 2,
+        },
+    )]));
+    assert_eq!(
+        e.reconcile(system()).unwrap_err().code,
+        ErrorCode::InvalidCommand
+    );
+    assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+    assert_eq!(e.height_weights, weights);
+    e.dispatch(Command::Disable).unwrap();
+    let before = serde_json::to_value(e.snapshot()).unwrap();
+    assert_eq!(
+        e.reconcile(system()).unwrap_err().code,
+        ErrorCode::InvalidCommand
+    );
+    assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+    let mut e = engine();
+    e.set_viewports(BTreeMap::from([(
+        "a".into(),
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 2,
+        },
+    )]));
+    e.reconcile(system()).unwrap();
+    let t = e
+        .dispatch(Command::MoveWindow {
+            direction: Direction::Right,
+        })
+        .unwrap();
+    assert_column_coverage(&e, &t.actions);
+    let t = e
+        .dispatch(Command::AdjustWindowHeight { delta: i32::MAX })
+        .unwrap();
+    assert_column_coverage(&e, &t.actions);
+    assert_eq!(placement(&t.actions, "1").0.height, 1);
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    assert_rejected_unchanged(
+        &mut e,
+        Command::MoveWindow {
+            direction: Direction::Left,
+        },
+    );
+}
+
 fn monitor(id: &str, x: i32) -> Monitor {
     Monitor {
         id: id.into(),

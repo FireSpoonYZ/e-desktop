@@ -193,6 +193,17 @@ pub enum Command {
         direction: Direction,
     },
     CycleWidth,
+    /// Column dimensions and deltas are physical pixels, not logical/DPI-scaled units.
+    SetColumnWidth {
+        width: u32,
+    },
+    AdjustColumnWidth {
+        delta: i32,
+    },
+    AdjustWindowHeight {
+        delta: i32,
+    },
+    ResetWindowHeights,
     CenterFocused,
     Scroll {
         monitor_id: MonitorId,

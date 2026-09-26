@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::*;
 
+mod sizing;
+
 /// Monitor/page indices plus optional column/row (None for floating windows).
 type WindowLocation = (usize, usize, Option<(usize, usize)>);
 
@@ -13,6 +15,8 @@ pub struct Engine {
     viewports: BTreeMap<MonitorId, Rect>,
     page_focus: BTreeMap<PageId, WindowId>,
     fullscreen_restore: BTreeMap<WindowId, Rect>,
+    /// Relative shares of space above each tiled window's one-pixel minimum.
+    height_weights: BTreeMap<WindowId, u32>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -62,6 +66,7 @@ impl Engine {
             viewports: BTreeMap::new(),
             page_focus: BTreeMap::new(),
             fullscreen_restore: BTreeMap::new(),
+            height_weights: BTreeMap::new(),
         }
     }
 
@@ -174,7 +179,7 @@ impl Engine {
         let mut next = self.clone();
         let native_focus = system.focused_window.clone();
         next.reconcile_inner(system)?;
-        let mut actions = next.placements();
+        let mut actions = next.placements()?;
         if let Some(id) = next.snapshot.focused_window.as_ref().filter(|_| {
             next.snapshot.enabled
                 && next.snapshot.backend.capabilities.focus
@@ -437,6 +442,8 @@ impl Engine {
             .collect();
         self.page_focus
             .retain(|page, window| valid.get(page).is_some_and(|ids| ids.contains(window)));
+        self.height_weights
+            .retain(|id, _| self.snapshot.windows.iter().any(|w| &w.native.id == id));
     }
 
     fn set_focus(&mut self, id: &str, ensure_visible: bool) -> Result<(), AppError> {
@@ -578,7 +585,7 @@ impl Engine {
             if let Some(id) = self.snapshot.focused_window.clone() {
                 self.ensure_visible(&id, false)?;
             }
-            return Ok(self.placements());
+            return self.placements();
         }
         if !self.snapshot.enabled {
             return Err(invalid("Window management is paused"));
@@ -727,10 +734,7 @@ impl Engine {
                 self.ensure_visible(&id, false)?;
             }
             Command::CycleWidth => {
-                let id = self.focused()?;
-                let (m, p, column) = self.location(&id)?;
-                let (c, _) =
-                    column.ok_or_else(|| invalid("Floating windows have no column width"))?;
+                let (id, m, p, c, _) = self.sizing_target()?;
                 let viewport = self.snapshot.monitors[m].viewport.width;
                 let presets = [
                     (viewport / 3).max(1),
@@ -744,6 +748,22 @@ impl Engine {
                     .find(|preset| preset > width)
                     .unwrap_or(presets[0]);
                 self.ensure_visible(&id, false)?;
+            }
+            Command::SetColumnWidth { width } => {
+                if width == 0 {
+                    return Err(invalid("Column width must be positive"));
+                }
+                self.resize_column(width as i64, false)?;
+            }
+            Command::AdjustColumnWidth { delta } => {
+                self.resize_column(delta as i64, true)?;
+            }
+            Command::AdjustWindowHeight { delta } => self.adjust_window_height(delta)?,
+            Command::ResetWindowHeights => {
+                let (_, m, p, c, _) = self.sizing_target()?;
+                for id in &self.snapshot.monitors[m].pages[p].columns[c].windows {
+                    self.height_weights.remove(id);
+                }
             }
             Command::CenterFocused => {
                 let id = self.focused()?;
@@ -802,7 +822,7 @@ impl Engine {
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
         self.cleanup();
-        let mut actions = self.placements();
+        let mut actions = self.placements()?;
         if let Some(id) = self
             .snapshot
             .focused_window
@@ -825,9 +845,22 @@ impl Engine {
     }
 
     // ponytail: linear window lookups keep snapshot ownership simple; index IDs if large window counts matter.
-    fn placements(&self) -> Vec<NativeAction> {
+    fn placements(&self) -> Result<Vec<NativeAction>, AppError> {
+        // Reject impossible geometry transactionally, including viewport changes while paused.
+        for monitor in &self.snapshot.monitors {
+            if monitor
+                .pages
+                .iter()
+                .flat_map(|p| &p.columns)
+                .any(|c| c.windows.len() as u64 > monitor.viewport.height as u64)
+            {
+                return Err(invalid(
+                    "Viewport height is smaller than the tiled window count",
+                ));
+            }
+        }
         if !self.snapshot.enabled {
-            return vec![];
+            return Ok(vec![]);
         }
         let mut actions = Vec::new();
         for monitor in &self.snapshot.monitors {
@@ -841,17 +874,17 @@ impl Engine {
                 });
                 let mut x = monitor.viewport.x as i64 - page.viewport_x as i64;
                 for column in &page.columns {
-                    let count = column.windows.len() as u64;
-                    for (index, id) in column.windows.iter().enumerate() {
-                        let top = monitor.viewport.height as u64 * index as u64 / count;
-                        let bottom = monitor.viewport.height as u64 * (index as u64 + 1) / count;
+                    let heights = self.column_heights(column, monitor.viewport.height);
+                    let mut y = monitor.viewport.y as i64;
+                    for (id, height) in column.windows.iter().zip(heights) {
                         let rect = Rect {
                             x: coordinate(x),
-                            y: coordinate(monitor.viewport.y as i64 + top as i64),
+                            y: coordinate(y),
                             width: column.width,
-                            height: (bottom - top).max(1) as u32,
+                            height,
                         };
                         self.place(&mut actions, id, rect, monitor.viewport, active, fullscreen);
+                        y += height as i64;
                     }
                     x += column.width as i64;
                 }
@@ -868,7 +901,7 @@ impl Engine {
                 }
             }
         }
-        actions
+        Ok(actions)
     }
 
     fn place(
