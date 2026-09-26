@@ -1,4 +1,5 @@
 import type { Command, Snapshot } from '../model';
+import { scrollTarget } from '../shell/scroll';
 
 export interface Action { id: string; label: string; detail: string; command: Command; disabled: boolean }
 
@@ -6,6 +7,11 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
   const { capabilities, availability } = snapshot.backend;
   const managed = snapshot.enabled && availability === 'ready' && capabilities.placement;
   const focused = managed && snapshot.focusedWindow !== null;
+  const window = snapshot.windows.find(({ native }) => native.id === snapshot.focusedWindow);
+  const sizable = focused && !!window && !window.floating && !window.fullscreen
+    && snapshot.monitors.some(({ pages, activePage }) => pages.some((page) => page.id === activePage
+      && page.columns.some(({ windows }) => windows.includes(window.native.id))));
+  const target = scrollTarget(snapshot);
   const actions: Action[] = snapshot.windows.map(({ native }) => ({
     id: `window:${native.id}`, label: native.title || '无标题窗口', detail: native.appName || '未知应用',
     command: { type: 'focusWindow', windowId: native.id }, disabled: !managed || !capabilities.focus,
@@ -19,7 +25,16 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
     add(`向${label}聚焦 Focus ${direction}`, { type: 'focusDirection', direction }, focused && capabilities.focus);
     add(`向${label}移动窗口 Move ${direction}`, { type: 'moveWindow', direction }, focused);
   }
-  add('切换窗口宽度 Width', { type: 'cycleWidth' }, focused);
+  add('切换窗口宽度 Width', { type: 'cycleWidth' }, sizable);
+  add('加宽当前列 Width +50', { type: 'adjustColumnWidth', delta: 50 }, sizable, '当前聚焦列 · +50 物理像素');
+  add('减宽当前列 Width -50', { type: 'adjustColumnWidth', delta: -50 }, sizable, '当前聚焦列 · -50 物理像素');
+  add('增高当前窗口 Height +50', { type: 'adjustWindowHeight', delta: 50 }, sizable, '当前聚焦窗口 · +50 物理像素');
+  add('减高当前窗口 Height -50', { type: 'adjustWindowHeight', delta: -50 }, sizable, '当前聚焦窗口 · -50 物理像素');
+  add('恢复当前列等高 Reset heights', { type: 'resetWindowHeights' }, sizable, '当前聚焦列 · 恢复等高分配');
+  for (const [delta, label] of [[-160, '左'], [160, '右']] as const) {
+    add(`向${label}滚动 Scroll`, { type: 'scroll', monitorId: snapshot.activeMonitor ?? '', delta }, !!target,
+      `${target?.monitor.name ?? '无可用显示器'} · ${delta} 物理像素`);
+  }
   add('居中当前窗口 Center', { type: 'centerFocused' }, focused);
   add('切换浮动 Floating', { type: 'toggleFloating' }, focused);
   add('切换布局全屏 Fullscreen', { type: 'toggleFullscreen' }, focused);

@@ -44,7 +44,9 @@
   text-overflow: ellipsis;
 }
 .shell-bar .shell-error { color: var(--danger); }
-.shell-viewport { font-size: 11px; font-family: var(--font-mono); }
+.shell-scroll { display: flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: var(--radius); line-height: 18px; }
+.shell-scroll-position { min-width: 12ch; text-align: center; color: var(--muted); font-size: 11px; font-family: var(--font-mono); }
+.shell-scroll[aria-disabled="true"] .shell-scroll-position { opacity: .5; }
 .shell-rail {
   display: flex;
   flex-direction: column;
@@ -63,7 +65,7 @@
 .shell-rail .shell-page { width: 100%; max-width: 40px; padding: 4px 2px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .shell-rail-empty { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; text-align: center; }
 @media (max-width: 600px) {
-  .shell-brand, .shell-viewport { display: none; }
+  .shell-brand { display: none; }
   .shell-location { max-width: 14ch; }
 }
 @media (max-height: 36px) {

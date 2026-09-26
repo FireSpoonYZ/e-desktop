@@ -81,8 +81,7 @@ export default function App() {
   } : snapshot;
   const monitor = snapshot.monitors[monitorIndex];
   const selectedMonitor = surface === 'topbar' || surface === 'pagerail' ? monitor?.monitor.id : overlayMonitor;
-  const localSnapshot = selectedMonitor
-    ? { ...displaySnapshot, activeMonitor: selectedMonitor } : displaySnapshot;
+  const localSnapshot = { ...displaySnapshot, activeMonitor: selectedMonitor ?? null };
   const props = { snapshot: localSnapshot, onCommand, busy };
 
   return <main className={`desktop-surface desktop-surface--${surface}`}>

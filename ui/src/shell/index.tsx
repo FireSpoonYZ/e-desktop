@@ -1,4 +1,6 @@
 import type { Command, OnCommand, PageRailProps, Snapshot, TopBarProps } from '../model';
+import { ScrollControls } from './ScrollControls';
+import { selectedMonitor } from './scroll';
 import './shell.css';
 
 function currentMonitor(snapshot: Snapshot, monitorId?: string) {
@@ -30,7 +32,7 @@ function backendNotice(snapshot: Snapshot) {
 }
 
 export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOpenCommands, onQuit }: TopBarProps) {
-  const monitor = currentMonitor(snapshot);
+  const monitor = selectedMonitor(snapshot);
   const page = monitor?.pages.find(({ id }) => id === monitor.activePage);
   const error = snapshot.errors.at(-1);
   const canEnable = snapshot.backend.availability === 'ready'
@@ -53,6 +55,7 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
     </button>
     <button type="button" onClick={onOpenOverview}>概览</button>
     <button type="button" onClick={onOpenCommands}>命令</button>
+    <ScrollControls snapshot={snapshot} onCommand={onCommand} busy={busy} />
     <button type="button" disabled={busy} onClick={() => runCommand(onCommand, { type: 'refresh' })}
       title="重新读取后端状态与真实窗口">刷新</button>
     {onQuit && <button type="button" onClick={onQuit} title="还原窗口后退出；还原失败时保留应用供重试">退出</button>}
@@ -61,9 +64,6 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
       {error ? `操作失败：${error.message}` : notice}
       {!error && pageEmpty && snapshot.backend.availability === 'ready' ? ' · 当前页面无窗口' : ''}
     </span>
-    {page && <span className="shell-viewport shell-muted" title="当前页面横向视口位置（物理像素）；真实窗口位于桌面上">
-      横向 {page.viewportX} px
-    </span>}
   </header>;
 }
 

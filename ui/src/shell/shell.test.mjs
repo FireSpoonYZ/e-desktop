@@ -1,21 +1,30 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 import ts from 'typescript';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 
 const require = createRequire(import.meta.url);
 function load(path) {
-  const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+  const file = new URL(path, import.meta.url);
+  const source = readFileSync(file, 'utf8');
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
   });
   const exports = {};
-  new Function('require', 'exports', outputText)((id) => id.endsWith('.css') ? {} : require(id), exports);
+  new Function('require', 'exports', outputText)((id) => {
+    if (id.endsWith('.css')) return {};
+    if (!id.startsWith('.')) return require(id);
+    const tsx = new URL(`${id}.tsx`, file);
+    return load(existsSync(tsx) ? tsx : new URL(`${id}.ts`, file));
+  }, exports);
   return exports;
 }
 const { TopBar, PageRail } = load('./index.tsx');
 const { emptySnapshot } = load('../model.ts');
+const { ScrollControls } = load('./ScrollControls.tsx');
 function nodes(element) {
   if (!element || typeof element !== 'object') return [];
   return [element, ...[element.props?.children].flat(Infinity).flatMap(nodes)];
@@ -27,7 +36,7 @@ function readySnapshot() {
   snapshot.backend.capabilities.enumerate = true;
   snapshot.backend.capabilities.placement = true;
   snapshot.backend.capabilities.minimize = true;
-  snapshot.monitors = [{ monitor: { id: 'm1', name: '主屏', primary: true }, activePage: 'p1', pages: [
+  snapshot.monitors = [{ monitor: { id: 'm1', name: '主屏', primary: true, scaleFactor: 1 }, viewport: { width: 1000 }, activePage: 'p1', pages: [
     { id: 'p1', name: '一', columns: [], floatingWindows: [], viewportX: 0 },
     { id: 'p2', name: '二', columns: [], floatingWindows: [], viewportX: 600 },
   ] }];
@@ -96,4 +105,24 @@ test('PageRail preserves opaque monitor/page IDs, highlights current page, and h
   assert.equal(calls.length, 2);
   props.snapshot.backend.availability = 'unavailable';
   assert.ok(buttons(PageRail(props)).every(({ props }) => props.disabled));
+});
+
+test('dedicated scroll controls disable for pause, busy and no selected target', () => {
+  const snapshot = readySnapshot();
+  snapshot.enabled = true;
+  const props = { snapshot, onCommand() {} };
+  const html = renderToStaticMarkup(createElement(ScrollControls, props));
+  assert.match(html, /aria-label="当前显示器横向滚动"/);
+  assert.match(html, /向左滚动 160 物理像素/);
+  assert.match(html, /向右滚动 160 物理像素/);
+  assert.doesNotMatch(html, /disabled=""/);
+  for (const blocked of [{ ...props, busy: true }, { ...props, snapshot: { ...snapshot, enabled: false } },
+    { ...props, snapshot: { ...snapshot, activeMonitor: 'removed' } }]) {
+    const disabled = renderToStaticMarkup(createElement(ScrollControls, blocked));
+    assert.equal((disabled.match(/disabled=""/g) ?? []).length, 2);
+    assert.match(disabled, /aria-disabled="true"/);
+  }
+  const missing = TopBar({ ...props, snapshot: { ...snapshot, activeMonitor: 'removed' },
+    onOpenOverview() {}, onOpenCommands() {} });
+  assert.equal(nodes(missing).find(({ props }) => props.className === 'shell-location').props.title, '无显示器 / 无页面');
 });

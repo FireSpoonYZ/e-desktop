@@ -83,6 +83,10 @@ export type Command =
   | { type: 'moveWindowToPage'; windowId: WindowId; pageId: PageId }
   | { type: 'moveWindow'; direction: Direction }
   | { type: 'cycleWidth' }
+  | { type: 'setColumnWidth'; width: number }
+  | { type: 'adjustColumnWidth'; delta: number }
+  | { type: 'adjustWindowHeight'; delta: number }
+  | { type: 'resetWindowHeights' }
   | { type: 'centerFocused' }
   | { type: 'scroll'; monitorId: MonitorId; delta: number }
   | { type: 'toggleFloating' }

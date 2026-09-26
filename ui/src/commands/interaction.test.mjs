@@ -52,6 +52,39 @@ test('search matches Chinese, mixed case and all tokens; results carry exact pub
   assert.ok(commandActions(emptySnapshot, 'width')[0].disabled);
 });
 
+test('scroll palette commands preserve the selected secondary display and physical step', () => {
+  const secondary = { ...snapshot.monitors[0], monitor: { id: 'm2', name: 'Secondary', scaleFactor: 2 } };
+  const multi = { ...snapshot, activeMonitor: 'm2', monitors: [...snapshot.monitors, secondary] };
+  const actions = commandActions(multi, 'scroll');
+  assert.deepEqual(actions.map(({ command }) => command), [
+    { type: 'scroll', monitorId: 'm2', delta: -160 }, { type: 'scroll', monitorId: 'm2', delta: 160 },
+  ]);
+  assert.ok(actions.every(({ disabled, detail }) => !disabled && detail.includes('Secondary')));
+  for (const changed of [{ enabled: false }, { activeMonitor: null }, { activeMonitor: 'removed' }]) {
+    assert.ok(commandActions({ ...multi, ...changed }, 'scroll').every(({ disabled }) => disabled));
+  }
+});
+
+test('size actions carry frozen commands and only allow a focused tiled non-fullscreen window', () => {
+  const sizeTypes = ['cycleWidth', 'adjustColumnWidth', 'adjustWindowHeight', 'resetWindowHeights'];
+  const sizes = (state) => commandActions(state, '').filter(({ command }) => sizeTypes.includes(command.type));
+  const actions = sizes(snapshot);
+  assert.deepEqual(actions.map(({ command }) => command), [
+    { type: 'cycleWidth' }, { type: 'adjustColumnWidth', delta: 50 }, { type: 'adjustColumnWidth', delta: -50 },
+    { type: 'adjustWindowHeight', delta: 50 }, { type: 'adjustWindowHeight', delta: -50 }, { type: 'resetWindowHeights' },
+  ]);
+  assert.ok(actions.every(({ disabled }) => !disabled));
+  assert.ok(actions.slice(1, 5).every(({ detail }) => detail.includes('物理像素')));
+  for (const changed of [{ enabled: false }, { focusedWindow: null }, { focusedWindow: 'gone' },
+    { windows: [] }, { monitors: [] },
+    { windows: snapshot.windows.map((window) => ({ ...window, floating: true })) },
+    { windows: snapshot.windows.map((window) => ({ ...window, fullscreen: true })) },
+    { monitors: snapshot.monitors.map((monitor) => ({ ...monitor, activePage: 'p2' })) },
+    { backend: { ...snapshot.backend, availability: 'unavailable' } }]) {
+    assert.ok(sizes({ ...snapshot, ...changed }).every(({ disabled }) => disabled));
+  }
+});
+
 test('keyboard selection wraps, empty results are safe, IME cannot execute or dismiss', () => {
   assert.equal(nextSelection(0, -1, 3), 2);
   assert.equal(nextSelection(2, 1, 3), 0);
@@ -130,6 +163,28 @@ test('palette composition blocks actual Enter handler; rejected command does not
   await Promise.resolve();
   assert.deepEqual(commands, [{ type: 'focusWindow', windowId: 'w1' }]);
   assert.equal(dismissed, 0);
+});
+
+test('palette size clicks are gated by busy/paused state and pending IPC, then dismiss on success', async () => {
+  const calls = [];
+  let resolve, dismissed = 0;
+  const props = { snapshot, onCommand(command) {
+    calls.push(command); return new Promise((done) => { resolve = done; });
+  }, onDismiss() { dismissed++; } };
+  const sizeOption = (elements) => elements.find(({ props }) => props.role === 'option'
+    && props.children[0].props.children === '加宽当前列 Width +50');
+  for (const blocked of [{ ...props, busy: true }, { ...props, snapshot: { ...snapshot, enabled: false } }]) {
+    const option = sizeOption(capture(CommandPalette, blocked));
+    assert.equal(option.props['aria-disabled'], true);
+    option.props.onClick();
+    assert.equal(calls.length, 0);
+  }
+  const option = sizeOption(capture(CommandPalette, props));
+  option.props.onClick(); option.props.onClick();
+  assert.deepEqual(calls, [{ type: 'adjustColumnWidth', delta: 50 }]);
+  assert.equal(dismissed, 0);
+  resolve(); await Promise.resolve();
+  assert.equal(dismissed, 1);
 });
 
 test('empty surfaces do not fabricate native windows and expose accessible search', () => {
