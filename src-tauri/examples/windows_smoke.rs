@@ -92,6 +92,66 @@ fn checks(backend: &mut Backend, pid: u32, evidence: &mut Vec<serde_json::Value>
     apply(
         backend,
         &mut engine,
+        Command::SetColumnWidth { width: 500 },
+        &ids,
+        evidence,
+    )?;
+    apply(
+        backend,
+        &mut engine,
+        Command::AdjustColumnWidth { delta: 50 },
+        &ids,
+        evidence,
+    )?;
+    let resized = observe(backend, pid)?;
+    assert_eq!(
+        resized
+            .windows
+            .iter()
+            .find(|w| w.id == ids[0])
+            .unwrap()
+            .rect
+            .width,
+        550
+    );
+    evidence.push(serde_json::json!({"explicitColumnWidth": 550}));
+    apply(
+        backend,
+        &mut engine,
+        Command::Scroll {
+            monitor_id: monitor_id.clone(),
+            delta: 160,
+        },
+        &ids,
+        evidence,
+    )?;
+    let scrolled = engine
+        .snapshot()
+        .monitors
+        .iter()
+        .find(|m| m.monitor.id == monitor_id)
+        .unwrap();
+    assert!(
+        scrolled
+            .pages
+            .iter()
+            .find(|p| p.id == scrolled.active_page)
+            .unwrap()
+            .viewport_x
+            > 0
+    );
+    apply(
+        backend,
+        &mut engine,
+        Command::FocusWindow {
+            window_id: ids[0].clone(),
+        },
+        &ids,
+        evidence,
+    )?;
+    apply(
+        backend,
+        &mut engine,
         Command::MoveWindow {
             direction: Direction::Right,
         },
@@ -107,6 +167,51 @@ fn checks(backend: &mut Backend, pid: u32, evidence: &mut Vec<serde_json::Value>
             .flat_map(|p| &p.columns)
             .any(|c| c.windows.len() == 2)
     );
+    let stacked = observe(backend, pid)?;
+    let before_height = stacked
+        .windows
+        .iter()
+        .find(|w| w.id == ids[0])
+        .unwrap()
+        .rect
+        .height;
+    apply(
+        backend,
+        &mut engine,
+        Command::AdjustWindowHeight { delta: 50 },
+        &ids,
+        evidence,
+    )?;
+    let resized = observe(backend, pid)?;
+    assert_eq!(
+        resized
+            .windows
+            .iter()
+            .find(|w| w.id == ids[0])
+            .unwrap()
+            .rect
+            .height,
+        before_height + 50
+    );
+    apply(
+        backend,
+        &mut engine,
+        Command::ResetWindowHeights,
+        &ids,
+        evidence,
+    )?;
+    let reset = observe(backend, pid)?;
+    assert_eq!(
+        reset
+            .windows
+            .iter()
+            .find(|w| w.id == ids[0])
+            .unwrap()
+            .rect
+            .height,
+        before_height
+    );
+    evidence.push(serde_json::json!({"stackHeightAdjustedAndReset": true}));
     let page = engine
         .snapshot()
         .monitors
