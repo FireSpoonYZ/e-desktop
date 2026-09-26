@@ -2,12 +2,16 @@ use std::{collections::HashSet, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Command, Direction, Snapshot};
+use crate::{
+    model::{Command, Direction, Snapshot},
+    rules::WindowRule,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub shortcuts: Vec<ShortcutBinding>,
+    pub window_rules: Vec<WindowRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,17 +178,32 @@ impl Default for Config {
                 ShortcutAction::Command { command },
             );
         }
-        Self { shortcuts }
+        Self {
+            shortcuts,
+            window_rules: vec![],
+        }
     }
 }
 
 impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let config: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        for (index, rule) in config.window_rules.iter().enumerate() {
+            rule.validate()
+                .map_err(|e| format!("窗口规则 {}：{}", index + 1, e.message))?;
+        }
         let mut keys = HashSet::new();
         for binding in &config.shortcuts {
             if binding.key.trim().is_empty() || !keys.insert(&binding.key) {
                 return Err(format!("快捷键为空或重复：{}", binding.key));
+            }
+            if matches!(
+                binding.action,
+                ShortcutAction::Command {
+                    command: Command::SetColumnWidth { width: 0 }
+                }
+            ) {
+                return Err(format!("快捷键 {} 的列宽须大于 0。", binding.key));
             }
             if matches!(
                 binding.action,
@@ -373,6 +392,91 @@ mod tests {
             );
         }
         assert!(Config::parse(br#"{"shortcuts":[{"key":"A","action":{"type":"command","command":{"type":"adjustColumnWidth","delta":50,"width":900}}}]}"#).is_err());
+    }
+
+    #[test]
+    fn window_rules_load_with_shortcuts_and_only_affect_new_windows() {
+        use crate::{layout::Engine, model::*};
+        let config = Config::parse(
+            br#"{"shortcuts":[],"windowRules":[{"appName":"editor","columnWidth":700}]}"#,
+        )
+        .unwrap();
+        assert!(config.shortcuts.is_empty());
+        let mut engine = Engine::new(BackendStatus {
+            availability: BackendAvailability::Ready,
+            capabilities: Capabilities {
+                enumerate: true,
+                placement: true,
+                minimize: true,
+                focus: true,
+                clipping: true,
+                ..Capabilities::default()
+            },
+            ..BackendStatus::default()
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 900,
+        };
+        let window = |id: &str| NativeWindow {
+            id: id.into(),
+            title: "Draft".into(),
+            app_name: "Editor".into(),
+            process_id: 1,
+            monitor_id: "a".into(),
+            rect: area,
+            minimized: false,
+            minimized_by_manager: false,
+            resizable: true,
+        };
+        let mut system = SystemSnapshot {
+            monitors: vec![Monitor {
+                id: "a".into(),
+                name: "Main".into(),
+                bounds: area,
+                work_area: area,
+                scale_factor: 1.0,
+                primary: true,
+            }],
+            windows: vec![window("old")],
+            focused_window: Some("old".into()),
+        };
+        let mut shortcuts = Shortcuts::new(Config::default());
+        shortcuts.replace(config, |_, _| Ok(())).unwrap();
+        engine
+            .set_window_rules(shortcuts.config.window_rules.clone())
+            .unwrap();
+        assert!(engine.reconcile(system.clone()).unwrap().actions.is_empty());
+        assert_eq!(engine.snapshot().monitors[0].pages[0].columns[0].width, 700);
+        engine.dispatch(Command::Enable).unwrap();
+        engine
+            .dispatch(Command::AdjustColumnWidth { delta: 50 })
+            .unwrap();
+        let updated = Config::parse(
+            br#"{"shortcuts":[],"windowRules":[{"appName":"editor","columnWidth":333}]}"#,
+        )
+        .unwrap();
+        shortcuts
+            .replace(updated, |_, _| {
+                panic!("unchanged bindings must not re-register")
+            })
+            .unwrap();
+        engine
+            .set_window_rules(shortcuts.config.window_rules.clone())
+            .unwrap();
+        for invalid in [
+            br#"{"windowRules":[{"columnWidth":0}]}"#.as_slice(),
+            br#"{"windowRules":[{"pageIndex":0}]}"#.as_slice(),
+            br#"{"windowRules":[{"title":"editor","unknown":true,"floating":true}]}"#.as_slice(),
+            br#"{"shortcuts":[{"key":"A","action":{"type":"command","command":{"type":"setColumnWidth","width":0}}}]}"#.as_slice(),
+        ] { assert!(Config::parse(invalid).is_err()); }
+        system.windows.push(window("new"));
+        engine.reconcile(system).unwrap();
+        let columns = &engine.snapshot().monitors[0].pages[0].columns;
+        assert_eq!((columns[0].width, columns[1].width), (750, 333));
+        assert!(Config::parse(b"{}").unwrap().window_rules.is_empty());
     }
 
     #[test]

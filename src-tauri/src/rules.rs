@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{AppError, ErrorCode, NativeWindow};
 
 /// Literal, case-insensitive substring conditions; omitted conditions match any window.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WindowRule {
     pub app_name: Option<String>,

@@ -19,6 +19,7 @@ use crate::{
         Snapshot,
     },
     platform::Backend,
+    rules::WindowRule,
     shortcuts::{Shortcuts, normalize_key},
 };
 
@@ -128,6 +129,7 @@ struct Controller {
     engine: Engine,
     errors: Vec<AppError>,
     config_error: Option<AppError>,
+    window_rules: Vec<WindowRule>,
     placements: HashMap<String, (Rect, Option<Rect>, bool)>,
 }
 
@@ -138,6 +140,7 @@ impl Controller {
             engine: Engine::new(BackendStatus::default()),
             errors: vec![],
             config_error: None,
+            window_rules: vec![],
             placements: HashMap::new(),
         };
         if let Err(e) = controller.connect() {
@@ -148,8 +151,16 @@ impl Controller {
 
     fn connect(&mut self) -> Result<(), AppError> {
         let backend = Backend::new()?;
-        self.engine = Engine::new(backend.status());
+        let mut engine = Engine::new(backend.status());
+        engine.set_window_rules(self.window_rules.clone())?;
+        self.engine = engine;
         self.backend = Some(backend);
+        Ok(())
+    }
+
+    fn set_window_rules(&mut self, rules: Vec<WindowRule>) -> Result<(), AppError> {
+        self.engine.set_window_rules(rules.clone())?;
+        self.window_rules = rules;
         Ok(())
     }
 
@@ -506,6 +517,7 @@ fn reload_config(
     sender: &mpsc::SyncSender<Request>,
     file: &mut ConfigFile,
     shortcuts: &mut Shortcuts,
+    controller: &mut Controller,
 ) -> Option<Result<(), AppError>> {
     file.poll().map(|candidate| {
         candidate
@@ -514,6 +526,11 @@ fn reload_config(
                 shortcuts.replace(config, |key, enabled| {
                     set_shortcut(app, sender, key, enabled)
                 })
+            })
+            .and_then(|()| {
+                controller
+                    .set_window_rules(shortcuts.config.window_rules.clone())
+                    .map_err(|e| e.to_string())
             })
             .map_err(|e| {
                 error(
@@ -538,7 +555,13 @@ fn run_controller(
     let mut shortcuts = Shortcuts::new(defaults);
     let mut config_file = ConfigFile::new(config_path);
     // Install the requested map first; an invalid startup file falls back to defaults.
-    if let Some(Err(issue)) = reload_config(&app, &sender, &mut config_file, &mut shortcuts) {
+    if let Some(Err(issue)) = reload_config(
+        &app,
+        &sender,
+        &mut config_file,
+        &mut shortcuts,
+        &mut controller,
+    ) {
         controller.config_error = Some(issue);
         let defaults = shortcuts.config.clone();
         if let Err(e) = shortcuts.replace(defaults, |key, enabled| {
@@ -558,7 +581,13 @@ fn run_controller(
     loop {
         // A deadline, not an idle timeout: queued commands cannot starve config reloads.
         if Instant::now() >= next_refresh {
-            if let Some(result) = reload_config(&app, &sender, &mut config_file, &mut shortcuts) {
+            if let Some(result) = reload_config(
+                &app,
+                &sender,
+                &mut config_file,
+                &mut shortcuts,
+                &mut controller,
+            ) {
                 controller.config_error = result.err();
             }
             if controller.backend.is_some() {

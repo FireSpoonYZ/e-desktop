@@ -349,6 +349,68 @@ fn checks(backend: &mut Backend, pid: u32, evidence: &mut Vec<serde_json::Value>
         assert!(!actual.minimized_by_manager);
     }
     evidence.push(serde_json::json!({"restored": &restored}));
+
+    // Exercise JSON rules through paused observations before touching the fixture again.
+    let destination = original
+        .monitors
+        .iter()
+        .find(|m| m.id != monitor_id)
+        .or_else(|| original.monitors.iter().find(|m| m.id == monitor_id))
+        .unwrap();
+    let config = e_desktop::config::Config::parse(&serde_json::to_vec(&serde_json::json!({
+        "shortcuts": [],
+        "windowRules": [{ "title": original.windows[0].title, "floating": true, "monitorId": destination.id }]
+    }))?).map_err(std::io::Error::other)?;
+    let mut ruled = Engine::new(backend.status());
+    ruled.set_viewports(
+        engine
+            .snapshot()
+            .monitors
+            .iter()
+            .map(|m| (m.monitor.id.clone(), m.viewport))
+            .collect(),
+    );
+    ruled.set_window_rules(config.window_rules)?;
+    for _ in 0..2 {
+        assert!(ruled.reconcile(observe(backend, pid)?)?.actions.is_empty());
+    }
+    apply(backend, &mut ruled, Command::Enable, &ids, evidence)?;
+    let rule_observed = observe(backend, pid)?;
+    let moved = rule_observed
+        .windows
+        .iter()
+        .find(|w| w.id == ids[0])
+        .unwrap();
+    assert_eq!(moved.monitor_id, destination.id);
+    assert!(!moved.minimized);
+    let viewport = ruled
+        .snapshot()
+        .monitors
+        .iter()
+        .find(|m| m.monitor.id == destination.id)
+        .unwrap()
+        .viewport;
+    assert!(moved.rect.x >= viewport.x && moved.rect.y >= viewport.y);
+    evidence
+        .push(serde_json::json!({"pausedFloatingRule": moved, "targetMonitor": destination.id}));
+    apply(backend, &mut ruled, Command::Disable, &ids, evidence)?;
+    backend.restore()?;
+    let restored_again = observe(backend, pid)?;
+    for initial in &original.windows {
+        let actual = restored_again
+            .windows
+            .iter()
+            .find(|w| w.id == initial.id)
+            .unwrap();
+        assert_eq!(
+            actual.rect, initial.rect,
+            "rule restore rectangle: {}",
+            initial.title
+        );
+        assert_eq!(actual.minimized, initial.minimized);
+        assert!(!actual.minimized_by_manager);
+    }
+    evidence.push(serde_json::json!({"ruleRestore": true}));
     backend.apply(&[NativeAction::Close {
         window_id: ids[2].clone(),
     }])?;
