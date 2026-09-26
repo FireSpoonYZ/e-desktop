@@ -2,12 +2,12 @@
   color-scheme: dark;
   font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --background: #191b1c;
-  --surface: #232627;
-  --surface-raised: #2b2f30;
-  --text: #eeece5;
-  --muted: #a0a6a3;
-  --focus: #a8cbb9;
-  --border: #3a4140;
+  --surface: #262626;
+  --surface-raised: #333333;
+  --text: #eeeeee;
+  --muted: #a6a6a6;
+  --focus: #7fc8ff;
+  --border: #414141;
   --danger: #e2aaa3;
   --radius: 6px;
   --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;

@@ -1,6 +1,9 @@
 use e_desktop::{layout::Engine, model::*, platform::Backend};
 use std::{collections::BTreeMap, error::Error};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+#[cfg(target_os = "windows")]
+#[path = "support/windows_interaction.rs"]
+mod interaction;
 fn observe(backend: &mut Backend, pid: u32) -> Result<SystemSnapshot> {
     let mut system = backend.enumerate()?;
     system
@@ -55,6 +58,11 @@ fn checks(backend: &mut Backend, pid: u32, evidence: &mut Vec<serde_json::Value>
         "expected exactly three disposable fixture windows"
     );
     evidence.push(serde_json::json!({"original": &original}));
+    #[cfg(target_os = "windows")]
+    {
+        interaction::preview_checks(backend, &original, evidence)?;
+        interaction::animation_checks(backend, &original, evidence)?;
+    }
     let ids: Vec<_> = original.windows.iter().map(|w| w.id.clone()).collect();
     let monitor_id = original.windows[0].monitor_id.clone();
     let mut engine = Engine::new(backend.status());

@@ -25,8 +25,7 @@ use crate::{
     shortcuts::{Shortcuts, normalize_key},
 };
 
-const BAR_HEIGHT: f64 = 44.0;
-const RAIL_WIDTH: f64 = 56.0;
+const BAR_HEIGHT: f64 = 36.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 type Reply = mpsc::SyncSender<Result<Snapshot, AppError>>;
 
@@ -248,14 +247,13 @@ impl Controller {
             .iter()
             .map(|monitor| {
                 let top = (BAR_HEIGHT * monitor.scale_factor).round() as u32;
-                let left = (RAIL_WIDTH * monitor.scale_factor).round() as u32;
                 let area = monitor.work_area;
                 (
                     monitor.id.clone(),
                     Rect {
-                        x: area.x.saturating_add(left.min(area.width) as i32),
+                        x: area.x,
                         y: area.y.saturating_add(top.min(area.height) as i32),
-                        width: area.width.saturating_sub(left).max(1),
+                        width: area.width.max(1),
                         height: area.height.saturating_sub(top).max(1),
                     },
                 )
@@ -493,64 +491,33 @@ fn position_controls(app: &tauri::AppHandle, snapshot: &Snapshot) -> Result<(), 
     for (index, monitor) in snapshot.monitors.iter().enumerate() {
         let work = monitor.monitor.work_area;
         let top = (BAR_HEIGHT * monitor.monitor.scale_factor).round() as u32;
-        let left = (RAIL_WIDTH * monitor.monitor.scale_factor).round() as u32;
-        for (surface, rect) in [
-            (
-                "topbar",
-                Rect {
-                    x: work.x,
-                    y: work.y,
-                    width: work.width,
-                    height: top,
-                },
-            ),
-            (
-                "pagerail",
-                Rect {
-                    x: work.x,
-                    y: work.y.saturating_add(top as i32),
-                    width: left,
-                    height: work.height.saturating_sub(top).max(1),
-                },
-            ),
-        ] {
-            let label = control_label(surface, index);
-            labels.insert(label.clone());
-            let window = match app.get_webview_window(&label) {
-                Some(window) => window,
-                None => WebviewWindowBuilder::new(
-                    app,
-                    &label,
-                    WebviewUrl::App(
-                        format!("index.html?surface={surface}&monitorIndex={index}").into(),
-                    ),
-                )
-                .title("e-desktop")
-                .decorations(false)
-                .shadow(false)
-                .resizable(false)
-                .skip_taskbar(true)
-                .focused(false)
-                .visible(false)
-                .build()
-                .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?,
-            };
-            configure_window(&window, rect)?;
-            window
-                .set_always_on_top(snapshot.enabled)
-                .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))?;
-            if surface == "topbar" || snapshot.enabled {
-                window
-                    .show()
-                    .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))?;
-            } else {
-                let _ = window.hide();
-            }
-        }
+        let label = control_label("topbar", index);
+        labels.insert(label.clone());
+        let window = match app.get_webview_window(&label) {
+            Some(window) => window,
+            None => WebviewWindowBuilder::new(
+                app,
+                &label,
+                WebviewUrl::App(format!("index.html?surface=topbar&monitorIndex={index}").into()),
+            )
+            .title("e-desktop")
+            .decorations(false)
+            .shadow(false)
+            .resizable(false)
+            .skip_taskbar(true)
+            .focused(false)
+            .visible(false)
+            .build()
+            .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?,
+        };
+        configure_window(&window, Rect { x: work.x, y: work.y, width: work.width, height: top })?;
+        window
+            .set_always_on_top(snapshot.enabled)
+            .and_then(|_| window.show())
+            .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))?;
     }
     for (label, window) in app.webview_windows() {
-        if (label.starts_with("topbar-") || label.starts_with("pagerail-"))
-            && !labels.contains(&label)
+        if label.starts_with("topbar-") && !labels.contains(&label)
         {
             let _ = window.hide();
         }

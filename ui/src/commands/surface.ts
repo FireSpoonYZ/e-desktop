@@ -13,7 +13,9 @@ export function useSurface(onDismiss: () => void) {
     if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onDismiss(); }
     if (event.key !== 'Tab') return;
-    const controls = [...(root.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]') ?? [])];
+    const controls = [...(root.current?.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), select:not(:disabled), summary, [tabindex="0"]') ?? [])]
+      .filter((element) => element.getClientRects().length > 0
+        && (element.tagName === 'SUMMARY' || !element.closest('details:not([open])')));
     const first = controls[0], last = controls.at(-1);
     if (!first) { event.preventDefault(); root.current?.focus(); }
     else if (event.shiftKey && (document.activeElement === first || document.activeElement === root.current)) {

@@ -33,9 +33,12 @@ class SmokeFixture {
       forms.Add(f); f.Show();
     }
     var timer = new Timer { Interval=250 };
+    int frame = 0;
     timer.Tick += delegate {
+      frame++;
       var states = new List<object>();
       foreach (var f in forms.Where(f => !f.IsDisposed)) {
+        f.Controls[0].Text = f.Text + "\nLive frame " + frame + "\nDisposable native test window";
         Rect r, clip; GetWindowRect(f.Handle,out r);
         var region = CreateRectRgn(0,0,0,0); int kind = GetWindowRgn(f.Handle,region);
         GetRgnBox(region,out clip); DeleteObject(region);

@@ -762,11 +762,11 @@ impl Engine {
             Command::CycleWidth => {
                 let (id, m, p, c, _) = self.sizing_target()?;
                 let viewport = self.snapshot.monitors[m].viewport.width;
+                // niri preset-column-widths: 1/3, 1/2, 2/3; full width stays on ToggleFullscreen.
                 let presets = [
                     (viewport / 3).max(1),
                     (viewport / 2).max(1),
                     ((viewport as u64 * 2 / 3) as u32).max(1),
-                    viewport,
                 ];
                 let width = &mut self.snapshot.monitors[m].pages[p].columns[c].width;
                 *width = presets

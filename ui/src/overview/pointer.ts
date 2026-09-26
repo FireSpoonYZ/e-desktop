@@ -1,6 +1,20 @@
-import type { Command, Snapshot, WindowId } from '../model';
+import type { Command, Page, Rect, Snapshot, WindowId } from '../model';
 
-export const overviewScale = (scaleFactor: number) => .24 / Math.max(1, scaleFactor);
+/** Niri's half-size overview, reduced further when viewing a larger display. */
+export const overviewScale = (scaleFactor: number, viewportWidth = 1, availableWidth = Infinity) =>
+  Math.min(.5 / Math.max(1, scaleFactor), availableWidth / Math.max(1, viewportWidth));
+
+/** Keep column widths and scroll offsets in the same physical-to-CSS scale. */
+export function pageGeometry(page: Page, viewport: Rect, scale: number) {
+  const leading = Math.max(0, -page.viewportX);
+  return {
+    width: viewport.width * scale,
+    height: viewport.height * scale,
+    leading: leading * scale,
+    stripWidth: Math.max(viewport.width + Math.max(0, page.viewportX),
+      leading + page.columns.reduce((total, column) => total + column.width, 0)) * scale,
+  };
+}
 export const canInteract = (snapshot: Snapshot, busy: boolean) => !busy && snapshot.enabled
   && snapshot.backend.availability === 'ready' && snapshot.backend.capabilities.placement;
 

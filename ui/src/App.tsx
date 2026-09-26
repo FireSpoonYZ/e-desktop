@@ -3,7 +3,7 @@ import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onS
 import type { Surface } from './bridge';
 import { emptySnapshot } from './model';
 import type { OnCommand } from './model';
-import { TopBar, PageRail } from './shell';
+import { TopBar } from './shell';
 import { Overview } from './overview';
 import { CommandPalette } from './commands';
 
@@ -82,13 +82,12 @@ export default function App() {
     errors: [...snapshot.errors, { code: 'backendUnavailable' as const, message: localError, windowId: null }],
   } : snapshot;
   const monitor = snapshot.monitors[monitorIndex];
-  const selectedMonitor = surface === 'topbar' || surface === 'pagerail' ? monitor?.monitor.id : overlayMonitor;
+  const selectedMonitor = surface === 'topbar' ? monitor?.monitor.id : overlayMonitor;
   const localSnapshot = { ...displaySnapshot, activeMonitor: selectedMonitor ?? null };
   const props = { snapshot: localSnapshot, onCommand, busy };
 
   return <main className={`desktop-surface desktop-surface--${surface}`}>
-    {surface === 'pagerail' ? <PageRail {...props} monitorId={monitor?.monitor.id} />
-      : surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
+    {surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
       : surface === 'commands' ? <CommandPalette key={opening} {...props} onDismiss={onDismiss} />
       : <TopBar {...props} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
         onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }} />}

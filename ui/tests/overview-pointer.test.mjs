@@ -19,7 +19,7 @@ function moduleUrl(relative) {
   modules.set(file.href, url);
   return url;
 }
-const { moveCommand, widthCommand, overviewScale, physicalWidth, trackDrag, trackResize } = await import(moduleUrl('../src/overview/pointer.ts'));
+const { moveCommand, widthCommand, overviewScale, pageGeometry, physicalWidth, trackDrag, trackResize } = await import(moduleUrl('../src/overview/pointer.ts'));
 const { Overview } = await import(moduleUrl('../src/overview/index.tsx'));
 const { emptySnapshot } = await import(moduleUrl('../src/model.ts'));
 const rect = { x: 0, y: 0, width: 1000, height: 800 };
@@ -52,6 +52,21 @@ function emit(host, type, fields = {}) {
   host.dispatchEvent(event);
   return event;
 }
+
+test('overview scales the workspace, columns and signed viewport offsets together across DPI and screen sizes', () => {
+  const page = snapshot().monitors[0].pages[0];
+  assert.deepEqual(pageGeometry(page, rect, overviewScale(2)), {
+    width: 250, height: 200, leading: 0, stripWidth: 250,
+  });
+  assert.equal(overviewScale(1, 3840, 960), .25);
+  assert.equal(physicalWidth(500, 50, overviewScale(1, 3840, 960), 3840), 700);
+  assert.deepEqual(pageGeometry({ ...page, viewportX: -250 }, rect, .5), {
+    width: 500, height: 400, leading: 125, stripWidth: 500,
+  });
+  assert.deepEqual(pageGeometry({ ...page, viewportX: 750 }, rect, .5), {
+    width: 500, height: 400, leading: 0, stripWidth: 875,
+  });
+});
 
 test('overview move validates live window/page membership, pause, busy and capabilities', () => {
   const state = snapshot();
@@ -124,8 +139,8 @@ test('card drag threshold leaves clicks alone and disposal removes all drag call
 });
 
 test('physical resize uses overview scale, rounds/clamps and emits no focus command', () => {
-  assert.equal(overviewScale(2), .12);
-  assert.equal(physicalWidth(500, 24, overviewScale(2), 1000), 700);
+  assert.equal(overviewScale(2), .25);
+  assert.equal(physicalWidth(500, 50, overviewScale(2), 1000), 700);
   assert.equal(physicalWidth(500, -200, .12, 1000), 1);
   assert.equal(physicalWidth(500, 200, .12, 1000), 1000);
   assert.equal(physicalWidth(500, .2, .12, 1000), 502);
@@ -173,13 +188,13 @@ test('overview resize handler commits once and rechecks stale or paused state on
       const handle = elements.find((node) => node.props.className === 'overview-resize');
       handle.props.onPointerDown({ button: 0, pointerId: 7, clientX: 10, preventDefault() {},
         currentTarget: { setPointerCapture() {}, hasPointerCapture() { return false; } } });
-      emit(window, 'pointermove', { pointerId: 7, clientX: 34 });
+      emit(window, 'pointermove', { pointerId: 7, clientX: 60 });
       assert.deepEqual(calls, []);
       if (ending === 'gone') state.windows = [];
       if (ending === 'paused') state.enabled = false;
       if (ending === 'moved') state.monitors[0].pages[0].columns[0] = { ...state.monitors[0].pages[0].columns[0], id: 'new-column' };
       if (ending === 'lost-capture') handle.props.onLostPointerCapture();
-      emit(window, 'pointerup', { pointerId: 7, clientX: 34 });
+      emit(window, 'pointerup', { pointerId: 7, clientX: 60 });
       assert.deepEqual(calls, ending === 'valid' ? [{ type: 'setWindowColumnWidth', windowId: 'w', width: 700 }] : []);
     }
   } finally { globalThis.window = previousWindow; }

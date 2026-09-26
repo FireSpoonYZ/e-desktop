@@ -44,6 +44,7 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
 
   return <header className="shell-bar" aria-label="桌面窗口控制" aria-busy={busy}>
     <strong className="shell-brand">e-desktop</strong>
+    <PageRail snapshot={snapshot} onCommand={onCommand} monitorId={monitor?.monitor.id ?? ''} busy={busy} />
     <span className="shell-location" title={`${monitor?.monitor.name ?? '无显示器'} / ${page?.name ?? '无页面'}`}>
       {monitor?.monitor.name ?? '无显示器'}<span className="shell-muted"> / </span>{page?.name ?? '无页面'}
     </span>
@@ -72,7 +73,6 @@ export function PageRail({ snapshot, onCommand, monitorId, busy = false }: PageR
   const ready = snapshot.backend.availability === 'ready';
   const blocked = busy || !ready || (snapshot.enabled && !snapshot.backend.capabilities.placement);
   return <nav className="shell-rail" aria-label={`${monitor?.monitor.name ?? '显示器'}页面`} aria-busy={busy}>
-    <span className="shell-rail-heading" title={monitor?.monitor.name ?? '未检测到显示器'}>页</span>
     <div className="shell-pages">
       {monitor?.pages.map((page, index) => <button type="button" key={page.id}
         className="shell-page" aria-current={page.id === monitor.activePage ? 'page' : undefined}

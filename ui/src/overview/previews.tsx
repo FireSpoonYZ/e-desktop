@@ -144,7 +144,7 @@ export function usePreviewSlots(
     };
     const mutation = new MutationObserver(observe);
     mutation.observe(scope, { subtree: true, childList: true, attributes: true,
-      attributeFilter: ['class', 'style', 'hidden', 'data-preview-window-id'] });
+      attributeFilter: ['class', 'style', 'hidden', 'open', 'data-preview-window-id'] });
     for (let node = scope.parentElement; node; node = node.parentElement) {
       mutation.observe(node, { attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
     }
@@ -178,11 +178,11 @@ export function usePreviewSlots(
 }
 
 /** A dedicated, non-interactive rectangle; captions/buttons belong outside it. */
-export function WindowPreview({ windowId, available, status, height = 100 }: {
+export function WindowPreview({ windowId, available, status, height = '100%' }: {
   windowId: string;
   available: boolean;
   status?: PreviewStatus;
-  height?: number;
+  height?: number | string;
 }) {
   const state = available && status?.windowId === windowId ? status.state : undefined;
   const text = !available ? '此平台不支持实时预览'

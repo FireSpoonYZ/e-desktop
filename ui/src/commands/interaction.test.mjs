@@ -28,6 +28,7 @@ const { commandActions, paletteKey, nextSelection } = await import(moduleUrl('./
 const { emptySnapshot } = await import(moduleUrl('../model.ts'));
 const { Overview } = await import(moduleUrl('../overview/index.tsx'));
 const { CommandPalette } = await import(moduleUrl('./index.tsx'));
+const { useSurface } = await import(moduleUrl('./surface.ts'));
 const rect = { x: 0, y: 0, width: 1000, height: 800 };
 const snapshot = {
   ...emptySnapshot, enabled: true,
@@ -102,7 +103,11 @@ test('keyboard selection wraps, empty results are safe, IME cannot execute or di
 
 test('overview renders ordered proportional columns, focused state and real destination controls', () => {
   const html = renderToStaticMarkup(createElement(Overview, { snapshot, onCommand() {}, onDismiss() {} }));
-  assert.ok(html.indexOf('width:144px') < html.indexOf('width:72px'));
+  assert.match(html, /width:300px/);
+  assert.match(html, /width:150px/);
+  assert.ok(html.indexOf('width:300px') < html.indexOf('width:150px'));
+  assert.match(html, /<details class="overview-edit">/);
+  assert.doesNotMatch(html, /<details[^>]* open/);
   assert.match(html, /data-focused="true"/);
   assert.match(html, /aria-pressed="true"/);
   assert.match(html, /<option value="p2">Main · 第二页<\/option>/);
@@ -125,6 +130,18 @@ function capture(Component, props) {
   visit(tree);
   return elements;
 }
+
+test('overview opens on the selected display and keeps cross-display move destinations', () => {
+  const secondary = { ...snapshot.monitors[0], monitor: { id: 'm2', name: 'Secondary', scaleFactor: 2 }, activePage: 'p3', pages: [
+    { ...snapshot.monitors[0].pages[0], id: 'p3', name: '另一屏工作区' },
+  ] };
+  const state = { ...snapshot, activeMonitor: 'm2', monitors: [...snapshot.monitors, secondary] };
+  const html = renderToStaticMarkup(createElement(Overview, { snapshot: state, onCommand() {}, onDismiss() {} }));
+  assert.match(html, /data-overview-page="p3"/);
+  assert.doesNotMatch(html, /data-overview-page="p1"/);
+  assert.match(html, /<option value="p1">Main · 第一页<\/option>/);
+  assert.match(html, /title="Secondary" aria-pressed="true"/);
+});
 
 test('overview native select dispatches a move; focus dismisses only after command resolution', async () => {
   const commands = [];
@@ -185,6 +202,24 @@ test('palette size clicks are gated by busy/paused state and pending IPC, then d
   assert.equal(dismissed, 0);
   resolve(); await Promise.resolve();
   assert.equal(dismissed, 1);
+});
+
+test('focus containment skips closed details inputs even when Chromium reports layout rectangles', () => {
+  let surface, focused = null;
+  function Capture() { surface = useSurface(() => {}); return null; }
+  renderToStaticMarkup(createElement(Capture));
+  const control = (tagName, closed) => ({ tagName, getClientRects: () => [{}], closest: () => closed ? {} : null,
+    focus() { focused = this; } });
+  const close = control('BUTTON', false), summary = control('SUMMARY', true), input = control('INPUT', true);
+  surface.root.current = { querySelectorAll: () => [close, summary, input] };
+  const previous = globalThis.document;
+  try {
+    globalThis.document = { activeElement: summary };
+    let prevented = false;
+    surface.onKeyDown({ key: 'Tab', shiftKey: false, nativeEvent: {}, preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+    assert.equal(focused, close);
+  } finally { globalThis.document = previous; }
 });
 
 test('empty surfaces do not fabricate native windows and expose accessible search', () => {
