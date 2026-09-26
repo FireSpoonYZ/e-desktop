@@ -1,27 +1,17 @@
-use crate::model::{AppError, BackendStatus, NativeAction, SystemSnapshot};
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::Backend;
 
-/// Baseline only. Integration replaces this with cfg-selected static Backend exports.
-/// Platform workers implement the same inherent methods; no trait/plugin registry.
-pub struct Backend;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::Backend;
 
-impl Backend {
-    pub fn new() -> Result<Self, AppError> {
-        Err(AppError::not_implemented("Native backend"))
-    }
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::Backend;
 
-    pub fn status(&self) -> BackendStatus {
-        BackendStatus::default()
-    }
-
-    pub fn enumerate(&mut self) -> Result<SystemSnapshot, AppError> {
-        Err(AppError::not_implemented("Native enumeration"))
-    }
-
-    pub fn apply(&mut self, _actions: &[NativeAction]) -> Result<(), AppError> {
-        Err(AppError::not_implemented("Native actions"))
-    }
-
-    pub fn restore(&mut self) -> Result<(), AppError> {
-        Err(AppError::not_implemented("Native restoration"))
-    }
-}
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+compile_error!("e-desktop currently supports desktop Windows, Linux X11, and macOS targets.");

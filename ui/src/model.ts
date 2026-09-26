@@ -102,6 +102,7 @@ export interface ControlProps { snapshot: Snapshot; onCommand: OnCommand; busy?:
 export interface TopBarProps extends ControlProps {
   onOpenOverview: () => void;
   onOpenCommands: () => void;
+  onQuit?: () => void;
 }
 export interface PageRailProps extends ControlProps { monitorId?: MonitorId }
 export interface OverviewProps extends ControlProps { onDismiss: () => void }

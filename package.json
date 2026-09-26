@@ -7,7 +7,7 @@
     "dev": "vite --config ui/vite.config.ts",
     "typecheck": "tsc --noEmit -p ui/tsconfig.json",
     "build": "npm run typecheck && vite build --config ui/vite.config.ts",
-    "test": "node --test ui/tests/*.test.mjs",
+    "test": "node --test ui/tests/*.test.mjs ui/src/shell/*.test.mjs ui/src/commands/*.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -1,46 +1,74 @@
-# Implementation contract — baseline v1
+# Implementation contract — desktop v1
 
-Shared source of truth: `src-tauri/src/model.rs` and `ui/src/model.ts`. Changes require parent coordination. Baseline is a compiling seam, **not implemented window management**. Starts paused; every mutation returns `notImplemented`; no shortcuts are registered. No GUI was launched during baseline work.
+Shared source of truth: `src-tauri/src/model.rs` and `ui/src/model.ts`. Rust owns layout; the frontend renders complete snapshots and submits commands. Application startup and refresh never enable management implicitly.
 
 ## Wire and state
 
-- Serde camelCase fields; commands/actions use internally tagged `{ "type": "..." }`. IDs are opaque strings, never JS numeric native handles. Optional fields serialize as `null`.
-- `get_snapshot() -> Snapshot`; `execute(command: Command) -> Result<Snapshot, AppError>`; JS `invoke('execute', { command })`. Intended event: `snapshot` with complete `Snapshot`; baseline emits none.
-- Commands: refresh, enable, disable, focusWindow(windowId), focusDirection(direction), switchPage(monitorId,pageId), addPage(monitorId), moveWindowToPage(windowId,pageId), moveWindow(direction), cycleWidth, centerFocused, scroll(monitorId,delta), toggleFloating, toggleFullscreen, closeWindow(windowId). Directions: left/right/up/down. Scroll delta: signed physical horizontal pixels. Implicit commands address focused window/active monitor. Page IDs are globally unique within a snapshot.
-- Physical screen-pixel Rect has signed x/y and unsigned width/height. UI converts physical geometry to CSS using monitor scaleFactor. MonitorState owns pages, activePage and usable viewport; each Page retains viewportX, ordered columns and floatingWindows. Columns contain top-to-bottom window IDs. Native metadata lives in Snapshot.windows[].native. No task/project objects.
-- Floating exits automatic placement; fullscreen means layout fills the usable monitor viewport, **not** OS-native fullscreen. Layout/integration must agree control-window reservations before enabling management.
-- BackendStatus explicitly separates availability from capabilities. `ready` does not imply every capability. No fabricated sample windows or silent successful unsupported operations.
+- Serde camelCase fields; commands/actions are internally tagged `{ "type": "..." }`. IDs are opaque strings, never JS numeric native handles. Optional fields serialize as `null`.
+- `get_snapshot() -> Snapshot`; `execute(command) -> Result<Snapshot, AppError>`; JS calls `invoke('execute', { command })`.
+- `snapshot` events carry the full state. UI subscribes before fetching its initial snapshot and treats subsequent events as authoritative.
+- Native surface commands: `open_surface({surface, monitorId?})`, `dismiss_surface({surface})`, `quit()`. Surface is `overview` or `commands`; invalid explicit monitor IDs are rejected. `surface-opened` carries the selected monitor ID or null.
+- Commands: refresh, enable, disable, focusWindow(windowId), focusDirection(direction), switchPage(monitorId,pageId), addPage(monitorId), moveWindowToPage(windowId,pageId), moveWindow(direction), cycleWidth, centerFocused, scroll(monitorId,delta), toggleFloating, toggleFullscreen, closeWindow(windowId). Directions are left/right/up/down. Scroll delta is signed physical horizontal pixels. Implicit commands address the focused window or active monitor.
+- Rect uses physical screen pixels: signed x/y and unsigned width/height, including negative monitor origins. Native work areas remain unchanged. MonitorState.viewport reserves a 44 CSS px topbar and 56 CSS px rail, converted using scaleFactor.
+- Monitors own independent pages and activePage; pages retain viewportX, ordered columns and floatingWindows. Columns contain top-to-bottom window IDs. Native metadata lives in Snapshot.windows[].native.
+- Floating windows leave tiling. Layout fullscreen fills the usable viewport; it is not OS-native fullscreen. Existing floating geometry survives minimized/iconic enumeration. Layout state is session-local.
+- BackendStatus separates availability and individual capabilities. `ready` does not imply every capability. No sample/fabricated windows or silent unsupported enumeration.
 
-## Exclusive lanes and signatures
+## Modules and signatures
 
-| Owner | Files / exports |
+| Module | Exports |
 | --- | --- |
-| Layout | `src-tauri/src/layout/`: `Engine::new(BackendStatus) -> Self`, `snapshot(&self) -> &Snapshot`, `reconcile(&mut self, SystemSnapshot) -> Result<Transition, AppError>`, `dispatch(&mut self, Command) -> Result<Transition, AppError>` |
-| Windows | `src-tauri/src/platform/windows/mod.rs`: `pub struct Backend` with methods below |
-| Linux | `src-tauri/src/platform/linux/mod.rs`: same Backend methods; reject unsupported Wayland sessions explicitly |
-| macOS | `src-tauri/src/platform/macos/mod.rs`: same Backend methods; report AX permission requirements |
-| Shell | `ui/src/shell/index.tsx`: named `TopBar(TopBarProps)`, `PageRail(PageRailProps)` |
-| Overview/commands | `ui/src/overview/index.tsx`: named `Overview(OverviewProps)`; `ui/src/commands/index.tsx`: named `CommandPalette(CommandPaletteProps)` |
-| Parent integration | `App.tsx`, `bridge.ts`, `src-tauri/src/app.rs`, `platform/mod.rs`, manifests/locks, shared models and theme |
-
-Backend inherent methods (no trait registry):
+| `src-tauri/src/layout/` | Engine and pure behavior tests |
+| `src-tauri/src/platform/windows/` | Win32 Backend |
+| `src-tauri/src/platform/linux/` | X11 Backend; explicitly unsupported Wayland |
+| `src-tauri/src/platform/macos/` | Accessibility/CoreGraphics Backend |
+| `ui/src/shell/` | TopBar, PageRail |
+| `ui/src/overview/`, `ui/src/commands/` | Overview, CommandPalette |
+| Integration | App.tsx, bridge.ts, app.rs, target-cfg platform selector, shared models/config |
 
 ```rust
-pub fn new() -> Result<Self, AppError>;
-pub fn status(&self) -> BackendStatus;
-pub fn enumerate(&mut self) -> Result<SystemSnapshot, AppError>;
-pub fn apply(&mut self, actions: &[NativeAction]) -> Result<(), AppError>;
-pub fn restore(&mut self) -> Result<(), AppError>;
+// Pure layout, no OS or Tauri calls.
+Engine::new(BackendStatus) -> Self;
+Engine::snapshot(&self) -> &Snapshot;
+Engine::set_backend(&mut self, BackendStatus); // no layout reset
+Engine::set_viewports(&mut self, BTreeMap<MonitorId, Rect>);
+Engine::reconcile(&mut self, SystemSnapshot) -> Result<Transition, AppError>;
+Engine::dispatch(&mut self, Command) -> Result<Transition, AppError>;
+
+// Each statically selected platform Backend has these inherent methods.
+Backend::new() -> Result<Self, AppError>;
+Backend::status(&self) -> BackendStatus;
+Backend::enumerate(&mut self) -> Result<SystemSnapshot, AppError>;
+Backend::apply(&mut self, &[NativeAction]) -> Result<(), AppError>;
+Backend::restore(&mut self) -> Result<(), AppError>;
 ```
 
-Parent replaces baseline `platform/mod.rs` stub with target-cfg Backend reexports. Platform modules do not call layout or Tauri. No preview signature/dependency is frozen; coordinate before adding thumbnail capture. Windows windows-sys and Linux x11rb dependencies are already declared. macOS may use narrow native framework FFI; dependency additions belong to parent.
+`Transition` contains an updated snapshot and ordered native actions. Commands commit layout transactionally. Close emits a request; a window is removed after native enumeration confirms its lifetime ended.
 
-NativeAction separates Placement(rect,clip,minimized), Focus, Close and per-window Restore. Clip uses physical screen coordinates; backend converts to native region coordinates. `None` removes manager-owned clipping, not pre-existing application regions. Preserve original native placement/region/state before first mutation. Retain manager-minimized windows in enumeration; absence is not closure unless native lifetime checks confirm it. Fully offscreen windows use recoverable minimization, never inaccessible hiding. Close is graceful, not process termination. Disable/normal exit call restore; restore must attempt all owned windows and surface failure. Partial apply failures require fresh enumeration, not claiming all actions succeeded. Abnormal-exit restoration is not guaranteed by this baseline.
+Integration creates and retains Backend on a dedicated OS thread, including non-Send macOS AX objects. A bounded request queue separates IPC from native work. Blocking native requests never run on the WebView/Cocoa main thread. Native enumeration is polled at 500 ms while idle. Runtime backend status is synchronized into Engine before capability checks. Viewport overrides are supplied before reconciliation.
 
-`Transition` contains updated Snapshot plus ordered NativeAction list. Pure layout has no OS/Tauri dependency; integration owns refresh/enumeration, native application, error publication, activation/restore lifecycle and global shortcuts. Never enable as a side effect of construction or refresh.
+Background reconciliation does not force foreground focus. Unchanged placements are skipped when the observed native state still matches. Native apply failures refresh metadata; Placement/Restore failures pause automatic layout and attempt recovery.
 
-All UI props are exported from `ui/src/model.ts`: common `{snapshot, onCommand, busy?}`; TopBar adds `onOpenOverview`, `onOpenCommands`; PageRail adds optional `monitorId`; Overview and CommandPalette add `onDismiss`. `onCommand: (Command) => void | Promise<void>`. Components do not invoke IPC or own a second layout state. Import named exports from their directory; all skeletons participate in App's typecheck/build. Parent handles showing/hiding native surfaces. Topbar is the only initially visible window; pagerail, overview and commands remain hidden until integration positions/shows them. No fullscreen daily web overlay.
+## Native ownership and lifecycle
 
-## Checks
+NativeAction separates Placement(rect,clip,minimized), Focus, graceful Close and per-window Restore. Clip is in physical screen coordinates; the backend converts it to native region coordinates. `None` removes manager-owned clipping, not pre-existing application regions.
 
-From repository root: `npm ci`; `npm run typecheck`; `npm run build`; `npm test`; `cargo test --workspace --no-default-features`; `cargo build --workspace`. `npm run tauri -- dev` launches GUI (parent only); `npm run tauri -- build --no-bundle` builds desktop release. Both lockfiles are committed. Only Windows compilation has been checked; Linux/macOS and all real-window behavior require independent verification.
+Before first mutation, retain original geometry/show/region state as supported by the platform. Manager-minimized windows remain enumerable. Fully offscreen windows use recoverable minimization; on non-clipping backends, partially offscreen tiled windows also minimize. The focused column fits and becomes fully visible. Floating windows retain free placement.
+
+Validate window instance identity rather than trusting reusable native IDs. Windows uses per-HWND lifetime properties; X11 uses session/generation properties and guarded request submission; macOS retains AX identity. These are lifecycle protections, not isolation from malicious clients with equivalent OS privileges.
+
+Disable and normal exit attempt restoration of all owned windows. Failed restoration retains ownership for retry and surfaces errors. Having no originals is a successful no-op, even without AX permission or on unsupported Wayland; enumerate/apply remain explicit failures on unsupported sessions. Do not infer absence of restore ownership from paused state.
+
+Application ExitRequested and native window-close paths use the same asynchronous worker restore handshake. Only successful restoration permits final application exit; failure leaves the app paused with an error. No synchronous main-thread wait is allowed, because macOS screen collection uses the main queue. Forced termination/crash recovery is not guaranteed.
+
+## Native UI surfaces
+
+Each monitor has a topbar and rail; dynamic labels use `topbar-N` and `pagerail-N` and have matching local capabilities. Controls have no native shadow, so their outer/client bounds match the reserved area. Rails are hidden when paused. Permanent controls are topmost only while enabled. Overview/commands are temporarily topmost when opened, above the controls, and hidden on dismissal.
+
+All components receive `{snapshot, onCommand, busy?}`. TopBar also receives `onOpenOverview`, `onOpenCommands`, optional `onQuit`; PageRail accepts optional monitorId; Overview and CommandPalette accept onDismiss. Components do not invoke IPC or implement a second layout state machine. App owns IPC errors; shell consumes rejected promises, while transient surfaces dismiss only after successful commands.
+
+Overview displays actual metadata and geometry with explicit unavailable previews. Command palette handles selection, IME composition, focus containment and escape dismissal. Native thumbnails, pointer-follow focus, networking/mobile/LLM services and persistent layout configuration are outside this iteration.
+
+## Validation
+
+`npm test`, `npm run typecheck`, `cargo test --workspace --no-default-features --locked`, and `npm run tauri -- build --debug --no-bundle` pass on the Windows host. `scripts/windows-smoke.ps1` exercises the actual Win32 backend and Engine with PID-scoped disposable windows. See [the dated validation record](validation/windows-2026-09-26.md) for actual GUI coverage and remaining limits. Host harness checks for X11/macOS are not target-platform runtime verification.

@@ -1,0 +1,75 @@
+.shell-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  height: 44px;
+  max-height: 100dvh;
+  min-height: 0;
+  padding: 4px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  line-height: 18px;
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.shell-bar > * { flex-shrink: 0; }
+.shell-brand { font-size: 12px; font-weight: 600; }
+.shell-muted, .shell-feedback, .shell-rail-heading { color: var(--muted); }
+.shell-location { max-width: 24ch; overflow: hidden; text-overflow: ellipsis; }
+.shell-bar button, .shell-rail button { border-radius: var(--radius); padding: 4px 8px; min-height: 28px; }
+.shell-bar button:hover:not(:disabled), .shell-rail button:hover:not(:disabled) {
+  background: var(--surface-raised);
+  border-color: var(--muted);
+}
+.shell-bar button:focus-visible, .shell-rail button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -3px;
+}
+.shell-bar button:disabled, .shell-rail button:disabled { opacity: .5; cursor: not-allowed; }
+.shell-toggle[aria-pressed="true"], .shell-page[aria-current="page"] {
+  color: var(--focus);
+  border-color: var(--focus);
+  background: var(--surface-raised);
+}
+.shell-bar .shell-feedback {
+  margin: 0;
+  min-width: 14ch;
+  max-width: 48ch;
+  flex: 1 1 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.shell-bar .shell-error { color: var(--danger); }
+.shell-viewport { font-size: 11px; font-family: var(--font-mono); }
+.shell-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px;
+  background: var(--background);
+  border-right: 1px solid var(--border);
+}
+.shell-rail-heading { font-size: 11px; }
+.shell-pages { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
+.shell-rail .shell-page { width: 100%; max-width: 40px; padding: 4px 2px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.shell-rail-empty { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; text-align: center; }
+@media (max-width: 600px) {
+  .shell-brand, .shell-viewport { display: none; }
+  .shell-location { max-width: 14ch; }
+}
+@media (max-height: 36px) {
+  .shell-bar { padding-block: 1px; }
+  .shell-bar button { min-height: 24px; padding-block: 2px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shell-bar *, .shell-rail * { animation: none; transition: none; scroll-behavior: auto; }
+}
