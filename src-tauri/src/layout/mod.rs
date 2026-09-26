@@ -21,6 +21,7 @@ pub struct Engine {
     /// Relative shares of space above each tiled window's one-pixel minimum.
     height_weights: BTreeMap<WindowId, u32>,
     window_rules: Vec<WindowRule>,
+    pending_rule_floating: BTreeSet<WindowId>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -72,6 +73,7 @@ impl Engine {
             fullscreen_restore: BTreeMap::new(),
             height_weights: BTreeMap::new(),
             window_rules: vec![],
+            pending_rule_floating: BTreeSet::new(),
         }
     }
 
@@ -195,6 +197,7 @@ impl Engine {
                 window_id: id.clone(),
             });
         }
+        next.update_pending_rule_floating(&actions);
         *self = next;
         Ok(self.transition(actions))
     }
@@ -287,6 +290,7 @@ impl Engine {
         self.snapshot
             .windows
             .retain(|w| window_ids.contains(&w.native.id));
+        self.update_pending_rule_floating(&[]);
         let mut new_windows = BTreeSet::new();
         for mut native in system.windows {
             if let Some(existing) = self
@@ -295,9 +299,11 @@ impl Engine {
                 .iter_mut()
                 .find(|w| w.native.id == native.id)
             {
-                // Iconic rectangles are not floating restore targets. Keep the last normal
-                // geometry; fullscreen_restore separately owns the pre-fullscreen rectangle.
-                if existing.floating && native.minimized {
+                // Keep normal geometry for iconic windows and rule moves not yet placed visibly.
+                // fullscreen_restore separately owns the pre-fullscreen rectangle.
+                if existing.floating
+                    && (native.minimized || self.pending_rule_floating.contains(&native.id))
+                {
                     native.rect = existing.native.rect;
                 }
                 existing.native = native;
@@ -546,6 +552,7 @@ impl Engine {
     pub fn dispatch(&mut self, command: Command) -> Result<Transition, AppError> {
         let mut next = self.clone();
         let actions = next.dispatch_inner(command)?;
+        next.update_pending_rule_floating(&actions);
         *self = next;
         Ok(self.transition(actions))
     }

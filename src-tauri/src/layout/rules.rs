@@ -10,6 +10,32 @@ impl Engine {
         Ok(())
     }
 
+    pub(super) fn update_pending_rule_floating(&mut self, actions: &[NativeAction]) {
+        for action in actions {
+            // A minimized placement only hides the native window; it does not apply its rect.
+            if let NativeAction::Placement {
+                window_id,
+                minimized: false,
+                ..
+            }
+            | NativeAction::Restore { window_id } = action
+            {
+                self.pending_rule_floating.remove(window_id);
+            }
+        }
+        self.pending_rule_floating.retain(|id| {
+            self.snapshot
+                .windows
+                .iter()
+                .any(|w| &w.native.id == id && w.floating)
+                && self
+                    .snapshot
+                    .monitors
+                    .iter()
+                    .any(|m| m.pages.iter().any(|p| p.floating_windows.contains(id)))
+        });
+    }
+
     pub(super) fn insert_new_window(&mut self, id: &str) -> Result<(), AppError> {
         let w = self.window_index(id)?;
         let native = &self.snapshot.windows[w].native;
@@ -43,6 +69,7 @@ impl Engine {
         if self.snapshot.windows[w].floating && source != m {
             let source = self.snapshot.monitors[source].viewport;
             let target = self.snapshot.monitors[m].viewport;
+            self.pending_rule_floating.insert(id.into());
             let rect = &mut self.snapshot.windows[w].native.rect;
             // Same translation/clamping as a manual cross-monitor floating move.
             rect.x = coordinate((rect.x as i64 + target.x as i64 - source.x as i64).clamp(
@@ -401,6 +428,143 @@ mod tests {
             1
         );
         assert_eq!(e.snapshot.monitors[m].pages.len(), 2);
+    }
+
+    #[test]
+    fn paused_cross_monitor_floating_keeps_rule_rect_until_visible_placement() {
+        for page_index in [1, 2] {
+            let mut e = engine();
+            e.dispatch(Command::Disable).unwrap();
+            e.set_window_rules(vec![WindowRule {
+                floating: Some(true),
+                monitor_id: Some("b".into()),
+                page_index: Some(page_index),
+                ..WindowRule::default()
+            }])
+            .unwrap();
+            let mut native = system();
+            native.windows.push(window("new", "a"));
+            native.focused_window = Some("new".into());
+            let expected = Rect {
+                x: -1160,
+                y: 40,
+                width: 500,
+                height: 400,
+            };
+            for _ in 0..2 {
+                assert!(e.reconcile(native.clone()).unwrap().actions.is_empty());
+                assert_eq!(
+                    e.snapshot.windows[e.window_index("new").unwrap()]
+                        .native
+                        .rect,
+                    expected
+                );
+            }
+            // Reloads still do not reroute an existing pending window.
+            e.set_window_rules(vec![rule(r#"{"floating":false,"monitorId":"a"}"#)])
+                .unwrap();
+            let t = e.dispatch(Command::Enable).unwrap();
+            assert_eq!(
+                placement(&t.actions, "new"),
+                (expected, None, page_index == 2)
+            );
+            if page_index == 2 {
+                // A minimized Placement does not move the native rectangle on Windows.
+                native.windows.last_mut().unwrap().minimized = true;
+                native.windows.last_mut().unwrap().minimized_by_manager = true;
+                e.reconcile(native.clone()).unwrap();
+                // Even an external restore on the old monitor cannot consume the pending move.
+                native.windows.last_mut().unwrap().minimized = false;
+                native.windows.last_mut().unwrap().minimized_by_manager = false;
+                let t = e.reconcile(native.clone()).unwrap();
+                assert_eq!(placement(&t.actions, "new"), (expected, None, true));
+                let page = e.snapshot.monitors[1].pages[1].id.clone();
+                let t = e
+                    .dispatch(Command::SwitchPage {
+                        monitor_id: "b".into(),
+                        page_id: page,
+                    })
+                    .unwrap();
+                assert_eq!(placement(&t.actions, "new"), (expected, None, false));
+            }
+            // After the first visible placement, ordinary native/user geometry wins again.
+            let moved = Rect {
+                x: -900,
+                y: 120,
+                width: 420,
+                height: 300,
+            };
+            let new = native.windows.last_mut().unwrap();
+            new.monitor_id = "b".into();
+            new.rect = moved;
+            let t = e.reconcile(native).unwrap();
+            assert_eq!(placement(&t.actions, "new"), (moved, None, false));
+        }
+    }
+
+    #[test]
+    fn pending_rule_geometry_is_released_on_restore_removal_disconnect_and_manual_move() {
+        for event in ["restore", "remove", "disconnect", "manual"] {
+            let mut e = engine();
+            e.dispatch(Command::Disable).unwrap();
+            e.set_window_rules(vec![rule(
+                r#"{"floating":true,"monitorId":"b","pageIndex":2}"#,
+            )])
+            .unwrap();
+            let mut native = system();
+            native.windows.push(window("new", "a"));
+            native.focused_window = None;
+            e.reconcile(native.clone()).unwrap();
+            assert!(e.pending_rule_floating.contains("new"));
+            match event {
+                "restore" => {
+                    e.dispatch(Command::Enable).unwrap();
+                    assert!(e.pending_rule_floating.contains("new"));
+                    let t = e.dispatch(Command::Disable).unwrap();
+                    assert!(t.actions.iter().any(
+                        |a| matches!(a, NativeAction::Restore { window_id } if window_id == "new")
+                    ));
+                }
+                "remove" => {
+                    native.windows.pop();
+                }
+                "disconnect" => {
+                    native.monitors.retain(|m| m.id != "b");
+                    native.windows.retain(|w| w.id != "4");
+                }
+                "manual" => {
+                    e.dispatch(Command::Enable).unwrap();
+                    let page = e.snapshot.monitors[0].active_page.clone();
+                    let t = e
+                        .dispatch(Command::MoveWindowToPage {
+                            window_id: "new".into(),
+                            page_id: page,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        placement(&t.actions, "new"),
+                        (window("new", "a").rect, None, false)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            e.reconcile(native.clone()).unwrap();
+            assert!(e.pending_rule_floating.is_empty(), "{event}");
+            if event != "remove" {
+                assert_eq!(
+                    e.snapshot.windows[e.window_index("new").unwrap()]
+                        .native
+                        .rect,
+                    window("new", "a").rect,
+                    "{event}"
+                );
+            } else {
+                e.set_window_rules(vec![]).unwrap();
+                native.windows.push(window("new", "a"));
+                e.reconcile(native).unwrap();
+                assert!(!e.snapshot.windows[e.window_index("new").unwrap()].floating);
+            }
+        }
     }
 
     #[test]
