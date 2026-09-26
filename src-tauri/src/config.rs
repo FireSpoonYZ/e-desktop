@@ -75,6 +75,10 @@ enum StrictCommand {
     MoveWindowToPage { window_id: String, page_id: String },
     MoveWindow { direction: Direction },
     CycleWidth {},
+    SetColumnWidth { width: u32 },
+    AdjustColumnWidth { delta: i32 },
+    AdjustWindowHeight { delta: i32 },
+    ResetWindowHeights {},
     CenterFocused {},
     Scroll { monitor_id: String, delta: i32 },
     ToggleFloating {},
@@ -156,6 +160,18 @@ impl Default for Config {
             bind(
                 format!("Control+Alt+{key}"),
                 ShortcutAction::Scroll { direction },
+            );
+        }
+        for (key, command) in [
+            ("Left", Command::AdjustColumnWidth { delta: -50 }),
+            ("Right", Command::AdjustColumnWidth { delta: 50 }),
+            ("Up", Command::AdjustWindowHeight { delta: 50 }),
+            ("Down", Command::AdjustWindowHeight { delta: -50 }),
+            ("R", Command::ResetWindowHeights),
+        ] {
+            bind(
+                format!("Control+Alt+Shift+{key}"),
+                ShortcutAction::Command { command },
             );
         }
         Self { shortcuts }
@@ -298,7 +314,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::default().shortcuts.len(), 41);
+        assert_eq!(Config::default().shortcuts.len(), 46);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -339,6 +355,24 @@ mod tests {
             Config::parse(&serde_json::to_vec(&defaults).unwrap()).unwrap(),
             defaults
         );
+    }
+
+    #[test]
+    fn sizing_shortcuts_share_the_ipc_contract() {
+        for command in [
+            Command::SetColumnWidth { width: 700 },
+            Command::AdjustColumnWidth { delta: -50 },
+            Command::AdjustWindowHeight { delta: 50 },
+            Command::ResetWindowHeights,
+        ] {
+            let json = serde_json::json!({"shortcuts": [{"key": "Control+Alt+W", "action": {"type": "command", "command": command}}]});
+            let config = Config::parse(&serde_json::to_vec(&json).unwrap()).unwrap();
+            assert_eq!(
+                config.shortcuts[0].action,
+                ShortcutAction::Command { command }
+            );
+        }
+        assert!(Config::parse(br#"{"shortcuts":[{"key":"A","action":{"type":"command","command":{"type":"adjustColumnWidth","delta":50,"width":900}}}]}"#).is_err());
     }
 
     #[test]

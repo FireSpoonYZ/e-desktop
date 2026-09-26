@@ -240,6 +240,6 @@ mod tests {
                 .is_err()
         );
         let defaults = Config::default().normalize_keys(normalize_key).unwrap();
-        assert_eq!(defaults.shortcuts.len(), 41);
+        assert_eq!(defaults.shortcuts.len(), 46);
     }
 }
