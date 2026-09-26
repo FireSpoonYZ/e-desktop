@@ -1,4 +1,5 @@
 //! Win32 backend. Poll on the owning thread; no hooks or desktop mutation at construction.
+pub mod preview;
 use crate::model::*;
 use std::{
     collections::HashMap,
@@ -58,6 +59,7 @@ struct Entry {
     minimized: bool,
 }
 pub struct Backend {
+    previews: preview::Previews,
     entries: HashMap<String, Entry>,
     property: Vec<u16>,
     next: usize,
@@ -186,6 +188,7 @@ impl Backend {
             .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string(), None))?
             .as_nanos();
         Ok(Self {
+            previews: preview::Previews::default(),
             entries: HashMap::new(),
             property: wide(&format!(
                 "e-desktop.{}.{}",
@@ -198,7 +201,7 @@ impl Backend {
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
             capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, ..Capabilities::default() },
-            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. No preview or pointer-focus implementation.".into() }
+            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. DWM preview API requires overview host integration; no pointer-focus implementation.".into() }
     }
     fn alive(&self, e: &Entry) -> bool {
         let h = e.hwnd as HWND;
@@ -211,6 +214,7 @@ impl Backend {
         }
     }
     pub fn enumerate(&mut self) -> Result<SystemSnapshot, AppError> {
+        self.prune_previews();
         let _dpi = DpiScope::enter()?;
         let mut result = SystemSnapshot::default();
         let mut monitors = Vec::<usize>::new();
@@ -656,6 +660,7 @@ impl Backend {
         Ok(())
     }
     pub fn restore(&mut self) -> Result<(), AppError> {
+        self.clear_previews();
         let _dpi = DpiScope::enter()?;
         let ids: Vec<_> = self.entries.keys().cloned().collect();
         let mut failures = Vec::new();
