@@ -549,7 +549,17 @@ mod tests {
                 _ => unreachable!(),
             }
             e.reconcile(native.clone()).unwrap();
-            assert!(e.pending_rule_floating.is_empty(), "{event}");
+            if event == "disconnect" {
+                // The borrowed background page is retained; its translated move is still pending.
+                assert!(e.pending_rule_floating.contains("new"));
+                let (m, p, _) = e.location("new").unwrap();
+                assert_ne!(
+                    e.snapshot.monitors[m].pages[p].id,
+                    e.snapshot.monitors[m].active_page
+                );
+            } else {
+                assert!(e.pending_rule_floating.is_empty(), "{event}");
+            }
             if event != "remove" {
                 assert_eq!(
                     e.snapshot.windows[e.window_index("new").unwrap()]

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::model::*;
 use crate::rules::WindowRule;
 
+mod monitors;
 mod rules;
 
 mod sizing;
@@ -22,6 +23,11 @@ pub struct Engine {
     height_weights: BTreeMap<WindowId, u32>,
     window_rules: Vec<WindowRule>,
     pending_rule_floating: BTreeSet<WindowId>,
+    disconnected_monitors: BTreeMap<MonitorId, monitors::DisconnectedMonitor>,
+    monitor_order: Vec<MonitorId>,
+    /// Explicit moves into borrowed pages stay on their chosen host when the owner returns.
+    hotplug_pinned: BTreeMap<WindowId, MonitorId>,
+    outputs_suspended: bool,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -74,6 +80,10 @@ impl Engine {
             height_weights: BTreeMap::new(),
             window_rules: vec![],
             pending_rule_floating: BTreeSet::new(),
+            disconnected_monitors: BTreeMap::new(),
+            monitor_order: vec![],
+            hotplug_pinned: BTreeMap::new(),
+            outputs_suspended: false,
         }
     }
 
@@ -186,6 +196,10 @@ impl Engine {
         let mut next = self.clone();
         let native_focus = system.focused_window.clone();
         next.reconcile_inner(system)?;
+        if next.outputs_suspended {
+            *self = next;
+            return Ok(self.transition(vec![]));
+        }
         let mut actions = next.placements()?;
         if let Some(id) = next.snapshot.focused_window.as_ref().filter(|_| {
             next.snapshot.enabled
@@ -246,50 +260,35 @@ impl Engine {
         {
             return Err(invalid("Focused window is absent from enumeration"));
         }
-        let viewport_changed = system.monitors.iter().any(|monitor| {
-            let viewport = self
-                .viewports
-                .get(&monitor.id)
-                .copied()
-                .unwrap_or(monitor.work_area);
-            self.snapshot
-                .monitors
-                .iter()
-                .find(|m| m.monitor.id == monitor.id)
-                .is_none_or(|m| m.viewport != viewport)
-        });
+        // Empty enumeration cannot distinguish closed windows from temporarily unavailable outputs.
+        // Validate the SystemSnapshot contract first; keep identities until outputs return.
+        if system.monitors.is_empty() {
+            self.outputs_suspended = true;
+            return Ok(());
+        }
+        self.outputs_suspended = false;
+        let floating_origins = self.floating_origins();
+        let viewport_changed = system.monitors.len() != self.snapshot.monitors.len()
+            || system.monitors.iter().any(|monitor| {
+                let viewport = self
+                    .viewports
+                    .get(&monitor.id)
+                    .copied()
+                    .unwrap_or(monitor.work_area);
+                self.snapshot
+                    .monitors
+                    .iter()
+                    .find(|m| m.monitor.id == monitor.id)
+                    .is_none_or(|m| m.viewport != viewport)
+            });
         self.fullscreen_restore
             .retain(|id, _| window_ids.contains(id));
-        self.snapshot
-            .monitors
-            .retain(|m| monitor_ids.contains(&m.monitor.id));
-        for monitor in system.monitors {
-            let viewport = self
-                .viewports
-                .get(&monitor.id)
-                .copied()
-                .unwrap_or(monitor.work_area);
-            if let Some(existing) = self
-                .snapshot
-                .monitors
-                .iter_mut()
-                .find(|m| m.monitor.id == monitor.id)
-            {
-                existing.monitor = monitor;
-                existing.viewport = viewport;
-            } else {
-                let page = self.page();
-                self.snapshot.monitors.push(MonitorState {
-                    monitor,
-                    active_page: page.id.clone(),
-                    pages: vec![page],
-                    viewport,
-                });
-            }
-        }
+        self.reconcile_monitors(system.monitors, &window_ids);
         self.snapshot
             .windows
             .retain(|w| window_ids.contains(&w.native.id));
+        // Restoring a borrowed active page can leave its host without a valid insertion target.
+        self.cleanup();
         self.update_pending_rule_floating(&[]);
         let mut new_windows = BTreeSet::new();
         for mut native in system.windows {
@@ -317,14 +316,6 @@ impl Engine {
                 });
             }
         }
-        for monitor in &mut self.snapshot.monitors {
-            for page in &mut monitor.pages {
-                for column in &mut page.columns {
-                    column.windows.retain(|id| window_ids.contains(id));
-                }
-                page.floating_windows.retain(|id| window_ids.contains(id));
-            }
-        }
         // Preserve logical monitor/page membership: clipped native rectangles can straddle monitors.
         for window in self.snapshot.windows.clone() {
             if self.location(&window.native.id).is_ok() {
@@ -342,7 +333,19 @@ impl Engine {
                 .unwrap();
             self.insert_window(m, p, &window.native.id, None)?;
         }
+        self.rebase_floating(floating_origins);
         self.cleanup();
+        self.repair_hotplug_focus();
+        if viewport_changed {
+            if let Some(id) = self
+                .snapshot
+                .focused_window
+                .clone()
+                .filter(|id| window_ids.contains(id))
+            {
+                self.ensure_visible(&id, false)?;
+            }
+        }
         let previous = self.snapshot.focused_window.clone();
         if let Some(id) = system.focused_window {
             let (m, p, _) = self.location(&id)?;
@@ -575,6 +578,11 @@ impl Engine {
                 })
                 .collect());
         }
+        if self.outputs_suspended {
+            return Err(invalid(
+                "No outputs available; waiting for monitor enumeration",
+            ));
+        }
         if command == Command::Enable {
             let backend = &self.snapshot.backend;
             if backend.availability != BackendAvailability::Ready {
@@ -681,6 +689,7 @@ impl Engine {
                 if (m, p) == (old_m, old_p) {
                     return Ok(vec![]);
                 }
+                self.record_hotplug_move(&window_id, &page_id);
                 let width = column
                     .map(|(c, _)| self.snapshot.monitors[old_m].pages[old_p].columns[c].width);
                 if m != old_m && column.is_none() {

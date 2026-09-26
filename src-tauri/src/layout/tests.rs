@@ -933,3 +933,451 @@ fn no_clipping_uses_whole_window_visibility_and_focus_recovers_edges() {
         400
     );
 }
+
+fn hotplug_system(outputs: &[&str], closed: &[&str]) -> SystemSnapshot {
+    let mut native = system();
+    native.monitors = outputs
+        .iter()
+        .map(|id| {
+            monitor(
+                id,
+                match *id {
+                    "a" => 0,
+                    "b" => -1200,
+                    _ => 1200,
+                },
+            )
+        })
+        .collect();
+    native.windows.retain(|w| !closed.contains(&w.id.as_str()));
+    for window in &mut native.windows {
+        if !outputs.contains(&window.monitor_id.as_str()) {
+            window.monitor_id = outputs[0].into();
+        }
+    }
+    native.focused_window = None;
+    native
+}
+
+fn assert_hotplug_consistent(e: &Engine) {
+    let mut assigned = BTreeSet::new();
+    for monitor in &e.snapshot.monitors {
+        assert!(monitor.pages.iter().any(|p| p.id == monitor.active_page));
+        assert!(empty(monitor.pages.last().unwrap()));
+        for page in &monitor.pages {
+            for id in ids(page) {
+                assert!(assigned.insert(id.clone()), "duplicate {id}");
+                assert!(e.window_index(id).is_ok());
+            }
+            assert_eq!(
+                page.viewport_x,
+                clamp_scroll(page, monitor.viewport.width, page.viewport_x as i64)
+            );
+            for column in &page.columns {
+                assert!(!column.windows.is_empty());
+                assert!((1..=monitor.viewport.width).contains(&column.width));
+            }
+        }
+    }
+    assert_eq!(
+        assigned,
+        e.snapshot
+            .windows
+            .iter()
+            .map(|w| w.native.id.clone())
+            .collect()
+    );
+    if let Some(id) = &e.snapshot.focused_window {
+        let (m, p, _) = e.location(id).unwrap();
+        assert_eq!(
+            e.snapshot.active_monitor.as_ref(),
+            Some(&e.snapshot.monitors[m].monitor.id)
+        );
+        assert_eq!(
+            e.snapshot.monitors[m].active_page,
+            e.snapshot.monitors[m].pages[p].id
+        );
+    }
+}
+
+#[test]
+fn hotplug_roundtrip_preserves_pages_columns_floating_scroll_and_background_focus() {
+    let mut e = stacked_engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    let tail = e.snapshot.monitors[0].pages.last().unwrap().id.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "3".into(),
+        page_id: tail,
+    })
+    .unwrap();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::AdjustWindowHeight { delta: 100 })
+        .unwrap();
+    e.dispatch(Command::CenterFocused).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    let before = serde_json::to_value(&e.snapshot.monitors[0].pages).unwrap();
+    let weights = e.height_weights.clone();
+    for _ in 0..2 {
+        let t = e.reconcile(hotplug_system(&["b"], &[])).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("4"));
+        assert!(placement(&t.actions, "1").2);
+        assert!(placement(&t.actions, "3").2);
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+        assert_hotplug_consistent(&e);
+        let t = e.reconcile(hotplug_system(&["b", "a"], &[])).unwrap();
+        assert_eq!(e.snapshot.monitors[0].monitor.id, "a");
+        assert_eq!(
+            serde_json::to_value(&e.snapshot.monitors[0].pages).unwrap(),
+            before
+        );
+        assert_eq!(e.height_weights, weights);
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("4"));
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+        assert_hotplug_consistent(&e);
+    }
+}
+
+#[test]
+fn hotplug_focused_page_follows_migration_without_native_refocus() {
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    let page = e.snapshot.monitors[1].active_page.clone();
+    for outputs in [vec!["a"], vec!["b", "a"], vec!["b"], vec!["a", "b"]] {
+        let t = e.reconcile(hotplug_system(&outputs, &[])).unwrap();
+        let (m, p, _) = e.location("4").unwrap();
+        assert_eq!(e.snapshot.monitors[m].pages[p].id, page);
+        assert!(!placement(&t.actions, "4").2);
+        assert!(
+            !t.actions
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+        assert_hotplug_consistent(&e);
+    }
+}
+
+#[test]
+fn hotplug_focused_edge_column_stays_visible_on_an_unchanged_smaller_receiver() {
+    let mut e = engine();
+    e.set_viewports(BTreeMap::from([(
+        "b".into(),
+        Rect {
+            x: -1200,
+            y: 0,
+            width: 400,
+            height: 900,
+        },
+    )]));
+    e.reconcile(system()).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    let t = e.reconcile(hotplug_system(&["b"], &[])).unwrap();
+    assert!(!placement(&t.actions, "3").2);
+    assert_eq!(placement(&t.actions, "3").0.width, 400);
+    assert!(
+        !t.actions
+            .iter()
+            .any(|a| matches!(a, NativeAction::Focus { .. }))
+    );
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_manual_moves_in_and_out_of_borrowed_pages_are_not_reclaimed() {
+    let mut e = engine();
+    let borrowed = e.snapshot.monitors[1].active_page.clone();
+    e.reconcile(hotplug_system(&["a"], &[])).unwrap();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "1".into(),
+        page_id: borrowed.clone(),
+    })
+    .unwrap();
+    let destination = e.snapshot.monitors[0].pages.last().unwrap().id.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "4".into(),
+        page_id: destination,
+    })
+    .unwrap();
+    // Even moving back into the original page is now explicit host ownership.
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "4".into(),
+        page_id: borrowed,
+    })
+    .unwrap();
+    e.reconcile(hotplug_system(&["b", "a"], &[])).unwrap();
+    for id in ["1", "4"] {
+        let (m, _, _) = e.location(id).unwrap();
+        assert_eq!(e.snapshot.monitors[m].monitor.id, "a");
+    }
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_multiple_disconnects_reconnect_order_and_closure_preserve_first_owner() {
+    for reconnect in [vec!["b", "a", "c"], vec!["c", "a", "b"]] {
+        let mut e = engine();
+        let a_page = e.snapshot.monitors[0].pages[0].id.clone();
+        let b_page = e.snapshot.monitors[1].pages[0].id.clone();
+        e.reconcile(hotplug_system(&["a", "b", "c"], &[])).unwrap();
+        e.reconcile(hotplug_system(&["a", "c"], &[])).unwrap();
+        // Pin 1 to a, even though its page originally came from b.
+        e.dispatch(Command::MoveWindowToPage {
+            window_id: "1".into(),
+            page_id: b_page.clone(),
+        })
+        .unwrap();
+        e.reconcile(hotplug_system(&["c"], &["2"])).unwrap();
+        assert_hotplug_consistent(&e);
+        // Restore b first while a is still absent: the pinned fragment must later return to a.
+        e.reconcile(hotplug_system(&["b", "c"], &["2"])).unwrap();
+        e.reconcile(hotplug_system(&reconnect, &["2"])).unwrap();
+        for (id, owner) in [("1", "a"), ("3", "a"), ("4", "b")] {
+            let (m, _, _) = e.location(id).unwrap();
+            assert_eq!(e.snapshot.monitors[m].monitor.id, owner);
+        }
+        let (m, p, _) = e.location("3").unwrap();
+        assert_eq!(e.snapshot.monitors[m].pages[p].id, a_page);
+        let (m, p, _) = e.location("4").unwrap();
+        assert_eq!(e.snapshot.monitors[m].pages[p].id, b_page);
+        assert!(e.window_index("2").is_err());
+        assert!(e.disconnected_monitors.is_empty());
+        assert_hotplug_consistent(&e);
+        let pages = serde_json::to_value(&e.snapshot.monitors).unwrap();
+        e.reconcile(hotplug_system(&["c", "b", "a"], &["2"]))
+            .unwrap();
+        assert_eq!(serde_json::to_value(&e.snapshot.monitors).unwrap(), pages);
+    }
+}
+
+#[test]
+fn hotplug_empty_outputs_suspend_actions_and_commands_until_valid_enumeration() {
+    let mut e = engine();
+    let before = serde_json::to_value(e.snapshot()).unwrap();
+    for _ in 0..2 {
+        let t = e.reconcile(SystemSnapshot::default()).unwrap();
+        assert!(t.actions.is_empty());
+        assert!(e.outputs_suspended);
+        assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+    }
+    for command in [
+        Command::Enable,
+        Command::CycleWidth,
+        Command::MoveWindowToPage {
+            window_id: "1".into(),
+            page_id: e.snapshot.monitors[1].active_page.clone(),
+        },
+    ] {
+        assert_rejected_unchanged(&mut e, command);
+    }
+    assert!(e.dispatch(Command::Refresh).unwrap().actions.is_empty());
+    assert!(
+        e.reconcile(SystemSnapshot {
+            windows: vec![window("1", "a")],
+            ..SystemSnapshot::default()
+        })
+        .is_err()
+    );
+    assert!(e.outputs_suspended);
+    e.reconcile(hotplug_system(&["a", "b"], &["2"])).unwrap();
+    assert!(!e.outputs_suspended);
+    assert!(e.window_index("2").is_err());
+    assert_hotplug_consistent(&e);
+    e.reconcile(SystemSnapshot::default()).unwrap();
+    let t = e.dispatch(Command::Disable).unwrap();
+    assert_eq!(t.actions.len(), 3);
+    assert!(
+        t.actions
+            .iter()
+            .all(|a| matches!(a, NativeAction::Restore { .. }))
+    );
+    assert!(e.dispatch(Command::Enable).is_err());
+    assert!(
+        e.reconcile(hotplug_system(&["b", "a"], &["2"]))
+            .unwrap()
+            .actions
+            .is_empty()
+    );
+    assert!(!e.snapshot.enabled);
+}
+
+#[test]
+fn hotplug_empty_monitor_restores_stable_page_and_closed_ids_never_resurrect() {
+    let mut e = engine();
+    e.reconcile(hotplug_system(&["a", "b"], &["4"])).unwrap();
+    let empty_page = e.snapshot.monitors[1].active_page.clone();
+    e.reconcile(hotplug_system(&["a"], &["4"])).unwrap();
+    e.reconcile(hotplug_system(&["b", "a"], &["4"])).unwrap();
+    assert_eq!(e.snapshot.monitors[1].pages.len(), 1);
+    assert_eq!(e.snapshot.monitors[1].active_page, empty_page);
+    assert!(e.window_index("4").is_err());
+    e.reconcile(hotplug_system(&["a"], &["4"])).unwrap();
+    e.reconcile(hotplug_system(&["a"], &["1", "2", "3", "4"]))
+        .unwrap();
+    e.reconcile(hotplug_system(&["b", "a"], &["1", "2", "3", "4"]))
+        .unwrap();
+    assert!(e.snapshot.windows.is_empty());
+    assert!(e.snapshot.monitors.iter().all(|m| m.pages.len() == 1));
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_mixed_dpi_shrink_clamps_floating_fullscreen_restore_and_pending_geometry() {
+    let mut e = engine();
+    e.dispatch(Command::Disable).unwrap();
+    e.set_window_rules(vec![WindowRule {
+        floating: Some(true),
+        monitor_id: Some("b".into()),
+        page_index: Some(2),
+        ..WindowRule::default()
+    }])
+    .unwrap();
+    let mut native = system();
+    native.windows.push(window("new", "a"));
+    e.reconcile(native).unwrap();
+    assert!(e.pending_rule_floating.contains("new"));
+    let mut small = hotplug_system(&["a"], &[]);
+    small.monitors[0].work_area.width = 300;
+    small.monitors[0].work_area.height = 200;
+    small.monitors[0].scale_factor = 2.0;
+    small.windows.push(window("new", "a"));
+    for _ in 0..2 {
+        assert!(e.reconcile(small.clone()).unwrap().actions.is_empty());
+        assert!(e.pending_rule_floating.contains("new"));
+        assert_eq!(
+            e.snapshot.windows[e.window_index("new").unwrap()]
+                .native
+                .rect,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 200
+            }
+        );
+        assert_hotplug_consistent(&e);
+    }
+    e.dispatch(Command::Enable).unwrap();
+    assert!(e.pending_rule_floating.contains("new"));
+    let (m, p, _) = e.location("new").unwrap();
+    let page_id = e.snapshot.monitors[m].pages[p].id.clone();
+    let t = e
+        .dispatch(Command::SwitchPage {
+            monitor_id: "a".into(),
+            page_id,
+        })
+        .unwrap();
+    assert!(!placement(&t.actions, "new").2);
+    assert!(!e.pending_rule_floating.contains("new"));
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    let mut native = hotplug_system(&["b", "a"], &[]);
+    native.monitors[0].work_area.width = 250;
+    native.monitors[0].work_area.height = 150;
+    native.monitors[0].scale_factor = 1.25;
+    native.windows.push(window("new", "a"));
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(
+        placement(&t.actions, "new").0,
+        e.snapshot.monitors[1].viewport
+    );
+    let t = e.dispatch(Command::ToggleFullscreen).unwrap();
+    let rect = placement(&t.actions, "new").0;
+    assert_eq!(
+        rect,
+        Rect {
+            x: -1200,
+            y: 0,
+            width: 250,
+            height: 150
+        }
+    );
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_closed_borrowed_window_id_is_not_revived_and_reuse_is_new_discovery() {
+    let mut e = engine();
+    e.reconcile(hotplug_system(&["a"], &[])).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    e.reconcile(hotplug_system(&["a"], &["4"])).unwrap();
+    assert!(e.window_index("4").is_err());
+    assert_ne!(e.snapshot.focused_window.as_deref(), Some("4"));
+    e.reconcile(hotplug_system(&["b", "a"], &["4"])).unwrap();
+    assert!(e.window_index("4").is_err());
+    e.set_window_rules(vec![WindowRule {
+        floating: Some(true),
+        ..WindowRule::default()
+    }])
+    .unwrap();
+    e.reconcile(hotplug_system(&["b", "a"], &[])).unwrap();
+    assert!(e.snapshot.windows[e.window_index("4").unwrap()].floating);
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_reconcile_failure_keeps_recovery_metadata_transactional() {
+    let mut e = stacked_engine();
+    e.reconcile(hotplug_system(&["b"], &[])).unwrap();
+    let before = serde_json::to_value(e.snapshot()).unwrap();
+    let saved = e.disconnected_monitors.len();
+    let order = e.monitor_order.clone();
+    let next_id = e.next_id;
+    let mut invalid = hotplug_system(&["a", "b"], &[]);
+    invalid.monitors[0].work_area.height = 2;
+    assert!(e.reconcile(invalid).is_err());
+    assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+    assert_eq!(e.disconnected_monitors.len(), saved);
+    assert_eq!(e.monitor_order, order);
+    assert_eq!(e.next_id, next_id);
+    e.reconcile(hotplug_system(&["b", "a"], &[])).unwrap();
+    assert!(e.disconnected_monitors.is_empty());
+    assert_eq!(e.location("1").unwrap().0, 0);
+    assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn hotplug_restoring_the_hosts_active_page_allows_simultaneous_new_windows() {
+    let mut e = engine();
+    e.reconcile(hotplug_system(&["a"], &[])).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    let mut native = hotplug_system(&["b", "a"], &[]);
+    native.windows.push(window("new", "a"));
+    e.reconcile(native).unwrap();
+    assert_eq!(
+        e.snapshot.monitors[e.location("new").unwrap().0].monitor.id,
+        "a"
+    );
+    assert_eq!(
+        e.snapshot.monitors[e.location("4").unwrap().0].monitor.id,
+        "b"
+    );
+    assert_hotplug_consistent(&e);
+}
