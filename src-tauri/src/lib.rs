@@ -4,4 +4,5 @@ pub mod config;
 pub mod layout;
 pub mod model;
 pub mod platform;
+pub mod rules;
 pub mod shortcuts;

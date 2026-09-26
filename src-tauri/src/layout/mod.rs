@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::*;
+use crate::rules::WindowRule;
+
+mod rules;
 
 mod sizing;
 
@@ -17,6 +20,7 @@ pub struct Engine {
     fullscreen_restore: BTreeMap<WindowId, Rect>,
     /// Relative shares of space above each tiled window's one-pixel minimum.
     height_weights: BTreeMap<WindowId, u32>,
+    window_rules: Vec<WindowRule>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -67,6 +71,7 @@ impl Engine {
             page_focus: BTreeMap::new(),
             fullscreen_restore: BTreeMap::new(),
             height_weights: BTreeMap::new(),
+            window_rules: vec![],
         }
     }
 
@@ -282,6 +287,7 @@ impl Engine {
         self.snapshot
             .windows
             .retain(|w| window_ids.contains(&w.native.id));
+        let mut new_windows = BTreeSet::new();
         for mut native in system.windows {
             if let Some(existing) = self
                 .snapshot
@@ -296,6 +302,7 @@ impl Engine {
                 }
                 existing.native = native;
             } else {
+                new_windows.insert(native.id.clone());
                 let floating = !native.resizable;
                 self.snapshot.windows.push(WindowState {
                     native,
@@ -317,6 +324,10 @@ impl Engine {
             if self.location(&window.native.id).is_ok() {
                 continue;
             }
+            if new_windows.contains(&window.native.id) {
+                self.insert_new_window(&window.native.id)?;
+                continue;
+            }
             let m = self.monitor_index(&window.native.monitor_id)?;
             let p = self.snapshot.monitors[m]
                 .pages
@@ -329,12 +340,11 @@ impl Engine {
         let previous = self.snapshot.focused_window.clone();
         if let Some(id) = system.focused_window {
             let (m, p, _) = self.location(&id)?;
-            // A stale native focus on a manager-hidden page must not undo a page switch.
+            // Native focus must not activate a background logical page, even while paused.
             let native = &self.snapshot.windows[self.window_index(&id)?].native;
-            if !self.snapshot.enabled
-                || (!native.minimized
-                    && self.snapshot.monitors[m].pages[p].id
-                        == self.snapshot.monitors[m].active_page)
+            if (!self.snapshot.enabled || !native.minimized)
+                && self.snapshot.monitors[m].pages[p].id
+                    == self.snapshot.monitors[m].active_page
             {
                 self.set_focus(&id, viewport_changed || previous.as_ref() != Some(&id))?;
             }
