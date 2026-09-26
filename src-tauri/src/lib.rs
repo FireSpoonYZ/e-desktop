@@ -1,3 +1,4 @@
+pub mod animation;
 #[cfg(feature = "desktop")]
 pub mod app;
 pub mod config;

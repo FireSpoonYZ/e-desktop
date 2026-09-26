@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,6 +12,7 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, Webvie
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use crate::{
+    animation::{Placements, ScrollAnimation},
     config::{Config, ConfigFile, ShortcutAction},
     layout::Engine,
     model::{
@@ -130,7 +131,9 @@ struct Controller {
     errors: Vec<AppError>,
     config_error: Option<AppError>,
     window_rules: Vec<WindowRule>,
-    placements: HashMap<String, (Rect, Option<Rect>, bool)>,
+    placements: Placements,
+    animation: ScrollAnimation,
+    animation_duration: Duration,
 }
 
 impl Controller {
@@ -141,7 +144,11 @@ impl Controller {
             errors: vec![],
             config_error: None,
             window_rules: vec![],
-            placements: HashMap::new(),
+            placements: Placements::new(),
+            animation: ScrollAnimation::default(),
+            animation_duration: Duration::from_millis(u64::from(
+                Config::default().animation_duration_ms,
+            )),
         };
         if let Err(e) = controller.connect() {
             controller.record(e);
@@ -193,6 +200,11 @@ impl Controller {
     }
 
     fn refresh(&mut self, apply: bool) -> Result<(), AppError> {
+        // Reconcile at its normal deadline, never defer it behind a stream of Scrolls.
+        // Drop frames BEFORE enumeration (windows/monitors may have disappeared).
+        // Tiled targets come from engine columns/viewport_x, not observed mid-frame rects;
+        // reconciliation immediately applies that final layout, without stale frame writes.
+        self.animation.cancel();
         let backend = self
             .backend
             .as_mut()
@@ -302,6 +314,7 @@ impl Controller {
     }
 
     fn stop(&mut self) -> Result<(), AppError> {
+        self.animation.cancel();
         self.placements.clear();
         // Always turn off automatic reflow, even when one native restore fails.
         let mut result = self.engine.dispatch(Command::Disable).map(|_| ());
@@ -323,6 +336,14 @@ impl Controller {
             let _ = self.refresh(false);
             return result;
         }
+        let scroll_monitor = match &command {
+            Command::Scroll { monitor_id, .. } => Some(monitor_id.clone()),
+            _ => None,
+        };
+        if scroll_monitor.is_none() && !matches!(command, Command::Refresh) {
+            // Close returns no layout actions; finish the old target before it too.
+            self.finish_animation()?;
+        }
         if self.backend.is_none() {
             self.connect()?;
         }
@@ -336,8 +357,36 @@ impl Controller {
         if matches!(command, Command::Enable) {
             self.refresh(false)?;
         }
-        let transition = self.engine.dispatch(command)?;
-        self.apply(&transition.actions)
+        let transition = match self.engine.dispatch(command) {
+            Ok(transition) => transition,
+            Err(issue) => {
+                self.finish_animation()?;
+                return Err(issue);
+            }
+        };
+        let actions = if let Some(monitor_id) = scroll_monitor {
+            self.animation.start(
+                &transition.snapshot,
+                &monitor_id,
+                &self.placements,
+                transition.actions,
+                self.animation_duration,
+                Instant::now(),
+            )
+        } else {
+            transition.actions
+        };
+        self.apply(&actions)
+    }
+
+    fn finish_animation(&mut self) -> Result<(), AppError> {
+        let actions = self.animation.cancel();
+        self.apply(&actions)
+    }
+
+    fn animate(&mut self, now: Instant) -> Result<(), AppError> {
+        let actions = self.animation.frame(now);
+        self.apply(&actions)
     }
 }
 
@@ -530,7 +579,10 @@ fn reload_config(
             .and_then(|()| {
                 controller
                     .set_window_rules(shortcuts.config.window_rules.clone())
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                controller.animation_duration =
+                    Duration::from_millis(u64::from(shortcuts.config.animation_duration_ms));
+                Ok(())
             })
             .map_err(|e| {
                 error(
@@ -598,6 +650,9 @@ fn run_controller(
             }
             next_refresh = Instant::now() + REFRESH_INTERVAL;
         }
+        if let Err(issue) = controller.animate(Instant::now()) {
+            controller.record(issue);
+        }
         let snapshot = controller.snapshot(shortcuts.available());
         // Native surface positions change only with monitor geometry or enabled state.
         let geometry = serde_json::to_string(&(
@@ -622,8 +677,12 @@ fn run_controller(
             let _ = app.emit("snapshot", &snapshot);
             previous = fingerprint;
         }
+        let next_deadline = controller
+            .animation
+            .deadline()
+            .map_or(next_refresh, |frame| frame.min(next_refresh));
         let request = match receiver
-            .recv_timeout(next_refresh.saturating_duration_since(Instant::now()))
+            .recv_timeout(next_deadline.saturating_duration_since(Instant::now()))
         {
             Ok(Request::Shortcut(key)) => {
                 match shortcuts
@@ -666,6 +725,10 @@ fn run_controller(
             }
             Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
             Ok(Request::Show(surface, monitor_id)) => {
+                if let Err(issue) = controller.finish_animation() {
+                    controller.record(issue);
+                    continue;
+                }
                 if let Err(issue) = show_surface(&app, &snapshot, surface, monitor_id.as_deref()) {
                     controller.record(issue);
                 }

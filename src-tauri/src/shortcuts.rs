@@ -132,7 +132,7 @@ mod tests {
                     action: ShortcutAction::Overview {},
                 })
                 .collect(),
-            window_rules: vec![],
+            ..Config::default()
         }
     }
 

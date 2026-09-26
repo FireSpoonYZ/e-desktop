@@ -12,6 +12,8 @@ use crate::{
 pub struct Config {
     pub shortcuts: Vec<ShortcutBinding>,
     pub window_rules: Vec<WindowRule>,
+    /// Native Scroll animation; 0 disables it, maximum 1000 ms.
+    pub animation_duration_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +184,7 @@ impl Default for Config {
         Self {
             shortcuts,
             window_rules: vec![],
+            animation_duration_ms: 160,
         }
     }
 }
@@ -189,6 +192,9 @@ impl Default for Config {
 impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let config: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if config.animation_duration_ms > 1000 {
+            return Err("animationDurationMs 须在 0 到 1000 之间。".into());
+        }
         for (index, rule) in config.window_rules.iter().enumerate() {
             rule.validate()
                 .map_err(|e| format!("窗口规则 {}：{}", index + 1, e.message))?;
@@ -375,6 +381,25 @@ mod tests {
             Config::parse(&serde_json::to_vec(&defaults).unwrap()).unwrap(),
             defaults
         );
+    }
+
+    #[test]
+    fn animation_duration_bounds_and_invalid_retention() {
+        assert_eq!(Config::parse(b"{}").unwrap().animation_duration_ms, 160);
+        let mut shortcuts = Shortcuts::new(Config::default());
+        for ms in [0, 150, 1000] {
+            let config =
+                Config::parse(format!(r#"{{"animationDurationMs":{ms}}}"#).as_bytes()).unwrap();
+            shortcuts.replace(config, |_, _| Ok(())).unwrap();
+            assert_eq!(shortcuts.config.animation_duration_ms, ms);
+        }
+        let previous = shortcuts.config.clone();
+        for value in ["1001", "-1", "1.5", "null", "4294967296", "\"160\""] {
+            assert!(
+                Config::parse(format!(r#"{{"animationDurationMs":{value}}}"#).as_bytes()).is_err()
+            );
+            assert_eq!(shortcuts.config, previous);
+        }
     }
 
     #[test]
