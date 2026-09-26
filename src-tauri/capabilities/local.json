@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-controls",
+  "description": "Local control surfaces; no filesystem, shell, or JS shortcut registration.",
+  "windows": ["topbar", "pagerail", "overview", "commands"],
+  "permissions": ["core:default"]
+}

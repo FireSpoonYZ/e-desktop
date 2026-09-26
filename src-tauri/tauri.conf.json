@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "e-desktop",
+  "version": "0.1.0",
+  "identifier": "local.e-desktop.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      { "label": "topbar", "title": "e-desktop", "url": "index.html?surface=topbar", "width": 960, "height": 64, "minWidth": 600, "resizable": false, "decorations": false, "focus": false },
+      { "label": "pagerail", "title": "e-desktop pages", "url": "index.html?surface=pagerail", "width": 56, "height": 360, "resizable": false, "decorations": false, "focus": false, "visible": false },
+      { "label": "overview", "title": "e-desktop overview", "url": "index.html?surface=overview", "width": 1000, "height": 700, "visible": false },
+      { "label": "commands", "title": "e-desktop commands", "url": "index.html?surface=commands", "width": 640, "height": 480, "visible": false }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": { "active": false }
+}
