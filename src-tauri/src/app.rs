@@ -5,19 +5,21 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use crate::{
+    config::{Config, ConfigFile, ShortcutAction},
     layout::Engine,
     model::{
-        AppError, BackendAvailability, BackendStatus, Command, Direction, ErrorCode, NativeAction,
-        Rect, Snapshot,
+        AppError, BackendAvailability, BackendStatus, Command, ErrorCode, NativeAction, Rect,
+        Snapshot,
     },
     platform::Backend,
+    shortcuts::{Shortcuts, normalize_key},
 };
 
 const BAR_HEIGHT: f64 = 44.0;
@@ -50,11 +52,7 @@ enum Request {
     Command(Command, Option<Reply>),
     Show(Surface, Option<String>),
     Dismiss(Surface),
-    Page {
-        index: Option<usize>,
-        delta: i32,
-        move_window: bool,
-    },
+    Shortcut(String),
     Quit,
 }
 
@@ -129,6 +127,7 @@ struct Controller {
     backend: Option<Backend>,
     engine: Engine,
     errors: Vec<AppError>,
+    config_error: Option<AppError>,
     placements: HashMap<String, (Rect, Option<Rect>, bool)>,
 }
 
@@ -138,6 +137,7 @@ impl Controller {
             backend: None,
             engine: Engine::new(BackendStatus::default()),
             errors: vec![],
+            config_error: None,
             placements: HashMap::new(),
         };
         if let Err(e) = controller.connect() {
@@ -177,6 +177,7 @@ impl Controller {
         }
         snapshot.backend.capabilities.global_shortcuts = shortcuts;
         snapshot.errors.extend(self.errors.clone());
+        snapshot.errors.extend(self.config_error.clone());
         snapshot
     }
 
@@ -475,146 +476,76 @@ fn show_surface(
     .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))
 }
 
-fn register_shortcuts(
+fn set_shortcut(
     app: &tauri::AppHandle,
     sender: &mpsc::SyncSender<Request>,
-) -> (bool, Vec<AppError>) {
-    let mut failures = vec![];
-    let mut register = |key: &str, command: Option<Command>, surface: Option<Surface>| {
+    key: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let result = if enabled {
         let sender = sender.clone();
-        if let Err(e) = app.global_shortcut().on_shortcut(key, move |_, _, event| {
-            if event.state != ShortcutState::Pressed {
-                return;
+        let callback_key = key.to_owned();
+        app.global_shortcut().on_shortcut(key, move |_, _, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = sender.try_send(Request::Shortcut(callback_key.clone()));
             }
-            let request = if let Some(surface) = surface {
-                Request::Show(surface, None)
-            } else if let Some(command) = &command {
-                Request::Command(command.clone(), None)
-            } else {
-                Request::Quit
-            };
-            let _ = sender.try_send(request);
-        }) {
-            failures.push(error(
-                ErrorCode::OperationDenied,
-                format!("快捷键 {key} 注册失败：{e}"),
-            ));
-        }
-    };
-    for (key, direction) in [
-        ("H", Direction::Left),
-        ("J", Direction::Down),
-        ("K", Direction::Up),
-        ("L", Direction::Right),
-    ] {
-        register(
-            &format!("Control+Alt+{key}"),
-            Some(Command::FocusDirection { direction }),
-            None,
-        );
-        register(
-            &format!("Control+Alt+Shift+{key}"),
-            Some(Command::MoveWindow { direction }),
-            None,
-        );
-    }
-    for (key, command) in [
-        ("Control+Alt+R", Command::CycleWidth),
-        ("Control+Alt+C", Command::CenterFocused),
-        ("Control+Alt+F", Command::ToggleFullscreen),
-        ("Control+Alt+V", Command::ToggleFloating),
-        ("Control+Alt+Backspace", Command::Disable),
-    ] {
-        register(key, Some(command), None);
-    }
-    register("Control+Alt+Space", None, Some(Surface::Commands));
-    register("Control+Alt+O", None, Some(Surface::Overview));
-    register("Control+Alt+Q", None, None);
-    register(
-        "Control+Alt+N",
-        Some(Command::AddPage {
-            monitor_id: String::new(),
-        }),
-        None,
-    );
-    let mut pages = vec![
-        ("Control+Alt+PageUp".to_owned(), None, -1, false),
-        ("Control+Alt+PageDown".to_owned(), None, 1, false),
-        ("Control+Alt+Shift+PageUp".to_owned(), None, -1, true),
-        ("Control+Alt+Shift+PageDown".to_owned(), None, 1, true),
-    ];
-    for index in 0..9 {
-        pages.push((format!("Control+Alt+{}", index + 1), Some(index), 0, false));
-        pages.push((
-            format!("Control+Alt+Shift+{}", index + 1),
-            Some(index),
-            0,
-            true,
-        ));
-    }
-    for (key, index, delta, move_window) in pages {
-        let sender = sender.clone();
-        if let Err(e) = app
-            .global_shortcut()
-            .on_shortcut(key.as_str(), move |_, _, event| {
-                if event.state == ShortcutState::Pressed {
-                    let _ = sender.try_send(Request::Page {
-                        index,
-                        delta,
-                        move_window,
-                    });
-                }
-            })
-        {
-            failures.push(error(
-                ErrorCode::OperationDenied,
-                format!("快捷键 {key} 注册失败：{e}"),
-            ));
-        }
-    }
-    (failures.is_empty(), failures)
-}
-
-fn page_command(
-    snapshot: &Snapshot,
-    index: Option<usize>,
-    delta: i32,
-    move_window: bool,
-) -> Option<Command> {
-    let monitor = snapshot
-        .monitors
-        .iter()
-        .find(|m| Some(&m.monitor.id) == snapshot.active_monitor.as_ref())
-        .or(snapshot.monitors.first())?;
-    let current = monitor
-        .pages
-        .iter()
-        .position(|p| p.id == monitor.active_page)?;
-    let target = index.unwrap_or_else(|| (current as i64 + i64::from(delta)).max(0) as usize);
-    let page = monitor.pages.get(target)?;
-    if move_window {
-        Some(Command::MoveWindowToPage {
-            window_id: snapshot.focused_window.clone()?,
-            page_id: page.id.clone(),
         })
     } else {
-        Some(Command::SwitchPage {
-            monitor_id: monitor.monitor.id.clone(),
-            page_id: page.id.clone(),
-        })
-    }
+        app.global_shortcut().unregister(key)
+    };
+    result.map_err(|e| {
+        format!(
+            "快捷键 {key} {}失败：{e}",
+            if enabled { "注册" } else { "注销" }
+        )
+    })
+}
+
+fn reload_config(
+    app: &tauri::AppHandle,
+    sender: &mpsc::SyncSender<Request>,
+    file: &mut ConfigFile,
+    shortcuts: &mut Shortcuts,
+) -> Option<Result<(), AppError>> {
+    file.poll().map(|candidate| {
+        candidate
+            .and_then(|config| config.normalize_keys(normalize_key))
+            .and_then(|config| {
+                shortcuts.replace(config, |key, enabled| {
+                    set_shortcut(app, sender, key, enabled)
+                })
+            })
+            .map_err(|e| {
+                error(
+                    ErrorCode::InvalidCommand,
+                    format!("配置 {}：{e}", file.path.display()),
+                )
+            })
+    })
 }
 
 fn run_controller(
     app: tauri::AppHandle,
     receiver: mpsc::Receiver<Request>,
     shared: Arc<Mutex<Snapshot>>,
-    shortcuts: bool,
-    startup_errors: Vec<AppError>,
+    sender: mpsc::SyncSender<Request>,
+    config_path: std::path::PathBuf,
 ) {
     let mut controller = Controller::new();
-    for issue in startup_errors {
-        controller.record(issue);
+    let defaults = Config::default()
+        .normalize_keys(normalize_key)
+        .expect("valid default shortcuts");
+    let mut shortcuts = Shortcuts::new(defaults);
+    let mut config_file = ConfigFile::new(config_path);
+    // Install the requested map first; an invalid startup file falls back to defaults.
+    if let Some(Err(issue)) = reload_config(&app, &sender, &mut config_file, &mut shortcuts) {
+        controller.config_error = Some(issue);
+        let defaults = shortcuts.config.clone();
+        if let Err(e) = shortcuts.replace(defaults, |key, enabled| {
+            set_shortcut(&app, &sender, key, enabled)
+        }) {
+            controller.record(error(ErrorCode::OperationDenied, e));
+        }
     }
     if controller.backend.is_some() {
         if let Err(issue) = controller.refresh(false) {
@@ -623,8 +554,22 @@ fn run_controller(
     }
     let mut previous = Vec::new();
     let mut controls = String::new();
+    let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
-        let snapshot = controller.snapshot(shortcuts);
+        // A deadline, not an idle timeout: queued commands cannot starve config reloads.
+        if Instant::now() >= next_refresh {
+            if let Some(result) = reload_config(&app, &sender, &mut config_file, &mut shortcuts) {
+                controller.config_error = result.err();
+            }
+            if controller.backend.is_some() {
+                if let Err(issue) = controller.refresh(true) {
+                    let _ = controller.stop();
+                    controller.record(issue);
+                }
+            }
+            next_refresh = Instant::now() + REFRESH_INTERVAL;
+        }
+        let snapshot = controller.snapshot(shortcuts.available());
         // Native surface positions change only with monitor geometry or enabled state.
         let geometry = serde_json::to_string(&(
             snapshot.enabled,
@@ -641,14 +586,33 @@ fn run_controller(
                 Err(issue) => controller.record(issue),
             }
         }
-        let snapshot = controller.snapshot(shortcuts);
+        let snapshot = controller.snapshot(shortcuts.available());
         let fingerprint = serde_json::to_vec(&snapshot).unwrap_or_default();
         if fingerprint != previous {
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
             let _ = app.emit("snapshot", &snapshot);
             previous = fingerprint;
         }
-        match receiver.recv_timeout(REFRESH_INTERVAL) {
+        let request = match receiver
+            .recv_timeout(next_refresh.saturating_duration_since(Instant::now()))
+        {
+            Ok(Request::Shortcut(key)) => {
+                match shortcuts
+                    .action(&key)
+                    .and_then(|action| action.resolve(controller.engine.snapshot()))
+                {
+                    Some(ShortcutAction::Command { command }) => {
+                        Ok(Request::Command(command, None))
+                    }
+                    Some(ShortcutAction::Overview {}) => Ok(Request::Show(Surface::Overview, None)),
+                    Some(ShortcutAction::Commands {}) => Ok(Request::Show(Surface::Commands, None)),
+                    Some(ShortcutAction::Quit {}) => Ok(Request::Quit),
+                    _ => continue,
+                }
+            }
+            request => request,
+        };
+        match request {
             Ok(Request::Command(mut command, reply)) => {
                 if let Command::AddPage { monitor_id } = &mut command {
                     if monitor_id.is_empty() {
@@ -664,26 +628,14 @@ fn run_controller(
                 if let Err(issue) = &result {
                     controller.record(issue.clone());
                 }
-                let current = controller.snapshot(shortcuts);
+                let current = controller.snapshot(shortcuts.available());
                 *shared.lock().unwrap_or_else(|e| e.into_inner()) = current.clone();
                 let _ = app.emit("snapshot", &current);
                 if let Some(reply) = reply {
                     let _ = reply.send(result.map(|_| current));
                 }
             }
-            Ok(Request::Page {
-                index,
-                delta,
-                move_window,
-            }) => {
-                if let Some(command) =
-                    page_command(controller.engine.snapshot(), index, delta, move_window)
-                {
-                    if let Err(issue) = controller.command(command) {
-                        controller.record(issue);
-                    }
-                }
-            }
+            Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
             Ok(Request::Show(surface, monitor_id)) => {
                 if let Err(issue) = show_surface(&app, &snapshot, surface, monitor_id.as_deref()) {
                     controller.record(issue);
@@ -693,7 +645,7 @@ fn run_controller(
                 if let Some(window) = app.get_webview_window(surface.label()) {
                     let _ = window.hide();
                 }
-                let current = controller.snapshot(shortcuts);
+                let current = controller.snapshot(shortcuts.available());
                 if current.enabled && current.backend.capabilities.focus {
                     if let Some(window_id) = current.focused_window {
                         if let Err(issue) = controller.command(Command::FocusWindow { window_id }) {
@@ -724,14 +676,7 @@ fn run_controller(
                 }
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if controller.backend.is_some() {
-                    if let Err(issue) = controller.refresh(true) {
-                        let _ = controller.stop();
-                        controller.record(issue);
-                    }
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -755,11 +700,14 @@ pub fn run() {
             quit
         ])
         .setup(move |app| {
-            let (shortcuts, errors) = register_shortcuts(app.handle(), &sender);
+            let config_path = match std::env::var_os("E_DESKTOP_CONFIG") {
+                Some(path) => std::path::PathBuf::from(path),
+                None => app.path().app_config_dir()?.join("config.json"),
+            };
             let app = app.handle().clone();
             std::thread::Builder::new()
                 .name("desktop-controller".into())
-                .spawn(move || run_controller(app, receiver, shared, shortcuts, errors))?;
+                .spawn(move || run_controller(app, receiver, shared, sender, config_path))?;
             Ok(())
         })
         .on_window_event(|window, event| {
