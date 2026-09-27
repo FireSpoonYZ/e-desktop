@@ -84,7 +84,7 @@ pub struct MonitorState {
     pub monitor: Monitor,
     pub pages: Vec<Page>,
     pub active_page: PageId,
-    /// Available physical area after reserving native control windows.
+    /// Usable physical area after the top bar and the gap inset.
     pub viewport: Rect,
 }
 
@@ -150,6 +150,14 @@ pub struct Snapshot {
     pub focused_window: Option<WindowId>,
     pub active_monitor: Option<MonitorId>,
     pub errors: Vec<AppError>,
+    /// Monitors whose control bar stays visible and reserves space; others auto-hide.
+    pub pinned_bars: Vec<MonitorId>,
+    /// False when the platform cannot reveal bars from the pointer (all bars stay pinned).
+    pub bars_autohide: bool,
+    /// Logical pixels between tiled windows and the screen edges (niri gaps).
+    pub gaps: u32,
+    /// Layout and overview animation length; 0 disables animations.
+    pub animation_duration_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +225,26 @@ pub enum Command {
     ToggleFullscreen,
     CloseWindow {
         window_id: WindowId,
+    },
+    /// Pointer drop at a physical screen point: a tiled window joins the column under it,
+    /// or becomes a new column when dropped on a column's outer quarter or empty space.
+    DropWindow {
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+    },
+    /// Drag the boundary left of column `edge` on the monitor's active page by `delta`
+    /// physical pixels (`edge` = column count is the right end). Neighbours give or take the
+    /// width, cut columns slide, the edge snaps onto screen edges; the page stays filled.
+    DragEdge {
+        monitor_id: MonitorId,
+        edge: u32,
+        delta: i32,
+    },
+    /// Physical rectangle for a floating window (pointer move/resize).
+    SetFloatingRect {
+        window_id: WindowId,
+        rect: Rect,
     },
 }
 
@@ -316,5 +344,6 @@ mod tests {
         assert_eq!(snapshot["backend"]["availability"], "notImplemented");
         assert_eq!(snapshot["focusedWindow"], serde_json::Value::Null);
         assert_eq!(snapshot["backend"]["capabilities"]["placement"], false);
+        assert_eq!(snapshot["gaps"], 0);
     }
 }

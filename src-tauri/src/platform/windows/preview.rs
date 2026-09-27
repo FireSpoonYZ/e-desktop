@@ -173,6 +173,9 @@ impl Backend {
                 cookie,
                 saved: None,
                 minimized: false,
+                decor: None,
+                pads: vec![],
+                placed_pad: None,
             });
         }
         self.previews

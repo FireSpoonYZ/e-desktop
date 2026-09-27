@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::model::*;
 use crate::rules::WindowRule;
 
+pub mod edges;
 mod monitors;
+mod pointer;
 mod rules;
 
 mod sizing;
@@ -53,17 +55,53 @@ fn coordinate(value: i64) -> i32 {
     value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// One side of the logical gap, in physical pixels. The visual gap is twice this.
+pub fn half_gap(gaps: u32, scale: f64) -> u32 {
+    let px = f64::from(gaps) * scale / 2.0;
+    if !px.is_finite() || px <= 0.0 {
+        0
+    } else {
+        px.round() as u32
+    }
+}
+
+/// Inset every side. Stays inside `rect`; a side smaller than `2 * half` keeps at least 1px.
+pub fn inset_gap(rect: Rect, half: u32) -> Rect {
+    // ponytail: clamp so the result stays inside `rect`. Full `half` when the monitor is larger than the gap.
+    let hx = half.min(rect.width.saturating_sub(1) / 2);
+    let hy = half.min(rect.height.saturating_sub(1) / 2);
+    Rect {
+        x: rect.x.saturating_add(hx as i32),
+        y: rect.y.saturating_add(hy as i32),
+        width: rect.width - hx * 2,
+        height: rect.height - hy * 2,
+    }
+}
+
+/// Grow every side by `half` (the viewport before the gap inset).
+pub fn expand_gap(rect: Rect, half: u32) -> Rect {
+    let half = i64::from(half);
+    Rect {
+        x: coordinate(i64::from(rect.x) - half),
+        y: coordinate(i64::from(rect.y) - half),
+        width: (i64::from(rect.width) + half * 2).clamp(0, i64::from(u32::MAX)) as u32,
+        height: (i64::from(rect.height) + half * 2).clamp(0, i64::from(u32::MAX)) as u32,
+    }
+}
+
+fn widths(page: &Page) -> Vec<u32> {
+    page.columns.iter().map(|c| c.width).collect()
+}
+
+/// The strip always fills the viewport: no empty space before the first or after the last column.
 fn clamp_scroll(page: &Page, viewport: u32, target: i64) -> i32 {
-    let Some(first) = page.columns.first() else {
-        return 0;
-    };
-    let last = page.columns.last().unwrap();
-    let extent: i64 = page.columns.iter().map(|c| c.width as i64).sum();
-    // Half-column edge margins permit centering even the first/last column.
-    let min = ((first.width as i64 - viewport as i64) / 2).min(0);
-    let max =
-        (extent - viewport as i64 + ((viewport as i64 - last.width as i64) / 2).max(0)).max(0);
-    coordinate(target.clamp(min, max))
+    coordinate(edges::clamp_x(&widths(page), viewport, target))
+}
+
+/// Snap distance for boundary drags: 1/12 of the viewport width, at least 64 logical pixels,
+/// so an edge released anywhere near the screen edge clearly lands on it.
+pub fn snap_distance(scale: f64, view: u32) -> i64 {
+    ((64.0 * scale).round() as i64).max(i64::from(view) / 12)
 }
 
 impl Engine {
@@ -100,6 +138,10 @@ impl Engine {
     /// Native monitor work areas remain unchanged; missing overrides use the native work area.
     pub fn set_viewports(&mut self, viewports: BTreeMap<MonitorId, Rect>) {
         self.viewports = viewports;
+    }
+
+    pub fn set_gaps(&mut self, gaps: u32) {
+        self.snapshot.gaps = gaps;
     }
 
     fn id(&mut self, prefix: &str) -> String {
@@ -352,8 +394,7 @@ impl Engine {
             // Native focus must not activate a background logical page, even while paused.
             let native = &self.snapshot.windows[self.window_index(&id)?].native;
             if (!self.snapshot.enabled || !native.minimized)
-                && self.snapshot.monitors[m].pages[p].id
-                    == self.snapshot.monitors[m].active_page
+                && self.snapshot.monitors[m].pages[p].id == self.snapshot.monitors[m].active_page
             {
                 self.set_focus(&id, viewport_changed || previous.as_ref() != Some(&id))?;
             }
@@ -426,6 +467,11 @@ impl Engine {
                     column.width = column.width.min(monitor.viewport.width).max(1);
                 }
                 page.columns.retain(|c| !c.windows.is_empty());
+                let mut filled = widths(page);
+                edges::fill(&mut filled, monitor.viewport.width);
+                for (column, width) in page.columns.iter_mut().zip(filled) {
+                    column.width = width;
+                }
             }
             // Keep the selected empty page and a stable empty tail, but coalesce adjacent empties.
             let last = monitor.pages.last().map(|p| p.id.clone());
@@ -809,7 +855,42 @@ impl Engine {
                     .iter_mut()
                     .find(|p| p.id == monitor.active_page)
                     .unwrap();
-                page.viewport_x = coordinate(page.viewport_x as i64 + delta as i64);
+                page.viewport_x = coordinate(edges::snap_scroll(
+                    &widths(page),
+                    monitor.viewport.width,
+                    page.viewport_x as i64,
+                    delta as i64,
+                ));
+            }
+            Command::DragEdge {
+                monitor_id,
+                edge,
+                delta,
+            } => {
+                let m = self.monitor_index(&monitor_id)?;
+                let monitor = &mut self.snapshot.monitors[m];
+                let view = monitor.viewport.width;
+                let snap = snap_distance(monitor.monitor.scale_factor, view);
+                let page = monitor
+                    .pages
+                    .iter_mut()
+                    .find(|p| p.id == monitor.active_page)
+                    .unwrap();
+                if edge as usize > page.columns.len() {
+                    return Err(invalid("Column boundary does not exist"));
+                }
+                let (widths, x) = edges::drag_edge(
+                    &widths(page),
+                    view,
+                    page.viewport_x as i64,
+                    edge as usize,
+                    delta as i64,
+                    snap,
+                );
+                for (column, width) in page.columns.iter_mut().zip(widths) {
+                    column.width = width;
+                }
+                page.viewport_x = coordinate(x);
             }
             Command::ToggleFloating => {
                 let id = self.focused()?;
@@ -850,6 +931,13 @@ impl Engine {
                 }
                 // Keep membership until enumeration confirms native destruction (close can be cancelled).
                 return Ok(vec![NativeAction::Close { window_id }]);
+            }
+            Command::DropWindow { window_id, x, y } => {
+                self.drop_window(&window_id, x, y)?;
+                focus_action = true;
+            }
+            Command::SetFloatingRect { window_id, rect } => {
+                self.set_floating_rect(&window_id, rect)?;
             }
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
@@ -904,18 +992,23 @@ impl Engine {
                         .iter()
                         .any(|w| &w.native.id == *id && w.fullscreen)
                 });
+                let half = half_gap(self.snapshot.gaps, monitor.monitor.scale_factor);
+                let outer = expand_gap(monitor.viewport, half);
                 let mut x = monitor.viewport.x as i64 - page.viewport_x as i64;
                 for column in &page.columns {
                     let heights = self.column_heights(column, monitor.viewport.height);
                     let mut y = monitor.viewport.y as i64;
                     for (id, height) in column.windows.iter().zip(heights) {
-                        let rect = Rect {
-                            x: coordinate(x),
-                            y: coordinate(y),
-                            width: column.width,
-                            height,
-                        };
-                        self.place(&mut actions, id, rect, monitor.viewport, active, fullscreen);
+                        let rect = inset_gap(
+                            Rect {
+                                x: coordinate(x),
+                                y: coordinate(y),
+                                width: column.width,
+                                height,
+                            },
+                            half,
+                        );
+                        self.place(&mut actions, id, rect, outer, active, fullscreen);
                         y += height as i64;
                     }
                     x += column.width as i64;
@@ -926,7 +1019,7 @@ impl Engine {
                         &mut actions,
                         id,
                         window.native.rect,
-                        monitor.viewport,
+                        outer,
                         active,
                         fullscreen,
                     );
@@ -941,7 +1034,7 @@ impl Engine {
         actions: &mut Vec<NativeAction>,
         id: &str,
         rect: Rect,
-        viewport: Rect,
+        bounds: Rect,
         active: bool,
         fullscreen: Option<&WindowId>,
     ) {
@@ -949,13 +1042,14 @@ impl Engine {
         if window.native.minimized && !window.native.minimized_by_manager {
             return;
         }
-        let rect = if window.fullscreen { viewport } else { rect };
-        let left = (rect.x as i64).max(viewport.x as i64);
-        let top = (rect.y as i64).max(viewport.y as i64);
-        let right =
-            (rect.x as i64 + rect.width as i64).min(viewport.x as i64 + viewport.width as i64);
+        // `bounds` is the viewport expanded by half a gap: fullscreen has no gap, and
+        // scrolling may draw tiled windows into that margin instead of clipping there.
+        let rect = if window.fullscreen { bounds } else { rect };
+        let left = (rect.x as i64).max(bounds.x as i64);
+        let top = (rect.y as i64).max(bounds.y as i64);
+        let right = (rect.x as i64 + rect.width as i64).min(bounds.x as i64 + bounds.width as i64);
         let bottom =
-            (rect.y as i64 + rect.height as i64).min(viewport.y as i64 + viewport.height as i64);
+            (rect.y as i64 + rect.height as i64).min(bounds.y as i64 + bounds.height as i64);
         let visible = right > left && bottom > top;
         let fully_visible = visible
             && left == rect.x as i64

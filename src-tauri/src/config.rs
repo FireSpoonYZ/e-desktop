@@ -10,10 +10,45 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
+    /// Layered over the built-in map by key; `unbind` removes a built-in key.
     pub shortcuts: Vec<ShortcutBinding>,
+    /// false: `shortcuts` is the complete map (`[]` disables all global shortcuts).
+    pub default_shortcuts: bool,
     pub window_rules: Vec<WindowRule>,
-    /// Native Scroll animation; 0 disables it, maximum 1000 ms.
+    /// Layout and overview animations; 0 disables them, maximum 1000 ms.
     pub animation_duration_ms: u32,
+    /// Hovering a managed window focuses it (niri focus-follows-mouse).
+    pub focus_follows_mouse: bool,
+    /// Keyboard/command focus changes move the pointer into the focused window.
+    pub warp_mouse_to_focus: bool,
+    /// The top-left pixel of each monitor toggles the overview.
+    pub hot_corners: bool,
+    /// Held with left drag to move managed windows; null disables.
+    pub drag_modifier: Option<DragModifier>,
+    /// Logical pixels between tiled windows and around the usable edges. Maximum 256.
+    pub gaps: u32,
+    /// False hides every top bar and reserves no space for them.
+    pub top_bar: bool,
+    /// `#rrggbb` focus border for managed windows; null leaves the system color. Windows 11 only.
+    pub focus_border_color: Option<String>,
+    /// Windows 11 corner preference. `system` does not override DWM.
+    pub window_corners: WindowCorners,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DragModifier {
+    Alt,
+    Super,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowCorners {
+    System,
+    Round,
+    RoundSmall,
+    Square,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +87,8 @@ pub enum ShortcutAction {
     Scroll {
         direction: HorizontalDirection,
     },
+    /// Removes the built-in binding for this key; dropped before registration.
+    Unbind {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,27 +111,102 @@ enum StrictCommand {
     Refresh {},
     Enable {},
     Disable {},
-    FocusWindow { window_id: String },
-    FocusDirection { direction: Direction },
-    SwitchPage { monitor_id: String, page_id: String },
-    AddPage { monitor_id: String },
-    MoveWindowToPage { window_id: String, page_id: String },
-    MoveWindow { direction: Direction },
+    FocusWindow {
+        window_id: String,
+    },
+    FocusDirection {
+        direction: Direction,
+    },
+    SwitchPage {
+        monitor_id: String,
+        page_id: String,
+    },
+    AddPage {
+        monitor_id: String,
+    },
+    MoveWindowToPage {
+        window_id: String,
+        page_id: String,
+    },
+    MoveWindow {
+        direction: Direction,
+    },
     CycleWidth {},
-    SetColumnWidth { width: u32 },
-    SetWindowColumnWidth { window_id: String, width: u32 },
-    AdjustColumnWidth { delta: i32 },
-    AdjustWindowHeight { delta: i32 },
+    SetColumnWidth {
+        width: u32,
+    },
+    SetWindowColumnWidth {
+        window_id: String,
+        width: u32,
+    },
+    AdjustColumnWidth {
+        delta: i32,
+    },
+    AdjustWindowHeight {
+        delta: i32,
+    },
     ResetWindowHeights {},
     CenterFocused {},
-    Scroll { monitor_id: String, delta: i32 },
+    Scroll {
+        monitor_id: String,
+        delta: i32,
+    },
     ToggleFloating {},
     ToggleFullscreen {},
-    CloseWindow { window_id: String },
+    CloseWindow {
+        window_id: String,
+    },
+    DropWindow {
+        window_id: String,
+        x: i32,
+        y: i32,
+    },
+    DragEdge {
+        monitor_id: String,
+        edge: u32,
+        delta: i32,
+    },
+    SetFloatingRect {
+        window_id: String,
+        rect: crate::model::Rect,
+    },
 }
 
 impl Default for Config {
     fn default() -> Self {
+        Self {
+            shortcuts: vec![],
+            default_shortcuts: true,
+            window_rules: vec![],
+            animation_duration_ms: 160,
+            focus_follows_mouse: false,
+            warp_mouse_to_focus: false,
+            hot_corners: true,
+            drag_modifier: Some(DragModifier::Alt),
+            gaps: 0,
+            top_bar: true,
+            focus_border_color: Some("#7fc8ff".into()),
+            window_corners: WindowCorners::System,
+        }
+    }
+}
+
+fn colorref(hex: &str) -> Option<u32> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(hex, 16).ok()?;
+    Some((rgb >> 16 & 0xff) | ((rgb >> 8 & 0xff) << 8) | ((rgb & 0xff) << 16))
+}
+
+impl Config {
+    /// COLORREF `0x00BBGGRR` for `focus_border_color`, if it is `#rrggbb`.
+    pub fn focus_colorref(&self) -> Option<u32> {
+        self.focus_border_color.as_deref().and_then(colorref)
+    }
+
+    pub fn builtin_shortcuts() -> Vec<ShortcutBinding> {
         let mut shortcuts = Vec::new();
         let mut bind = |key: String, action| shortcuts.push(ShortcutBinding { key, action });
         for (key, direction) in [
@@ -181,19 +293,23 @@ impl Default for Config {
                 ShortcutAction::Command { command },
             );
         }
-        Self {
-            shortcuts,
-            window_rules: vec![],
-            animation_duration_ms: 160,
-        }
+        shortcuts
     }
-}
 
-impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let config: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if config.animation_duration_ms > 1000 {
             return Err("animationDurationMs 须在 0 到 1000 之间。".into());
+        }
+        if config.gaps > 256 {
+            return Err("gaps 须在 0 到 256 之间。".into());
+        }
+        if config
+            .focus_border_color
+            .as_deref()
+            .is_some_and(|color| colorref(color).is_none())
+        {
+            return Err("focusBorderColor 须为 #rrggbb 或 null。".into());
         }
         for (index, rule) in config.window_rules.iter().enumerate() {
             rule.validate()
@@ -237,6 +353,21 @@ impl Config {
                 return Err(format!("快捷键重复：{}", binding.key));
             }
         }
+        if self.default_shortcuts {
+            let mut merged = Vec::new();
+            for mut binding in Self::builtin_shortcuts() {
+                binding.key = normalize(&binding.key)?;
+                if !keys.contains(&binding.key) {
+                    merged.push(binding);
+                }
+            }
+            merged.append(&mut self.shortcuts);
+            self.shortcuts = merged;
+            // The map is now complete; normalizing again must not re-add unbound keys.
+            self.default_shortcuts = false;
+        }
+        self.shortcuts
+            .retain(|binding| binding.action != ShortcutAction::Unbind {});
         Ok(self)
     }
 }
@@ -340,7 +471,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::default().shortcuts.len(), 46);
+        assert_eq!(Config::builtin_shortcuts().len(), 46);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -384,6 +515,63 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_layer_over_builtins_unless_disabled() {
+        let resolve = |text: &str| {
+            Config::parse(text.as_bytes())
+                .unwrap()
+                .normalize_keys(|k| Ok(k.to_owned()))
+                .unwrap()
+        };
+        let focus_right = ShortcutAction::Command {
+            command: Command::FocusDirection {
+                direction: Direction::Right,
+            },
+        };
+        let action = |config: &Config, key: &str| {
+            config
+                .shortcuts
+                .iter()
+                .find(|b| b.key == key)
+                .map(|b| b.action.clone())
+        };
+        assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 46);
+        let config = resolve(
+            r#"{"shortcuts":[
+                {"key":"Control+Alt+L","action":{"type":"unbind"}},
+                {"key":"Control+Alt+Semicolon","action":{"type":"command","command":{"type":"focusDirection","direction":"right"}}},
+                {"key":"Control+Alt+O","action":{"type":"quit"}}
+            ]}"#,
+        );
+        assert_eq!(config.shortcuts.len(), 46);
+        assert_eq!(action(&config, "Control+Alt+L"), None);
+        assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
+        assert_eq!(
+            action(&config, "Control+Alt+O"),
+            Some(ShortcutAction::Quit {})
+        );
+        assert_eq!(action(&config, "Control+Alt+H").is_some(), true);
+        // Idempotent: a normalized map is complete and keeps its unbinds.
+        assert_eq!(
+            config.clone().normalize_keys(|k| Ok(k.to_owned())).unwrap(),
+            config
+        );
+        assert!(
+            resolve(r#"{"defaultShortcuts":false}"#)
+                .shortcuts
+                .is_empty()
+        );
+        assert_eq!(
+            resolve(
+                r#"{"defaultShortcuts":false,"shortcuts":[{"key":"A","action":{"type":"quit"}}]}"#
+            )
+            .shortcuts
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn animation_duration_bounds_and_invalid_retention() {
         assert_eq!(Config::parse(b"{}").unwrap().animation_duration_ms, 160);
         let mut shortcuts = Shortcuts::new(Config::default());
@@ -399,6 +587,47 @@ mod tests {
                 Config::parse(format!(r#"{{"animationDurationMs":{value}}}"#).as_bytes()).is_err()
             );
             assert_eq!(shortcuts.config, previous);
+        }
+    }
+
+    #[test]
+    fn appearance_defaults_bounds_and_colorref() {
+        let config = Config::parse(b"{}").unwrap();
+        assert_eq!(config.gaps, 0);
+        assert!(config.top_bar);
+        assert_eq!(config.focus_border_color.as_deref(), Some("#7fc8ff"));
+        assert_eq!(config.window_corners, WindowCorners::System);
+        assert_eq!(config.focus_colorref(), Some(0x00ff_c87f));
+        let config = Config::parse(
+            br#"{"gaps":0,"topBar":false,"focusBorderColor":null,"windowCorners":"roundSmall"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.focus_colorref(), None);
+        assert_eq!(
+            (
+                config.gaps,
+                config.top_bar,
+                config.focus_border_color,
+                config.window_corners
+            ),
+            (0, false, None, WindowCorners::RoundSmall)
+        );
+        assert_eq!(
+            Config::parse(br##"{"focusBorderColor":"#ABCDEF"}"##)
+                .unwrap()
+                .focus_colorref(),
+            Some(0x00ef_cdab)
+        );
+        for text in [
+            r#"{"gaps":257}"#,
+            r#"{"gaps":-1}"#,
+            r#"{"topBar":"yes"}"#,
+            r#"{"focusBorderColor":"7fc8ff"}"#,
+            r##"{"focusBorderColor":"#7fc8f"}"##,
+            r##"{"focusBorderColor":"#7fc8ffff"}"##,
+            r#"{"windowCorners":"circle"}"#,
+        ] {
+            assert!(Config::parse(text.as_bytes()).is_err(), "accepted: {text}");
         }
     }
 
@@ -475,7 +704,11 @@ mod tests {
             .set_window_rules(shortcuts.config.window_rules.clone())
             .unwrap();
         assert!(engine.reconcile(system.clone()).unwrap().actions.is_empty());
-        assert_eq!(engine.snapshot().monitors[0].pages[0].columns[0].width, 700);
+        // The rule applied, but a lone column fills the screen.
+        assert_eq!(
+            engine.snapshot().monitors[0].pages[0].columns[0].width,
+            1200
+        );
         engine.dispatch(Command::Enable).unwrap();
         engine
             .dispatch(Command::AdjustColumnWidth { delta: 50 })
@@ -501,7 +734,7 @@ mod tests {
         system.windows.push(window("new"));
         engine.reconcile(system).unwrap();
         let columns = &engine.snapshot().monitors[0].pages[0].columns;
-        assert_eq!((columns[0].width, columns[1].width), (750, 333));
+        assert_eq!((columns[0].width, columns[1].width), (1200, 333));
         assert!(Config::parse(b"{}").unwrap().window_rules.is_empty());
     }
 

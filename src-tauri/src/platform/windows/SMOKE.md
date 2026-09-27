@@ -27,7 +27,7 @@ If a reused target directory contains multiple dependency-feature builds, use a 
 - `clip` is an absolute screen-pixel rectangle, intersected with the target window and the selected monitor work area. Original application region is intersected, not discarded. No-region originals are restored with NULL. Region ownership transfers to USER only after successful `SetWindowRgn`; private copies are deleted by RAII. Partial clips reject layered and RTL windows. Fully excluded windows minimize recoverably; no `SW_HIDE` is used.
 - Ordinary GDI/DWM region-compatible windows are the supported clipping case. This is not security isolation: applications can reset their regions or use independent owned popups, and compositor shadows/custom rendering need real-machine verification. Layered/RTL clipping is explicitly denied; per-window constraints/unsupported behavior produce errors. No claim of compositor-equivalent clipping for every app.
 - On failed placement the backend attempts to restore that window's original state, including recovering an empty transition mask. Parent must refresh after **any** apply failure; earlier actions in a batch are not rolled back. Report errors. On disable/normal exit call `restore()` explicitly and surface aggregate failures. Drop performs a final best-effort restoration and logs failures, but crash/forced termination cannot restore.
-- No preview interface exists in the approved model; no preview or fake screenshot is provided. No global shortcuts or pointer-follow implementation in this backend. Windows 10+ DPI context APIs are used, with scoped per-monitor-v2 thread awareness.
+- No preview interface exists in the approved model; no preview or fake screenshot is provided. No global shortcuts in this backend; the app starts a separate `WH_MOUSE_LL` hook thread (`hook.rs`) for pointer focus, modifier drags and hot corners. Windows 10+ DPI context APIs are used, with scoped per-monitor-v2 thread awareness.
 
 ## Safe manual smoke sequence
 
@@ -40,3 +40,19 @@ Use only disposable test windows with no unsaved work. Ensure explicit disable/r
 5. Close only a disposable document using `Close`; confirm normal app save-prompt behavior (never process termination). Cancel prompt and continue. Destroy/recreate disposable windows, including rapid same-process creation: old IDs must fail with `windowGone`, never mutate the replacement.
 6. Disable after normal placement, partial clipping, maximization and page minimization. Verify initial placement/show state/region returns. Repeat enable/disable. Normal application exit should restore too. Force an operation failure and confirm no permanent empty mask; restoration error must be visible if recovery is denied.
 7. Disconnect/reconnect a secondary monitor and change DPI/work area while paused, then refresh. Recheck metadata before enabling. Test hung/elevated/custom-rendered applications separately; they are not assumed fully supported.
+
+## Mixed-DPI visible-frame regression
+
+With e-desktop stopped, launch a disposable Edge app window titled `EDPEEKTEST`
+using a separate `--user-data-dir`. Pass its process ID to:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --example windows_dpi_smoke --no-default-features -- <fixture-pid>
+```
+
+Start the fixture on a 100% side monitor when the primary is 150%. The check
+moves only that PID/title-matched fixture, applies repeated clipped placements
+on each monitor, temporarily removes the fixture clip, and compares DWM's actual
+visible frame against the target. This bypasses the backend's cached padding,
+which previously hid a missing-DPI-cache error from ordinary readback checks.
+The fixture placement is restored after each monitor and before reporting errors.

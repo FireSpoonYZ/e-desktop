@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,14 +12,15 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, Webvie
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 use crate::{
-    animation::{Placements, ScrollAnimation},
+    animation::{Animation, Placements},
     config::{Config, ConfigFile, ShortcutAction},
-    layout::Engine,
+    layout::{Engine, half_gap, inset_gap},
     model::{
         AppError, BackendAvailability, BackendStatus, Command, ErrorCode, NativeAction, Rect,
         Snapshot,
     },
     platform::Backend,
+    pointer::Gesture,
     preview::{PreviewSession, PreviewSlot, PreviewStatus},
     rules::WindowRule,
     shortcuts::{Shortcuts, normalize_key},
@@ -60,6 +61,13 @@ enum Request {
         mpsc::SyncSender<Result<Vec<PreviewStatus>, AppError>>,
     ),
     Shortcut(String),
+    PinBar(String, bool),
+    /// The mouse hook queued events; drain them with `hook::drain`.
+    #[cfg(target_os = "windows")]
+    Pointer,
+    /// A column boundary drag ended; drain it with `splitter::drain`.
+    #[cfg(target_os = "windows")]
+    Edges,
     Quit,
 }
 
@@ -149,6 +157,15 @@ async fn sync_previews(
 }
 
 #[tauri::command]
+fn set_bar_pinned(
+    monitor_id: String,
+    pinned: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), AppError> {
+    send(&state, Request::PinBar(monitor_id, pinned))
+}
+
+#[tauri::command]
 fn quit(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     send(&state, Request::Quit)
 }
@@ -160,9 +177,25 @@ struct Controller {
     config_error: Option<AppError>,
     window_rules: Vec<WindowRule>,
     placements: Placements,
-    animation: ScrollAnimation,
+    /// Plans a window refused (e.g. minimum size); not retried until the plan changes.
+    refused: Placements,
+    animation: Animation,
     animation_duration: Duration,
     preview_session: PreviewSession,
+    gesture: Option<Gesture>,
+    /// Last window under the pointer: focus-follows-mouse acts on entering a window.
+    hovered: Option<String>,
+    in_corner: bool,
+    /// False hides every top bar and reserves no space.
+    top_bar: bool,
+    /// Managed window in the system move/size loop at the last refresh.
+    native_drag: Option<String>,
+    /// A mouse button was released: refresh soon to adopt a native move or resize.
+    refresh_soon: bool,
+    /// Whether bars can auto-hide (needs the pointer hook).
+    autohide: bool,
+    pinned: BTreeSet<String>,
+    revealed: BTreeSet<String>,
 }
 
 impl Controller {
@@ -174,8 +207,18 @@ impl Controller {
             config_error: None,
             window_rules: vec![],
             placements: Placements::new(),
-            animation: ScrollAnimation::default(),
+            refused: Placements::new(),
+            animation: Animation::default(),
             preview_session: PreviewSession::default(),
+            gesture: None,
+            hovered: None,
+            in_corner: false,
+            top_bar: Config::default().top_bar,
+            native_drag: None,
+            refresh_soon: false,
+            autohide: false,
+            pinned: BTreeSet::new(),
+            revealed: BTreeSet::new(),
             animation_duration: Duration::from_millis(u64::from(
                 Config::default().animation_duration_ms,
             )),
@@ -183,13 +226,16 @@ impl Controller {
         if let Err(e) = controller.connect() {
             controller.record(e);
         }
+        controller.engine.set_gaps(Config::default().gaps);
         controller
     }
 
     fn connect(&mut self) -> Result<(), AppError> {
+        let gaps = self.engine.snapshot().gaps;
         let backend = Backend::new()?;
         let mut engine = Engine::new(backend.status());
         engine.set_window_rules(self.window_rules.clone())?;
+        engine.set_gaps(gaps);
         self.engine = engine;
         self.backend = Some(backend);
         Ok(())
@@ -226,15 +272,45 @@ impl Controller {
         snapshot.backend.capabilities.global_shortcuts = shortcuts;
         snapshot.errors.extend(self.errors.clone());
         snapshot.errors.extend(self.config_error.clone());
+        snapshot.bars_autohide = self.autohide;
+        snapshot.animation_duration_ms = self.animation_duration.as_millis() as u32;
+        snapshot.pinned_bars = snapshot
+            .monitors
+            .iter()
+            .map(|m| m.monitor.id.clone())
+            .filter(|id| self.bar_pinned(id))
+            .collect();
         snapshot
     }
 
+    fn bar_pinned(&self, monitor_id: &str) -> bool {
+        self.top_bar && (!self.autohide || self.pinned.contains(monitor_id))
+    }
+
+    /// Bars shown right now: pinned ones plus those revealed by the pointer.
+    fn visible_bars(&self) -> BTreeSet<String> {
+        if !self.top_bar {
+            return BTreeSet::new();
+        }
+        self.engine
+            .snapshot()
+            .monitors
+            .iter()
+            .map(|m| m.monitor.id.clone())
+            .filter(|id| self.bar_pinned(id) || self.revealed.contains(id))
+            .collect()
+    }
+
     fn refresh(&mut self, apply: bool) -> Result<(), AppError> {
-        // Reconcile at its normal deadline, never defer it behind a stream of Scrolls.
-        // Drop frames BEFORE enumeration (windows/monitors may have disappeared).
-        // Tiled targets come from engine columns/viewport_x, not observed mid-frame rects;
-        // reconciliation immediately applies that final layout, without stale frame writes.
-        self.animation.cancel();
+        // Reconcile at its normal deadline, never defer it behind a stream of commands.
+        // Drop frames BEFORE enumeration (windows/monitors may have disappeared); a focus
+        // still waiting for its window to arrive is kept.
+        let pending_focus = self
+            .animation
+            .cancel()
+            .into_iter()
+            .rev()
+            .find(|a| matches!(a, NativeAction::Focus { .. }));
         let backend = self
             .backend
             .as_mut()
@@ -242,39 +318,112 @@ impl Controller {
         let system = backend.enumerate();
         self.engine.set_backend(backend.status());
         let system = system?;
+        let gaps = self.engine.snapshot().gaps;
         let viewports = system
             .monitors
             .iter()
             .map(|monitor| {
-                let top = (BAR_HEIGHT * monitor.scale_factor).round() as u32;
+                // Only a pinned bar reserves space; an auto-hidden one overlays windows.
+                let top = if self.bar_pinned(&monitor.id) {
+                    bar_rect(monitor).height
+                } else {
+                    0
+                };
                 let area = monitor.work_area;
+                let usable = Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(top.min(area.height) as i32),
+                    width: area.width.max(1),
+                    height: area.height.saturating_sub(top).max(1),
+                };
                 (
                     monitor.id.clone(),
-                    Rect {
-                        x: area.x,
-                        y: area.y.saturating_add(top.min(area.height) as i32),
-                        width: area.width.max(1),
-                        height: area.height.saturating_sub(top).max(1),
-                    },
+                    inset_gap(usable, half_gap(gaps, monitor.scale_factor)),
                 )
             })
             .collect::<BTreeMap<_, _>>();
         self.engine.set_viewports(viewports);
-        let transition = self.engine.reconcile(system)?;
-        self.placements.retain(|id, _| {
+        let prev = self.engine.snapshot().clone();
+        let mut transition = self.engine.reconcile(system)?;
+        self.revealed.retain(|id| {
+            transition
+                .snapshot
+                .monitors
+                .iter()
+                .any(|m| &m.monitor.id == id)
+        });
+        let alive = |id: &String| {
             transition
                 .snapshot
                 .windows
                 .iter()
                 .any(|w| &w.native.id == id)
-        });
+        };
+        self.placements.retain(|id, _| alive(id));
+        self.refused.retain(|id, _| alive(id));
+        // While the user drags a window's own border or title bar, leave everything alone;
+        // the first refresh after the drag adopts the new size or position.
+        #[cfg(target_os = "windows")]
+        let dragging = self.backend.as_ref().and_then(Backend::move_size_window);
+        #[cfg(not(target_os = "windows"))]
+        let dragging: Option<String> = None;
+        let dragged = match dragging {
+            Some(id) => {
+                self.native_drag = Some(id);
+                return Ok(());
+            }
+            None => self.native_drag.take(),
+        };
         if apply {
+            // A tiled window dragged by its title bar joins the layout where it was dropped,
+            // including on another monitor.
+            // A window resized through its own border keeps the new size. Only the window the
+            // user dragged counts: apps also resize themselves (e.g. after moving to a monitor
+            // with other scaling), and those changes are placed back into the layout.
+            if let Some((planned, id)) =
+                dragged.and_then(|id| Some((self.placements.get(&id).filter(|p| !p.2)?.0, id)))
+            {
+                let adopted = match self.engine.adopt_native_move(&id, planned)? {
+                    Some(moved) => Some(moved),
+                    None => self.engine.adopt_native_sizes(&[(id, planned)])?,
+                };
+                if let Some(adopted) = adopted {
+                    transition = adopted;
+                }
+            }
             // Observation must not steal focus from an open palette, menu or dialog.
             let actions: Vec<_> = transition
                 .actions
                 .into_iter()
                 .filter(|a| !matches!(a, NativeAction::Focus { .. }))
+                .chain(pending_focus)
                 .collect();
+            // Opened/closed windows push neighbours: animate those from where they are on
+            // screen. A window the user moved or resized itself starts at its target.
+            let windows = &transition.snapshot.windows;
+            let on_screen: Placements = self
+                .placements
+                .iter()
+                .filter(|(id, (rect, _, hidden))| {
+                    windows.iter().any(|w| {
+                        &w.native.id == *id
+                            && if *hidden {
+                                w.native.minimized_by_manager
+                            } else {
+                                !w.native.minimized && w.native.rect == *rect
+                            }
+                    })
+                })
+                .map(|(id, plan)| (id.clone(), *plan))
+                .collect();
+            let actions = self.animation.start(
+                &prev,
+                &transition.snapshot,
+                &on_screen,
+                actions,
+                self.animation_duration,
+                Instant::now(),
+            );
             self.apply(&actions)?;
         }
         Ok(())
@@ -289,7 +438,11 @@ impl Controller {
                 minimized,
             } = action
             {
-                let same_plan = self.placements.get(window_id) == Some(&(*rect, *clip, *minimized));
+                let plan = (*rect, *clip, *minimized);
+                if self.refused.get(window_id) == Some(&plan) {
+                    continue;
+                }
+                let same_plan = self.placements.get(window_id) == Some(&plan);
                 let native_matches = self
                     .engine
                     .snapshot()
@@ -313,6 +466,25 @@ impl Controller {
                 .ok_or_else(|| error(ErrorCode::BackendUnavailable, "原生窗口后端尚未连接。"))?
                 .apply(std::slice::from_ref(action));
             if let Err(issue) = result {
+                // One window refusing its slot (minimum size, layered clip, ...) must not
+                // end the whole session: the backend already restored that window, so
+                // report it, leave it untouched until its plan changes, and keep going.
+                if let (
+                    NativeAction::Placement {
+                        window_id,
+                        rect,
+                        clip,
+                        minimized,
+                    },
+                    ErrorCode::OperationDenied,
+                ) = (action, &issue.code)
+                {
+                    self.placements.remove(window_id);
+                    self.refused
+                        .insert(window_id.clone(), (*rect, *clip, *minimized));
+                    self.record(issue);
+                    continue;
+                }
                 // Focus/close refusal is not a reason to rearrange every other window.
                 if matches!(
                     action,
@@ -332,9 +504,11 @@ impl Controller {
                 } => {
                     self.placements
                         .insert(window_id.clone(), (*rect, *clip, *minimized));
+                    self.refused.remove(window_id);
                 }
                 NativeAction::Restore { window_id } => {
                     self.placements.remove(window_id);
+                    self.refused.remove(window_id);
                 }
                 _ => {}
             }
@@ -346,6 +520,7 @@ impl Controller {
         self.clear_previews();
         self.animation.cancel();
         self.placements.clear();
+        self.refused.clear();
         // Always turn off automatic reflow, even when one native restore fails.
         let mut result = self.engine.dispatch(Command::Disable).map(|_| ());
         if let Some(backend) = self.backend.as_mut() {
@@ -360,19 +535,16 @@ impl Controller {
     }
 
     fn command(&mut self, command: Command) -> Result<(), AppError> {
+        self.run(command, true)
+    }
+
+    /// `animate: false` for commands a pointer drag issues on every move.
+    fn run(&mut self, command: Command, animate: bool) -> Result<(), AppError> {
         if matches!(command, Command::Disable) {
             self.errors.clear();
             let result = self.stop();
             let _ = self.refresh(false);
             return result;
-        }
-        let scroll_monitor = match &command {
-            Command::Scroll { monitor_id, .. } => Some(monitor_id.clone()),
-            _ => None,
-        };
-        if scroll_monitor.is_none() && !matches!(command, Command::Refresh) {
-            // Close returns no layout actions; finish the old target before it too.
-            self.finish_animation()?;
         }
         if self.backend.is_none() {
             self.connect()?;
@@ -382,11 +554,13 @@ impl Controller {
         }
         if matches!(command, Command::Refresh) {
             self.errors.clear();
+            self.refused.clear();
             return self.refresh(true);
         }
         if matches!(command, Command::Enable) {
             self.refresh(false)?;
         }
+        let prev = self.engine.snapshot().clone();
         let transition = match self.engine.dispatch(command) {
             Ok(transition) => transition,
             Err(issue) => {
@@ -394,16 +568,23 @@ impl Controller {
                 return Err(issue);
             }
         };
-        let actions = if let Some(monitor_id) = scroll_monitor {
+        let layout = transition
+            .actions
+            .iter()
+            .any(|a| matches!(a, NativeAction::Placement { .. }));
+        let actions = if animate && layout {
+            // Retargets a running animation from the frames currently on screen.
             self.animation.start(
+                &prev,
                 &transition.snapshot,
-                &monitor_id,
                 &self.placements,
                 transition.actions,
                 self.animation_duration,
                 Instant::now(),
             )
         } else {
+            // Close returns no layout actions; finish the old target before it too.
+            self.finish_animation()?;
             transition.actions
         };
         self.apply(&actions)
@@ -469,6 +650,298 @@ impl Controller {
         let actions = self.animation.frame(now);
         self.apply(&actions)
     }
+
+    /// niri warp-mouse-to-focus: after a non-pointer focus change, move the pointer inside.
+    fn warp_to_focus(&self, before: Option<&String>) {
+        #[cfg(target_os = "windows")]
+        {
+            let snapshot = self.engine.snapshot();
+            let Some(id) = snapshot
+                .focused_window
+                .as_ref()
+                .filter(|id| snapshot.enabled && Some(*id) != before)
+            else {
+                return;
+            };
+            if let (Some(backend), Some((rect, clip, false))) =
+                (&self.backend, self.placements.get(id).copied())
+            {
+                backend.warp_pointer(clip.unwrap_or(rect));
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = before;
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Controller {
+    fn sync_pointer(&self, config: &Config) {
+        use crate::platform::hook;
+        let enabled = self.engine.snapshot().enabled;
+        hook::configure(hook::Settings {
+            targets: match (&self.backend, config.drag_modifier) {
+                (Some(backend), Some(_)) if enabled => backend.pointer_targets(),
+                _ => HashSet::new(),
+            },
+            modifier: config.drag_modifier,
+            moves: (enabled && config.focus_follows_mouse) || !self.revealed.is_empty(),
+            zones: self
+                .engine
+                .snapshot()
+                .monitors
+                .iter()
+                .flat_map(|m| {
+                    let b = m.monitor.bounds;
+                    let corner = Rect {
+                        width: 1,
+                        height: 1,
+                        ..b
+                    };
+                    let edge = Rect { height: 1, ..b };
+                    [
+                        (enabled && config.hot_corners).then_some(corner),
+                        (self.top_bar && !self.bar_pinned(&m.monitor.id)).then_some(edge),
+                    ]
+                })
+                .flatten()
+                .collect(),
+        });
+    }
+
+    /// Drag strips on the column boundaries of every active page, hidden while a surface is
+    /// open or a layout fullscreen window covers the page.
+    fn sync_edges(&self, surface_open: bool) {
+        use crate::layout::{edges::edge_position, expand_gap, snap_distance};
+        use crate::platform::splitter::{Edge, configure};
+        let snapshot = self.engine.snapshot();
+        let mut edges = Vec::new();
+        for monitor in snapshot
+            .monitors
+            .iter()
+            .filter(|_| snapshot.enabled && !surface_open)
+        {
+            let Some(page) = monitor.pages.iter().find(|p| p.id == monitor.active_page) else {
+                continue;
+            };
+            let fullscreen = snapshot.windows.iter().any(|w| {
+                w.fullscreen
+                    && page
+                        .columns
+                        .iter()
+                        .any(|c| c.windows.contains(&w.native.id))
+            });
+            if fullscreen || page.columns.is_empty() {
+                continue;
+            }
+            let scale = monitor.monitor.scale_factor;
+            let inner = monitor.viewport;
+            let outer = expand_gap(inner, half_gap(snapshot.gaps, scale));
+            let widths: Vec<u32> = page.columns.iter().map(|c| c.width).collect();
+            let view = i64::from(inner.width);
+            let x = i64::from(page.viewport_x);
+            // As wide as the native resize border on both sides of the boundary.
+            let strip = ((12.0 * scale).round() as i64).max(8);
+            let (left, right) = (
+                i64::from(outer.x),
+                i64::from(outer.x) + i64::from(outer.width),
+            );
+            for index in 0..=widths.len() {
+                let pos = edge_position(&widths, x, index);
+                // Shared boundaries, plus screen edges hiding a column behind them.
+                let shown = (pos > 0 && pos < view)
+                    || (pos == 0 && index > 0)
+                    || (pos == view && index < widths.len());
+                if !shown {
+                    continue;
+                }
+                let center = i64::from(inner.x) + pos;
+                let start = (center - strip / 2).clamp(left, right - strip);
+                edges.push(Edge {
+                    monitor_id: monitor.monitor.id.clone(),
+                    index,
+                    hit: Rect {
+                        x: start as i32,
+                        y: outer.y,
+                        width: strip as u32,
+                        height: outer.height,
+                    },
+                    area: inner,
+                    widths: widths.clone(),
+                    rows: page
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            c.windows
+                                .iter()
+                                .map(|id| self.placements.get(id).map_or(1, |p| p.0.height))
+                                .collect()
+                        })
+                        .collect(),
+                    scroll: x,
+                    snap: snap_distance(scale, inner.width),
+                    scale,
+                });
+            }
+        }
+        configure(edges);
+    }
+
+    fn sync_decorations(&mut self, config: &Config) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        let snapshot = self.engine.snapshot();
+        let focused = snapshot
+            .enabled
+            .then_some(snapshot.focused_window.as_deref())
+            .flatten();
+        let (border, corners) = decoration_style(config);
+        backend.set_decorations(focused, border, corners);
+    }
+
+    /// Reveal an unpinned bar at its monitor's top edge; hide it once the pointer leaves it.
+    fn update_bars(&mut self, x: i32, y: i32, corner_active: bool) {
+        if !self.top_bar {
+            self.revealed.clear();
+            return;
+        }
+        let (x, y) = (x as i64, y as i64);
+        let inside = |r: Rect| {
+            x >= r.x as i64
+                && y >= r.y as i64
+                && x < r.x as i64 + r.width as i64
+                && y < r.y as i64 + r.height as i64
+        };
+        for m in &self.engine.snapshot().monitors {
+            let id = &m.monitor.id;
+            if self.bar_pinned(id) {
+                continue;
+            }
+            let b = m.monitor.bounds;
+            let edge = inside(Rect { height: 1, ..b }) && !(corner_active && x == b.x as i64);
+            if edge {
+                self.revealed.insert(id.clone());
+            } else if !inside(bar_rect(&m.monitor)) {
+                self.revealed.remove(id);
+            }
+        }
+    }
+
+    /// Returns an overview toggle request when the pointer enters a hot corner.
+    fn pointer(&mut self, app: &tauri::AppHandle, config: &Config) -> Option<Request> {
+        let mut request = None;
+        for raw in crate::platform::hook::drain() {
+            match self.pointer_event(app, config, raw) {
+                Ok(Some(next)) => request = Some(next),
+                Ok(None) => {}
+                Err(issue) => {
+                    self.gesture = None;
+                    self.record(issue);
+                }
+            }
+        }
+        request
+    }
+
+    fn pointer_event(
+        &mut self,
+        app: &tauri::AppHandle,
+        config: &Config,
+        raw: crate::platform::hook::Raw,
+    ) -> Result<Option<Request>, AppError> {
+        use crate::platform::hook::Raw;
+        if let Raw::Up = raw {
+            // The hook runs before the dragged window's own loop sees the release.
+            if let Some(id) = self.backend.as_ref().and_then(Backend::move_size_window) {
+                self.native_drag = Some(id);
+                self.refresh_soon = true;
+            }
+            return Ok(None);
+        }
+        let snapshot = self.engine.snapshot();
+        let enabled = snapshot.enabled;
+        if !enabled {
+            self.gesture = None;
+            if let Raw::Move { x, y, .. } = raw {
+                self.update_bars(x, y, false);
+            }
+            return Ok(None);
+        }
+        let can_focus = snapshot.backend.capabilities.focus;
+        let focused = snapshot.focused_window.clone();
+        match raw {
+            Raw::Grab { hwnd, x, y } => {
+                let Some(id) = self.backend.as_ref().and_then(|b| b.window_for(hwnd)) else {
+                    return Ok(None);
+                };
+                self.gesture = Gesture::start(snapshot, &id, x, y);
+                if self.gesture.is_some() && can_focus && focused.as_ref() != Some(&id) {
+                    self.command(Command::FocusWindow { window_id: id })?;
+                }
+            }
+            Raw::Up => unreachable!("handled above"),
+            Raw::Release { x, y } => {
+                if let Some(mut gesture) = self.gesture.take() {
+                    for command in gesture.update(x, y, true) {
+                        self.command(command)?;
+                    }
+                }
+            }
+            Raw::Move { x, y, pressed } => {
+                if let Some(gesture) = self.gesture.as_mut() {
+                    for command in gesture.update(x, y, false) {
+                        self.run(command, false)?;
+                    }
+                    return Ok(None);
+                }
+                self.update_bars(x, y, config.hot_corners);
+                let snapshot = self.engine.snapshot();
+                let corner = snapshot
+                    .monitors
+                    .iter()
+                    .find(|m| (m.monitor.bounds.x, m.monitor.bounds.y) == (x, y))
+                    .filter(|_| config.hot_corners && !pressed)
+                    .map(|m| m.monitor.id.clone());
+                if corner.is_some() != self.in_corner {
+                    self.in_corner = corner.is_some();
+                    if let Some(monitor_id) = corner {
+                        let open = app
+                            .get_webview_window(Surface::Overview.label())
+                            .and_then(|w| w.is_visible().ok())
+                            .unwrap_or(false);
+                        return Ok(Some(if open {
+                            Request::Dismiss(Surface::Overview)
+                        } else {
+                            Request::Show(Surface::Overview, Some(monitor_id))
+                        }));
+                    }
+                }
+                if !config.focus_follows_mouse || pressed || !can_focus {
+                    return Ok(None);
+                }
+                let Some(backend) = &self.backend else {
+                    return Ok(None);
+                };
+                let hovered = backend.window_at(x, y);
+                if hovered == self.hovered {
+                    return Ok(None);
+                }
+                self.hovered = hovered.clone();
+                let surface_open = [Surface::Overview, Surface::Commands].iter().any(|s| {
+                    app.get_webview_window(s.label())
+                        .and_then(|w| w.is_visible().ok())
+                        .unwrap_or(false)
+                });
+                if let Some(id) = hovered.filter(|id| Some(id) != focused.as_ref()) {
+                    if !surface_open && backend.pointer_focus_allowed() {
+                        self.command(Command::FocusWindow { window_id: id })?;
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn configure_window(window: &tauri::WebviewWindow, rect: Rect) -> Result<(), AppError> {
@@ -486,11 +959,75 @@ fn control_label(surface: &str, index: usize) -> String {
     }
 }
 
-fn position_controls(app: &tauri::AppHandle, snapshot: &Snapshot) -> Result<(), AppError> {
+#[cfg(target_os = "windows")]
+fn decoration_style(config: &Config) -> (Option<u32>, Option<i32>) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL};
+    let corners = match config.window_corners {
+        crate::config::WindowCorners::System => None,
+        crate::config::WindowCorners::Round => Some(DWMWCP_ROUND),
+        crate::config::WindowCorners::RoundSmall => Some(DWMWCP_ROUNDSMALL),
+        crate::config::WindowCorners::Square => Some(DWMWCP_DONOTROUND),
+    };
+    (config.focus_colorref(), corners)
+}
+
+fn bar_rect(monitor: &crate::model::Monitor) -> Rect {
+    let work = monitor.work_area;
+    let top = (BAR_HEIGHT * monitor.scale_factor).round() as u32;
+    Rect {
+        height: top.min(work.height),
+        ..work
+    }
+}
+
+/// Show without activation: revealing a bar must not take focus from the user's window.
+fn show_bar(window: &tauri::WebviewWindow, visible: bool, on_top: bool) -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = window
+            .hwnd()
+            .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?
+            .0 as windows_sys::Win32::Foundation::HWND;
+        unsafe {
+            if visible {
+                let order = if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                SetWindowPos(
+                    hwnd,
+                    order,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            } else {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    window
+        .set_always_on_top(on_top)
+        .and_then(|_| {
+            if visible {
+                window.show()
+            } else {
+                window.hide()
+            }
+        })
+        .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))
+}
+
+fn position_controls(
+    app: &tauri::AppHandle,
+    snapshot: &Snapshot,
+    visible: &BTreeSet<String>,
+) -> Result<(), AppError> {
     let mut labels = HashSet::new();
     for (index, monitor) in snapshot.monitors.iter().enumerate() {
-        let work = monitor.monitor.work_area;
-        let top = (BAR_HEIGHT * monitor.monitor.scale_factor).round() as u32;
         let label = control_label("topbar", index);
         labels.insert(label.clone());
         let window = match app.get_webview_window(&label) {
@@ -510,15 +1047,14 @@ fn position_controls(app: &tauri::AppHandle, snapshot: &Snapshot) -> Result<(), 
             .build()
             .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?,
         };
-        configure_window(&window, Rect { x: work.x, y: work.y, width: work.width, height: top })?;
-        window
-            .set_always_on_top(snapshot.enabled)
-            .and_then(|_| window.show())
-            .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))?;
+        configure_window(&window, bar_rect(&monitor.monitor))?;
+        let id = &monitor.monitor.id;
+        // A revealed (unpinned) bar overlays tiled windows, so it must stay on top.
+        let pinned = snapshot.pinned_bars.contains(id);
+        show_bar(&window, visible.contains(id), snapshot.enabled || !pinned)?;
     }
     for (label, window) in app.webview_windows() {
-        if label.starts_with("topbar-") && !labels.contains(&label)
-        {
+        if label.starts_with("topbar-") && !labels.contains(&label) {
             let _ = window.hide();
         }
     }
@@ -631,6 +1167,11 @@ fn reload_config(
                 controller
                     .set_window_rules(shortcuts.config.window_rules.clone())
                     .map_err(|e| e.to_string())?;
+                controller.engine.set_gaps(shortcuts.config.gaps);
+                controller.top_bar = shortcuts.config.top_bar;
+                if !controller.top_bar {
+                    controller.revealed.clear();
+                }
                 controller.animation_duration =
                     Duration::from_millis(u64::from(shortcuts.config.animation_duration_ms));
                 Ok(())
@@ -678,6 +1219,28 @@ fn run_controller(
             controller.record(issue);
         }
     }
+    #[cfg(target_os = "windows")]
+    let _hook = {
+        let sender = sender.clone();
+        crate::platform::hook::start(Box::new(move || {
+            let _ = sender.try_send(Request::Pointer);
+        }))
+        .map_err(|issue| controller.record(issue))
+        .ok()
+    };
+    #[cfg(target_os = "windows")]
+    {
+        controller.autohide = _hook.is_some();
+    }
+    #[cfg(target_os = "windows")]
+    let _splitter = {
+        let sender = sender.clone();
+        crate::platform::splitter::start(Box::new(move || {
+            let _ = sender.try_send(Request::Edges);
+        }))
+        .map_err(|issue| controller.record(issue))
+        .ok()
+    };
     let mut previous = Vec::new();
     let mut controls = String::new();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
@@ -706,8 +1269,11 @@ fn run_controller(
         }
         let snapshot = controller.snapshot(shortcuts.available());
         // Native surface positions change only with monitor geometry or enabled state.
+        let visible = controller.visible_bars();
         let geometry = serde_json::to_string(&(
             snapshot.enabled,
+            &visible,
+            &snapshot.pinned_bars,
             snapshot
                 .monitors
                 .iter()
@@ -716,7 +1282,7 @@ fn run_controller(
         ))
         .unwrap_or_default();
         if geometry != controls {
-            match position_controls(&app, &snapshot) {
+            match position_controls(&app, &snapshot, &visible) {
                 Ok(()) => controls = geometry,
                 Err(issue) => controller.record(issue),
             }
@@ -727,6 +1293,17 @@ fn run_controller(
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
             let _ = app.emit("snapshot", &snapshot);
             previous = fingerprint;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            controller.sync_pointer(&shortcuts.config);
+            let surface_open = [Surface::Overview, Surface::Commands].iter().any(|s| {
+                app.get_webview_window(s.label())
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false)
+            });
+            controller.sync_edges(surface_open);
+            controller.sync_decorations(&shortcuts.config);
         }
         let next_deadline = controller
             .animation
@@ -763,9 +1340,12 @@ fn run_controller(
                             .unwrap_or_default();
                     }
                 }
+                let before = controller.engine.snapshot().focused_window.clone();
                 let result = controller.command(command);
                 if let Err(issue) = &result {
                     controller.record(issue.clone());
+                } else if shortcuts.config.warp_mouse_to_focus {
+                    controller.warp_to_focus(before.as_ref());
                 }
                 let current = controller.snapshot(shortcuts.available());
                 *shared.lock().unwrap_or_else(|e| e.into_inner()) = current.clone();
@@ -775,6 +1355,46 @@ fn run_controller(
                 }
             }
             Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
+            Ok(Request::PinBar(monitor_id, pinned)) => {
+                // Unpinning under the pointer keeps the bar until the pointer leaves it.
+                if pinned {
+                    controller.revealed.remove(&monitor_id);
+                    controller.pinned.insert(monitor_id);
+                } else {
+                    controller.pinned.remove(&monitor_id);
+                    controller.revealed.insert(monitor_id);
+                }
+                // Pinned bars reserve their height; reflow the tiled windows now.
+                if controller.backend.is_some() {
+                    if let Err(issue) = controller.refresh(true) {
+                        controller.record(issue);
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            Ok(Request::Edges) => {
+                for drop in crate::platform::splitter::drain() {
+                    // One real resize on release; no per-frame animation of window sizes.
+                    let command = Command::DragEdge {
+                        monitor_id: drop.monitor_id,
+                        edge: drop.index as u32,
+                        delta: drop.delta,
+                    };
+                    if let Err(issue) = controller.run(command, false) {
+                        controller.record(issue);
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            Ok(Request::Pointer) => {
+                if let Some(request) = controller.pointer(&app, &shortcuts.config) {
+                    let _ = sender.try_send(request);
+                }
+                if std::mem::take(&mut controller.refresh_soon) {
+                    // Give the released window's loop a moment to finish first.
+                    next_refresh = next_refresh.min(Instant::now() + Duration::from_millis(80));
+                }
+            }
             Ok(Request::Show(surface, monitor_id)) => {
                 if let Err(issue) = controller.finish_animation() {
                     controller.record(issue);
@@ -855,6 +1475,7 @@ pub fn run() {
             open_surface,
             dismiss_surface,
             sync_previews,
+            set_bar_pinned,
             quit
         ])
         .setup(move |app| {

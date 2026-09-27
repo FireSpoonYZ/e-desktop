@@ -1,6 +1,6 @@
 //! Helpers included by windows_smoke; actions remain restricted to its fixture PID.
 use super::*;
-use e_desktop::animation::{Placements, ScrollAnimation};
+use e_desktop::animation::{Animation, Placements};
 use e_desktop::preview::{PreviewSlot, PreviewState};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -165,24 +165,36 @@ pub fn animation_checks(
             .width,
         650
     );
-    let mut animation = ScrollAnimation::default();
+    let mut animation = Animation::default();
     let mut visible_frames = 0;
     // Redirect mid-flight, then enter from the opposite edge, and cancel before restore.
-    for (delta, partial) in [(600, true), (-450, false), (700, false), (-700, true)] {
+    // Scrolling snaps to column edges; always head toward the side that still has room.
+    for (step, partial) in [(600, true), (450, false), (700, false), (700, true)] {
+        let prev = engine.snapshot().clone();
+        let at_start = prev
+            .monitors
+            .iter()
+            .find(|m| m.monitor.id == monitor)
+            .and_then(|m| m.pages.iter().find(|p| p.id == m.active_page))
+            .is_some_and(|p| p.viewport_x == 0);
+        let delta = if at_start { step } else { -step };
         let transition = engine.dispatch(Command::Scroll {
             monitor_id: monitor.clone(),
             delta,
         })?;
         let now = Instant::now();
         let initial = animation.start(
+            &prev,
             engine.snapshot(),
-            &monitor,
             &applied,
             transition.actions,
             Duration::from_millis(160),
             now,
         );
-        assert!(animation.deadline().is_some());
+        assert!(
+            animation.deadline().is_some(),
+            "scroll {delta} did not move"
+        );
         backend.apply(&initial)?;
         remember(&mut applied, &initial);
         for ms in (16..=if partial { 80 } else { 160 }).step_by(16) {
@@ -203,9 +215,18 @@ pub fn animation_checks(
                     assert_eq!(native.minimized, minimized);
                     if !minimized {
                         assert_eq!(native.rect, rect);
-                        if ms < 160 {
-                            assert!(clip.is_some());
-                        }
+                        // Frames drop the mask only when the whole window is on its monitor.
+                        let viewport = engine
+                            .snapshot()
+                            .monitors
+                            .iter()
+                            .find(|m| m.monitor.id == monitor)
+                            .unwrap()
+                            .viewport;
+                        let inside = rect.x >= viewport.x
+                            && i64::from(rect.x) + i64::from(rect.width)
+                                <= i64::from(viewport.x) + i64::from(viewport.width);
+                        assert!(clip.is_some() || inside);
                         visible_frames += 1;
                     }
                 }

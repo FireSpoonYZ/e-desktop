@@ -1,8 +1,10 @@
 //! Win32 backend. Poll on the owning thread; no hooks or desktop mutation at construction.
+pub mod hook;
 pub mod preview;
+pub mod splitter;
 use crate::model::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
 };
@@ -57,6 +59,13 @@ struct Entry {
     cookie: usize,
     saved: Option<Saved>,
     minimized: bool,
+    /// Last border color (`None` = not forced) and corner preference we applied.
+    decor: Option<(Option<u32>, i32)>,
+    /// Invisible resize border (left, top, right, bottom) per window DPI, measured while
+    /// unclipped; it differs between monitors with different scaling.
+    pads: Vec<(u32, [i32; 4])>,
+    /// Border padding the last placement used; a managed window reads back with it.
+    placed_pad: Option<[i32; 4]>,
 }
 pub struct Backend {
     previews: preview::Previews,
@@ -121,6 +130,65 @@ fn intersect(a: RECT, b: RECT) -> Option<RECT> {
         bottom: a.bottom.min(b.bottom),
     };
     (r.left < r.right && r.top < r.bottom).then_some(r)
+}
+fn same_rect(a: RECT, b: RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+}
+/// Invisible resize border: how far `outer` (GetWindowRect) extends past the visible frame.
+fn frame_pad(outer: RECT, visible: RECT) -> [i32; 4] {
+    [
+        visible.left.saturating_sub(outer.left),
+        visible.top.saturating_sub(outer.top),
+        outer.right.saturating_sub(visible.right),
+        outer.bottom.saturating_sub(visible.bottom),
+    ]
+}
+fn outset(visible: RECT, pad: [i32; 4]) -> RECT {
+    RECT {
+        left: visible.left.saturating_sub(pad[0]),
+        top: visible.top.saturating_sub(pad[1]),
+        right: visible.right.saturating_add(pad[2]),
+        bottom: visible.bottom.saturating_add(pad[3]),
+    }
+}
+fn inset(outer: RECT, pad: [i32; 4]) -> RECT {
+    outset(outer, pad.map(|p| -p))
+}
+fn outer_frame(h: HWND) -> Option<RECT> {
+    let mut r: RECT = unsafe { zeroed() };
+    (unsafe { GetWindowRect(h, &mut r) } != 0).then_some(r)
+}
+/// DWM visible frame. Unreliable while a window region is set (DWM then reports the outer
+/// rectangle, and keeps doing so briefly after the region is removed).
+fn dwm_frame(h: HWND) -> Option<RECT> {
+    let mut visible: RECT = unsafe { zeroed() };
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            h,
+            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+            &mut visible as *mut _ as _,
+            size_of::<RECT>() as u32,
+        )
+    };
+    (hr >= 0).then_some(visible)
+}
+fn reset_decor(hwnd: HWND) {
+    let color = DWMWA_COLOR_DEFAULT;
+    let corner = DWMWCP_DEFAULT;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &color as *const _ as _,
+            size_of::<u32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner as *const _ as _,
+            size_of::<i32>() as u32,
+        );
+    }
 }
 fn local_clip(clip: RECT, window: RECT) -> Result<RECT, AppError> {
     let offset = |value: i32, origin: i32| {
@@ -200,8 +268,84 @@ impl Backend {
     }
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
-            capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, ..Capabilities::default() },
-            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. DWM live overview previews for visible sources; no pointer-focus implementation.".into() }
+            capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, focus_follows_pointer: true, ..Capabilities::default() },
+            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. Rectangles are visible DWM frames. Focus border color and corner preference apply on Windows 11. DWM live overview previews for visible sources; low-level mouse hook for pointer focus, modifier drags and hot corners.".into() }
+    }
+    /// Top-level windows the pointer hook may grab.
+    pub fn pointer_targets(&self) -> HashSet<usize> {
+        self.entries.values().map(|e| e.hwnd).collect()
+    }
+    pub fn window_for(&self, hwnd: usize) -> Option<String> {
+        self.entries
+            .iter()
+            .find(|(_, e)| e.hwnd == hwnd && self.alive(e))
+            .map(|(id, _)| id.clone())
+    }
+    pub fn window_at(&self, x: i32, y: i32) -> Option<String> {
+        let _dpi = DpiScope::enter().ok()?;
+        let h = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        self.window_for(h as usize)
+    }
+    /// Pointer focus must not dismiss menus, dialogs, Start/search or other unmanaged popups.
+    pub fn pointer_focus_allowed(&self) -> bool {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_null() {
+            return true;
+        }
+        let mut pid = 0;
+        let thread = unsafe { GetWindowThreadProcessId(fg, &mut pid) };
+        let mut info: GUITHREADINFO = unsafe { zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if unsafe { GetGUIThreadInfo(thread, &mut info) } != 0
+            && info.flags
+                & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_SYSTEMMENUMODE | GUI_INMOVESIZE)
+                != 0
+        {
+            return false;
+        }
+        if pid == unsafe { GetCurrentProcessId() } || self.window_for(fg as usize).is_some() {
+            return true;
+        }
+        let mut class = [0u16; 64];
+        let n = unsafe { GetClassNameW(fg, class.as_mut_ptr(), class.len() as i32) };
+        matches!(
+            String::from_utf16_lossy(&class[..n.max(0) as usize]).as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        )
+    }
+    /// A managed window is in the system move/size loop (its own border or title bar is
+    /// being dragged). Placing windows now would fight the loop.
+    pub fn move_size_window(&self) -> Option<String> {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_null() {
+            return None;
+        }
+        let thread = unsafe { GetWindowThreadProcessId(fg, null_mut()) };
+        let mut info: GUITHREADINFO = unsafe { zeroed() };
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if unsafe { GetGUIThreadInfo(thread, &mut info) } == 0 || info.flags & GUI_INMOVESIZE == 0 {
+            return None;
+        }
+        self.window_for(unsafe { GetAncestor(info.hwndMoveSize, GA_ROOT) } as usize)
+    }
+    /// Center the pointer in `target` unless it is already inside.
+    pub fn warp_pointer(&self, target: Rect) {
+        let Ok(_dpi) = DpiScope::enter() else { return };
+        let mut p = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut p) } != 0
+            && p.x as i64 >= target.x as i64
+            && p.y as i64 >= target.y as i64
+            && (p.x as i64) < target.x as i64 + target.width as i64
+            && (p.y as i64) < target.y as i64 + target.height as i64
+        {
+            return;
+        }
+        unsafe {
+            SetCursorPos(
+                (target.x as i64 + target.width as i64 / 2) as i32,
+                (target.y as i64 + target.height as i64 / 2) as i32,
+            );
+        }
     }
     fn alive(&self, e: &Entry) -> bool {
         let h = e.hwnd as HWND;
@@ -321,10 +465,10 @@ impl Backend {
                     continue;
                 }
             }
-            let mut r: RECT = unsafe { zeroed() };
-            if unsafe { GetWindowRect(h, &mut r) } == 0 {
+            let minimized = unsafe { IsIconic(h) } != 0;
+            let Some(outer) = outer_frame(h) else {
                 continue;
-            }
+            };
             let id = if let Some(id) = existing {
                 id
             } else {
@@ -353,9 +497,22 @@ impl Backend {
                         cookie,
                         saved: None,
                         minimized: false,
+                        decor: None,
+                        pads: vec![],
+                        placed_pad: None,
                     },
                 );
                 id
+            };
+            // Report the visible frame with the same border padding placement used, so a
+            // placed window reads back exactly as planned (region or not).
+            let entry = &self.entries[&id];
+            let dpi = unsafe { GetDpiForWindow(h) };
+            let known = entry.pads.iter().find(|(d, _)| *d == dpi).map(|(_, p)| *p);
+            let r = match (entry.saved.as_ref().and(entry.placed_pad), known) {
+                _ if minimized => outer,
+                (Some(pad), _) | (None, Some(pad)) => inset(outer, pad),
+                (None, None) => dwm_frame(h).unwrap_or(outer),
             };
             let mut title = vec![0u16; 32768];
             let n = unsafe { GetWindowTextW(h, title.as_mut_ptr(), title.len() as i32) }.max(0)
@@ -375,7 +532,6 @@ impl Backend {
                     CloseHandle(process);
                 }
             }
-            let minimized = unsafe { IsIconic(h) } != 0;
             result.windows.push(NativeWindow {
                 id: id.clone(),
                 title: String::from_utf16_lossy(&title[..n]),
@@ -492,6 +648,27 @@ impl Backend {
         }
         Ok(())
     }
+    /// Border padding at the window's current DPI, refreshed while DWM can report it
+    /// (visible, without our region). A zero reading never replaces a known padding
+    /// (DWM lags behind region removal).
+    fn measure_pad(&mut self, id: &str, h: HWND) -> Option<[i32; 4]> {
+        let dpi = unsafe { GetDpiForWindow(h) };
+        let e = self.entries.get_mut(id)?;
+        let known = e.pads.iter().find(|(d, _)| *d == dpi).map(|(_, p)| *p);
+        if unsafe { IsIconic(h) } != 0 || e.saved.as_ref().is_some_and(|s| s.clipped) {
+            return known;
+        }
+        let (Some(outer), Some(visible)) = (outer_frame(h), dwm_frame(h)) else {
+            return known;
+        };
+        let pad = frame_pad(outer, visible);
+        if !pad.iter().all(|p| (0..=32).contains(p)) || (pad == [0; 4] && known.is_some()) {
+            return known;
+        }
+        e.pads.retain(|(d, _)| *d != dpi);
+        e.pads.push((dpi, pad));
+        Some(pad)
+    }
     fn place(
         &mut self,
         id: &str,
@@ -525,6 +702,10 @@ impl Backend {
             ));
         }
         self.save(id)?;
+        let mut pad = self
+            .measure_pad(id, h)
+            .or(self.entries[id].placed_pad)
+            .unwrap_or_default();
         if minimized || matches!(clipping, Some(None)) {
             if unsafe { IsIconic(h) } == 0 {
                 self.show(h, SW_SHOWMINNOACTIVE, true, id)?;
@@ -546,24 +727,63 @@ impl Backend {
         if unsafe { IsIconic(h) } != 0 || unsafe { IsZoomed(h) } != 0 {
             self.show(h, SW_SHOWNOACTIVATE, false, id)?;
         }
-        if unsafe {
-            SetWindowPos(
-                h,
-                null_mut(),
-                target.x,
-                target.y,
-                target.width as i32,
-                target.height as i32,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
-            )
-        } == 0
+        // `r` is the visible target; SetWindowPos takes the outer frame, which includes the
+        // invisible resize border.
+        let position = |pad: [i32; 4]| {
+            let outer = outset(r, pad);
+            (unsafe {
+                SetWindowPos(
+                    h,
+                    null_mut(),
+                    outer.left,
+                    outer.top,
+                    outer.right - outer.left,
+                    outer.bottom - outer.top,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                )
+            } != 0)
+                .then_some(outer)
+                .ok_or_else(|| failed("SetWindowPos", Some(id)))
+        };
+        let mut outer = position(pad)?;
+        // Crossing into a monitor with different scaling makes the app resize itself
+        // (WM_DPICHANGED) and changes the invisible border. A column peeking in at the screen
+        // edge does this when most of it lies on the neighbouring monitor. Place once more
+        // with the new DPI's border: the window is already there, so the size now holds.
+        let resized = outer_frame(h).is_some_and(|actual| !same_rect(actual, outer));
+        // A first clipped move to a new DPI has no cached border there. Regions make DWM
+        // report the outer frame, so restore the original region and synchronize composition
+        // before measuring. Never turn an unavailable measurement into a zero-width border.
+        if self.measure_pad(id, h).is_none()
+            && self.entries[id].saved.as_ref().is_some_and(|s| s.clipped)
         {
-            return Err(failed("SetWindowPos", Some(id)));
+            let original = self.entries[id]
+                .saved
+                .as_ref()
+                .unwrap()
+                .region
+                .as_ref()
+                .map(copy_region)
+                .transpose()?;
+            set_region(h, original)?;
+            self.entries
+                .get_mut(id)
+                .unwrap()
+                .saved
+                .as_mut()
+                .unwrap()
+                .clipped = false;
+            unsafe {
+                DwmFlush();
+            }
         }
-        let mut actual: RECT = unsafe { zeroed() };
-        if unsafe { GetWindowRect(h, &mut actual) } == 0 {
-            return Err(failed("GetWindowRect", Some(id)));
+        let new_pad = self.measure_pad(id, h).unwrap_or(pad);
+        if resized || new_pad != pad {
+            pad = new_pad;
+            outer = position(pad)?;
         }
+        self.entries.get_mut(id).unwrap().placed_pad = Some(pad);
+        let actual = outer_frame(h).ok_or_else(|| failed("GetWindowRect", Some(id)))?;
         if let Some(Some(c)) = clipping {
             let c = intersect(c, actual).ok_or_else(|| {
                 error(
@@ -572,6 +792,7 @@ impl Backend {
                     Some(id),
                 )
             })?;
+            // Region coordinates are relative to the outer frame, not the visible bounds.
             let local = local_clip(c, actual)?;
             let region =
                 Region(
@@ -590,6 +811,13 @@ impl Backend {
                 }
             }
             set_region(h, Some(region))?;
+            self.entries
+                .get_mut(id)
+                .unwrap()
+                .saved
+                .as_mut()
+                .unwrap()
+                .clipped = true;
         } else if self.entries[id].saved.as_ref().unwrap().clipped {
             let original = self.entries[id]
                 .saved
@@ -609,7 +837,7 @@ impl Backend {
                 .clipped = false;
         }
         self.entries.get_mut(id).unwrap().minimized = false;
-        if rect(actual) != target {
+        if !same_rect(actual, outer) {
             return Err(error(
                 ErrorCode::OperationDenied,
                 "Window constrained requested size/position; refresh required",
@@ -617,6 +845,68 @@ impl Backend {
             ));
         }
         Ok(())
+    }
+    /// Focus border and corners for managed windows. Unchanged windows are not touched.
+    pub fn set_decorations(
+        &mut self,
+        focused: Option<&str>,
+        border: Option<u32>,
+        corners: Option<i32>,
+    ) {
+        let corner = corners.unwrap_or(DWMWCP_DEFAULT);
+        let ids: Vec<_> = self.entries.keys().cloned().collect();
+        for id in ids {
+            let Some(entry) = self.entries.get(&id) else {
+                continue;
+            };
+            if entry.saved.is_none() || !self.alive(entry) {
+                continue;
+            }
+            let desired = border.map(|color| {
+                if focused == Some(id.as_str()) {
+                    color
+                } else {
+                    DWMWA_COLOR_DEFAULT
+                }
+            });
+            let previous = entry.decor;
+            let (border_changed, corner_changed) = match previous {
+                Some((b, c)) => (b != desired, c != corner),
+                None => (desired.is_some(), corner != DWMWCP_DEFAULT),
+            };
+            if !border_changed && !corner_changed {
+                continue;
+            }
+            let hwnd = entry.hwnd as HWND;
+            if border_changed {
+                let color = desired.unwrap_or(DWMWA_COLOR_DEFAULT);
+                unsafe {
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_BORDER_COLOR as u32,
+                        &color as *const _ as _,
+                        size_of::<u32>() as u32,
+                    );
+                }
+            }
+            if corner_changed {
+                unsafe {
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                        &corner as *const _ as _,
+                        size_of::<i32>() as u32,
+                    );
+                }
+            }
+            if let Some(entry) = self.entries.get_mut(&id) {
+                entry.decor = if desired.is_none() && corner == DWMWCP_DEFAULT {
+                    None
+                } else {
+                    Some((desired, corner))
+                };
+            }
+        }
     }
     fn restore_one(&mut self, id: &str) -> Result<(), AppError> {
         let Some(e) = self.entries.get(id) else {
@@ -655,7 +945,12 @@ impl Backend {
         }
         region_result?;
         let e = self.entries.get_mut(id).unwrap();
+        if e.decor.is_some() {
+            reset_decor(h);
+            e.decor = None;
+        }
         e.saved = None;
+        e.placed_pad = None;
         e.minimized = false;
         Ok(())
     }
@@ -770,6 +1065,36 @@ mod tests {
             .is_err()
         );
         assert!(native(Rect::default()).is_err());
+        let outer = RECT {
+            left: 0,
+            top: 0,
+            right: 114,
+            bottom: 114,
+        };
+        let visible = RECT {
+            left: 7,
+            top: 0,
+            right: 107,
+            bottom: 107,
+        };
+        let pad = frame_pad(outer, visible);
+        assert_eq!(pad, [7, 0, 7, 7]);
+        let target = RECT {
+            left: 100,
+            top: 50,
+            right: 500,
+            bottom: 400,
+        };
+        let placed = outset(target, pad);
+        assert!(same_rect(
+            placed,
+            RECT {
+                left: 93,
+                top: 50,
+                right: 507,
+                bottom: 407,
+            }
+        ));
         assert!(
             native(Rect {
                 x: i32::MIN,

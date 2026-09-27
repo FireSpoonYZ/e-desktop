@@ -194,7 +194,7 @@ mod tests {
         assert_eq!((m, p), (1, 1));
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            333
+            1200 // The rule applied, but a lone column fills its viewport.
         );
         assert!(!e.snapshot.windows[e.window_index("new").unwrap()].floating);
         assert!(placement(&t.actions, "new").2);
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!((m, p), (0, 0));
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            1
+            1200 // A lone column fills its viewport.
         );
         assert_eq!(e.snapshot.monitors[m].pages.len(), 2);
     }
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(m, 0);
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            600
+            1200 // Not the rule's 7: a lone column fills its viewport.
         );
         assert!(!e.snapshot.windows[e.window_index("4").unwrap()].floating);
     }

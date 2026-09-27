@@ -70,6 +70,13 @@ export interface Snapshot {
   focusedWindow: WindowId | null;
   activeMonitor: MonitorId | null;
   errors: AppError[];
+  /** Monitors whose bar stays visible and reserves space; the others auto-hide. */
+  pinnedBars: MonitorId[];
+  barsAutohide: boolean;
+  /** 平铺间距，逻辑像素。 */
+  gaps: number;
+  /** 概览开合动画时长（毫秒）；0 禁用。 */
+  animationDurationMs: number;
 }
 export type Direction = 'left' | 'right' | 'up' | 'down';
 export type Command =
@@ -108,6 +115,7 @@ export interface TopBarProps extends ControlProps {
   onOpenOverview: () => void;
   onOpenCommands: () => void;
   onQuit?: () => void;
+  onTogglePin?: () => void;
 }
 export interface PageRailProps extends ControlProps { monitorId?: MonitorId }
 export interface OverviewProps extends ControlProps { onDismiss: () => void }
@@ -126,4 +134,5 @@ export const emptySnapshot: Snapshot = {
     message: 'Native backend is not implemented in this baseline.',
   },
   monitors: [], windows: [], focusedWindow: null, activeMonitor: null, errors: [],
+  pinnedBars: [], barsAutohide: false, gaps: 0, animationDurationMs: 0,
 };

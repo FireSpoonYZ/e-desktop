@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onSurfaceOpened, openSurface, quit, syncPreviews } from './bridge';
+import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onSurfaceOpened, openSurface, quit, setBarPinned, syncPreviews } from './bridge';
 import type { Surface } from './bridge';
 import { emptySnapshot } from './model';
 import type { OnCommand } from './model';
@@ -90,6 +90,10 @@ export default function App() {
     {surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
       : surface === 'commands' ? <CommandPalette key={opening} {...props} onDismiss={onDismiss} />
       : <TopBar {...props} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
-        onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }} />}
+        onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }}
+        onTogglePin={monitor && snapshot.barsAutohide ? () => {
+          void setBarPinned(monitor.monitor.id, !snapshot.pinnedBars.includes(monitor.monitor.id))
+            .catch((cause: unknown) => setLocalError(errorMessage(cause)));
+        } : undefined} />}
   </main>;
 }

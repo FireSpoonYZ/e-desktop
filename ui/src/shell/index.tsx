@@ -31,7 +31,7 @@ function backendNotice(snapshot: Snapshot) {
   }
 }
 
-export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOpenCommands, onQuit }: TopBarProps) {
+export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOpenCommands, onQuit, onTogglePin }: TopBarProps) {
   const monitor = selectedMonitor(snapshot);
   const page = monitor?.pages.find(({ id }) => id === monitor.activePage);
   const error = snapshot.errors.at(-1);
@@ -39,6 +39,7 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
     && snapshot.backend.capabilities.enumerate && snapshot.backend.capabilities.placement
     && snapshot.backend.capabilities.minimize && snapshot.monitors.length > 0;
   const notice = backendNotice(snapshot);
+  const pinned = !!monitor && snapshot.pinnedBars.includes(monitor.monitor.id);
   const pageEmpty = page && !page.columns.some(({ windows }) => windows.length)
     && !page.floatingWindows.length;
 
@@ -59,6 +60,10 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
     <ScrollControls snapshot={snapshot} onCommand={onCommand} busy={busy} />
     <button type="button" disabled={busy} onClick={() => runCommand(onCommand, { type: 'refresh' })}
       title="重新读取后端状态与真实窗口">刷新</button>
+    {onTogglePin && <button type="button" className="shell-pin" onClick={onTogglePin} aria-pressed={pinned}
+      title={pinned ? '取消固定：此屏控制栏自动收起，鼠标移到屏幕顶端时显示' : '固定：此屏控制栏常驻并占用顶部空间'}>
+      {pinned ? '已固定' : '固定'}
+    </button>}
     {onQuit && <button type="button" onClick={onQuit} title="还原窗口后退出；还原失败时保留应用供重试">退出</button>}
     <span className={`shell-feedback${error ? ' shell-error' : ''}`} role={error ? 'alert' : 'status'}
       title={error ? `${error.code}: ${error.message}` : `${notice}${snapshot.backend.message ? ` · ${snapshot.backend.message}` : ''}`}>

@@ -5,13 +5,15 @@ import { useCommand, useSurface } from '../commands/surface';
 import { canInteract, moveCommand, overviewScale, pageGeometry, sizingTarget, trackDrag, trackResize, widthCommand } from './pointer';
 import { WindowPreview, usePreviewFeed, usePreviewSlots } from './previews';
 import type { PreviewRequest } from './previews';
+import { useOverviewZoom } from './zoom';
 import './style.css';
 
 export function Overview({ snapshot, onCommand, onDismiss, busy = false, previewSession = null, syncPreviews }: OverviewProps & {
   previewSession?: number | null; syncPreviews?: PreviewRequest;
 }) {
   const id = useId();
-  const { root, onKeyDown } = useSurface(onDismiss);
+  const closeRef = useRef(onDismiss);
+  const { root, onKeyDown } = useSurface(() => closeRef.current());
   const { run, pending, error } = useCommand(onCommand);
   const [monitorId, setMonitorId] = useState(snapshot.activeMonitor);
   const [availableWidth, setAvailableWidth] = useState(Infinity);
@@ -29,7 +31,9 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
   const resizing = useRef<{ valid: () => boolean; cancel: () => void } | null>(null);
   const previewsAvailable = previewSession !== null && !!syncPreviews;
   const { statuses, publish } = usePreviewFeed(previewSession, syncPreviews);
-  usePreviewSlots(root, { available: previewsAvailable, active: !dropPreview && !preview, onSlotsChange: publish });
+  const zoom = useOverviewZoom({ snapshot, monitor: selected, previewsAvailable, publish, onDismiss });
+  closeRef.current = zoom.requestClose;
+  usePreviewSlots(root, { available: previewsAvailable, active: !dropPreview && !preview, onSlotsChange: zoom.onSlots });
   useLayoutEffect(() => {
     const element = root.current;
     if (!element) return;
@@ -101,7 +105,7 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
         }}
         onClick={(event) => {
           if (suppressClick.current && event?.detail !== 0) { event?.preventDefault(); return; }
-          if (!blocked && ready) void run({ type: 'focusWindow', windowId }, onDismiss);
+          if (!blocked && ready) void run({ type: 'focusWindow', windowId }, zoom.requestClose);
         }}>
         <WindowPreview windowId={windowId} available={previewsAvailable} status={statuses[windowId]} />
         <span className="overview-caption"><strong>{native.title || '无标题窗口'}</strong><span>{native.appName || '未知应用'}{window.fullscreen ? ' · 全屏' : window.floating ? ' · 浮动' : ''}</span></span>
@@ -121,7 +125,9 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
     </label>;
   };
   return <section ref={root} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}
-    className="desktop-overview" onKeyDown={(event) => {
+    className="desktop-overview" data-animating={zoom.phase ?? undefined}
+    style={zoom.phase ? { '--overview-ms': `${snapshot.animationDurationMs}ms` } as CSSProperties : undefined}
+    onKeyDown={(event) => {
       if (event.key === 'Escape' && (dragging.current || resizing.current)) {
         event.preventDefault(); event.stopPropagation(); dragging.current?.cancel(); resizing.current?.cancel(); return;
       }
@@ -130,10 +136,10 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
     <header className="overview-header"><h1 id={`${id}-title`}>工作区概览</h1>
       <nav className="overview-monitors" aria-label="选择显示器">
         {snapshot.monitors.map(({ monitor }, index) => <button key={monitor.id} title={monitor.name}
-          aria-pressed={monitor.id === selected?.monitor.id} disabled={!!dropPreview || !!preview}
+          aria-pressed={monitor.id === selected?.monitor.id} disabled={!!dropPreview || !!preview || zoom.phase !== null}
           onClick={() => setMonitorId(monitor.id)}>显示器 {index + 1}</button>)}
       </nav>
-      <button data-initial-focus className="overview-close" onClick={onDismiss}>关闭 <kbd>Esc</kbd></button></header>
+      <button data-initial-focus className="overview-close" onClick={zoom.requestClose}>关闭 <kbd>Esc</kbd></button></header>
     <div className="overview-notices">
       {!snapshot.enabled && <p role="status">管理已暂停。启用后可进入工作区、聚焦和移动窗口。</p>}
       {snapshot.backend.availability !== 'ready' && <p role="status">{snapshot.backend.message || '原生后端不可用'}</p>}
@@ -144,8 +150,8 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
     <div className="overview-workspaces" aria-label={selected?.monitor.name}>
       {selected && <section className="overview-monitor" aria-label={selected.monitor.name} key={selected.monitor.id}
         style={{
-          // niri logical sizes (gaps 16, focus ring 4) zoomed like the workspace.
-          '--gap': `${16 * scale * selected.monitor.scaleFactor}px`,
+          // niri logical sizes (snapshot.gaps, focus ring 4) zoomed like the workspace.
+          '--gap': `${snapshot.gaps * scale * selected.monitor.scaleFactor}px`,
           '--ring': `${4 * scale * selected.monitor.scaleFactor}px`,
           '--ws-h': `${selected.viewport.height * scale}px`,
         } as CSSProperties}>

@@ -312,14 +312,10 @@ fn sizing_handles_maximum_viewport_dimensions_without_overflow() {
     e.reconcile(native).unwrap();
     e.dispatch(Command::SetColumnWidth { width: u32::MAX })
         .unwrap();
-    for (delta, width) in [
-        (i32::MAX, u32::MAX),
-        (i32::MIN, i32::MAX as u32),
-        (i32::MIN, 1),
-        (i32::MAX, 2147483648),
-    ] {
+    // A lone column always fills the viewport, whatever the requested width.
+    for delta in [i32::MAX, i32::MIN, i32::MIN, i32::MAX] {
         let t = e.dispatch(Command::AdjustColumnWidth { delta }).unwrap();
-        assert_eq!(placement(&t.actions, "1").0.width, width);
+        assert_eq!(placement(&t.actions, "1").0.width, u32::MAX);
     }
     for delta in [i32::MAX, i32::MIN, i32::MIN, i32::MAX] {
         let t = e.dispatch(Command::AdjustWindowHeight { delta }).unwrap();
@@ -482,7 +478,7 @@ fn system() -> SystemSnapshot {
     }
 }
 
-fn engine() -> Engine {
+pub(super) fn engine() -> Engine {
     let mut engine = Engine::new(BackendStatus {
         kind: BackendKind::Windows,
         availability: BackendAvailability::Ready,
@@ -497,6 +493,7 @@ fn engine() -> Engine {
         },
         message: String::new(),
     });
+    engine.set_gaps(0);
     assert!(engine.reconcile(system()).unwrap().actions.is_empty());
     engine.dispatch(Command::Enable).unwrap();
     engine
@@ -711,11 +708,17 @@ fn focus_scroll_clipping_and_independent_monitors() {
             delta: -300,
         })
         .unwrap();
-    assert_eq!(placement(&t.actions, "1").1.unwrap().width, 300);
+    // Scrolling settles on a column edge: window 1 is back in full, unclipped.
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+    assert_eq!(
+        placement(&t.actions, "1"),
+        (placement(&t.actions, "1").0, None, false)
+    );
     e.reconcile(system()).unwrap(); // Actual focus changes to 1; follows it into view.
     assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
     e.dispatch(Command::CenterFocused).unwrap();
-    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, -300);
+    // The strip never leaves empty space, so centering the first column is clamped.
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
     e.dispatch(Command::FocusDirection {
         direction: Direction::Right,
     })
@@ -879,9 +882,10 @@ fn no_clipping_uses_whole_window_visibility_and_focus_recovers_edges() {
             delta: 300,
         })
         .unwrap();
+    // Scroll snaps to the next edge: columns 2 and 3 fill the screen.
     assert!(placement(&t.actions, "1").2);
     assert!(!placement(&t.actions, "2").2);
-    assert!(placement(&t.actions, "3").2);
+    assert!(!placement(&t.actions, "3").2);
     assert!(
         t.actions
             .iter()
@@ -1380,4 +1384,76 @@ fn hotplug_restoring_the_hosts_active_page_allows_simultaneous_new_windows() {
         "b"
     );
     assert_hotplug_consistent(&e);
+}
+
+#[test]
+fn gaps_pad_adjacent_columns_and_clip_to_the_outer_viewport() {
+    let mut e = Engine::new(BackendStatus {
+        availability: BackendAvailability::Ready,
+        capabilities: Capabilities {
+            enumerate: true,
+            placement: true,
+            minimize: true,
+            clipping: true,
+            focus: true,
+            ..Capabilities::default()
+        },
+        ..BackendStatus::default()
+    });
+    let half = half_gap(16, 1.0);
+    assert_eq!(half, 8);
+    e.set_gaps(16);
+    let outer = Rect {
+        x: 0,
+        y: 0,
+        width: 1200,
+        height: 900,
+    };
+    let inner = inset_gap(outer, half);
+    assert_eq!(expand_gap(inner, half), outer);
+    e.set_viewports(BTreeMap::from([("a".into(), inner)]));
+    let mut native = system();
+    native.monitors.truncate(1);
+    native.windows.truncate(3);
+    e.reconcile(native).unwrap();
+    let t = e.dispatch(Command::Enable).unwrap();
+    let (left, left_clip, minimized) = placement(&t.actions, "1");
+    let (right, _, _) = placement(&t.actions, "2");
+    let gap = (half * 2) as i32;
+    assert!(!minimized && left_clip.is_none());
+    assert_eq!(left.x - outer.x, gap);
+    assert_eq!(left.y - outer.y, gap);
+    assert_eq!(right.x - (left.x + left.width as i32), gap);
+    assert_eq!(
+        outer.x + outer.width as i32 - (right.x + right.width as i32),
+        gap
+    );
+    assert_eq!(
+        outer.y + outer.height as i32 - (left.y + left.height as i32),
+        gap
+    );
+    let t = e.dispatch(Command::ToggleFullscreen).unwrap();
+    assert_eq!(placement(&t.actions, "1").0, outer);
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    // Show columns 2 and 3, then let column 1 peek in from the left edge (beyond the snap).
+    e.dispatch(Command::Scroll {
+        monitor_id: "a".into(),
+        delta: 40,
+    })
+    .unwrap();
+    let t = e
+        .dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: 200,
+        })
+        .unwrap();
+    let (rect, clip, minimized) = placement(&t.actions, "1");
+    let clip = clip.unwrap();
+    assert!(!minimized && rect.x < outer.x && clip.x == outer.x && clip.x < inner.x);
+    assert_eq!(
+        i64::from(clip.x) + i64::from(clip.width),
+        i64::from(rect.x) + i64::from(rect.width)
+    );
+    assert_eq!((clip.y, clip.height), (rect.y, rect.height));
 }

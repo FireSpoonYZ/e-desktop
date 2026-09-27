@@ -55,6 +55,28 @@
 .overview-help { flex-shrink: 0; padding: 14px 0; color: var(--muted); font-size: 11px; text-align: center; }
 .overview-help > span { padding: 0 10px; color: #666; }
 .desktop-overview button:not(:disabled):hover { color: var(--text); }
+/* 预览槽位的祖先不能改 opacity/transform，否则 measure 会丢掉槽位。标题和页头是旁支；卡片和工作区底板只动画背景色。 */
+.desktop-overview[data-animating] .overview-workspaces { pointer-events: none; }
+.desktop-overview[data-animating] .overview-scroll { box-shadow: none; }
+.desktop-overview[data-animating] [data-preview-window-id] > small { opacity: 0; }
+.desktop-overview[data-animating] :is(.overview-header, .overview-notices, .overview-page > header, .overview-caption, .overview-help, .overview-add, .overview-edit, .overview-empty, .overview-missing, .overview-resize, .overview-resize-value, .overview-floating > h3) {
+  animation: var(--overview-fade, none) var(--overview-ms, 160ms) ease-in-out both;
+}
+.desktop-overview[data-animating="open"] { --overview-fade: overview-fade-in; }
+.desktop-overview[data-animating="close"] { --overview-fade: overview-fade-out; }
+.desktop-overview[data-animating="open"] .overview-window { animation: overview-card-in var(--overview-ms, 160ms) ease-in-out both; }
+.desktop-overview[data-animating="close"] .overview-window { animation: overview-card-out var(--overview-ms, 160ms) ease-in-out both; }
+.desktop-overview[data-animating="open"] .overview-scroll { animation: overview-plate-in var(--overview-ms, 160ms) ease-in-out both; }
+.desktop-overview[data-animating="close"] .overview-scroll { animation: overview-plate-out var(--overview-ms, 160ms) ease-in-out both; }
+@keyframes overview-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes overview-fade-out { from { opacity: 1 } to { opacity: 0 } }
+@keyframes overview-card-in { from { background-color: transparent } to { background-color: #222 } }
+@keyframes overview-card-out { from { background-color: #222 } to { background-color: transparent } }
+@keyframes overview-plate-in { from { background-color: transparent } to { background-color: #191b1c } }
+@keyframes overview-plate-out { from { background-color: #191b1c } to { background-color: transparent } }
+@media (prefers-reduced-motion: reduce) {
+  .desktop-overview[data-animating] :is(.overview-header, .overview-notices, .overview-page > header, .overview-caption, .overview-help, .overview-add, .overview-edit, .overview-empty, .overview-missing, .overview-resize, .overview-resize-value, .overview-floating > h3, .overview-window, .overview-scroll) { animation: none; }
+}
 @media (max-width: 600px) {
   .overview-header { gap: 8px; }
   .overview-header h1 { font-size: 13px; }
