@@ -1457,3 +1457,172 @@ fn gaps_pad_adjacent_columns_and_clip_to_the_outer_viewport() {
     );
     assert_eq!((clip.y, clip.height), (rect.y, rect.height));
 }
+
+#[test]
+fn clipped_edge_windows_hide_when_the_neighbouring_monitor_shows_nothing() {
+    let mut e = engine();
+    // Column "1" peeks 300 px in at a's left edge; the rest lies on monitor b.
+    e.snapshot.monitors[0].pages[0].viewport_x = 300;
+    let (_, clip, minimized) = placement(&e.placements().unwrap(), "1");
+    assert!(!minimized && clip.is_some(), "b's own window covers the cut-off part");
+    let page = e.snapshot.monitors[0].pages[0].id.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "4".into(),
+        page_id: page,
+    })
+    .unwrap();
+    e.snapshot.monitors[0].pages[0].viewport_x = 300;
+    let actions = e.placements().unwrap();
+    assert!(placement(&actions, "1").2, "nothing on b would hide it");
+    // The right edge borders no monitor: that peek stays.
+    let (_, clip, minimized) = placement(&actions, "3");
+    assert!(!minimized && clip.is_some());
+}
+
+#[test]
+fn closing_the_focused_window_focuses_its_layout_neighbour() {
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    // Windows activates a window on the other monitor once "2" is gone.
+    let mut native = system();
+    native.windows.retain(|w| w.id != "2");
+    native.focused_window = Some("4".into());
+    let t = e.reconcile(native.clone()).unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+    assert!(matches!(t.actions.last(), Some(NativeAction::Focus { window_id }) if window_id == "3"));
+    // The last column falls back to its left neighbour; a stack keeps focus in the column.
+    native.windows.retain(|w| w.id != "3");
+    native.focused_window = None;
+    e.reconcile(native).unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+    let mut e = stacked_engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    let mut native = system();
+    native.windows.retain(|w| w.id != "1");
+    native.focused_window = None;
+    e.reconcile(native).unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+}
+
+#[test]
+fn slide_column_reveals_and_focuses_the_next_column() {
+    // Monitor a: columns 1, 2, 3 of 600 px on a 1200 px view; 1 and 2 are visible.
+    let mut e = engine();
+    let slide = |e: &mut Engine, direction| {
+        e.dispatch(Command::SlideColumn { direction }).unwrap();
+        let page = &e.snapshot.monitors[0].pages[0];
+        (page.viewport_x, e.snapshot.focused_window.clone().unwrap())
+    };
+    assert_eq!(slide(&mut e, Direction::Right), (600, "3".into()));
+    // Nothing further right: focus moves like focusDirection (already at the last column).
+    assert_eq!(slide(&mut e, Direction::Right), (600, "3".into()));
+    assert_eq!(slide(&mut e, Direction::Left), (0, "1".into()));
+    // Everything to the left is visible: focus steps left through visible columns.
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    assert_eq!(slide(&mut e, Direction::Left), (0, "1".into()));
+}
+
+fn active_layout(e: &Engine, m: usize) -> (Vec<Vec<String>>, i32) {
+    let monitor = &e.snapshot.monitors[m];
+    let page = monitor
+        .pages
+        .iter()
+        .find(|p| p.id == monitor.active_page)
+        .unwrap();
+    (
+        page.columns.iter().map(|c| c.windows.clone()).collect(),
+        page.viewport_x,
+    )
+}
+
+#[test]
+fn drops_on_a_screen_edge_queue_the_window_off_screen() {
+    // Monitor a (x 0..1200): columns 1, 2, 3 of 600 px; 1 and 2 on screen.
+    let mut e = engine();
+    let drop = |e: &mut Engine, id: &str, x: i32| {
+        e.dispatch(Command::DropWindow {
+            window_id: id.into(),
+            x,
+            y: 450,
+        })
+        .unwrap()
+    };
+    let t = drop(&mut e, "2", 1190);
+    assert_eq!(active_layout(&e, 0), (vec![vec!["1".into()], vec!["3".into()], vec!["2".into()]], 0));
+    assert!(placement(&t.actions, "2").2, "queued past the right edge");
+    // The focused window queued on the left: focus stays on screen.
+    let t = drop(&mut e, "1", 10);
+    assert_eq!(active_layout(&e, 0).0, [["1"], ["3"], ["2"]]);
+    assert_eq!(active_layout(&e, 0).1, 600);
+    assert!(placement(&t.actions, "1").2);
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+    // Onto another monitor's edge: a lone column there widens to keep the queue off screen.
+    drop(&mut e, "3", -10);
+    assert_eq!(active_layout(&e, 1), (vec![vec!["4".into()], vec!["3".into()]], 0));
+    assert_eq!(e.snapshot.monitors[1].pages[0].columns[0].width, 1200);
+}
+
+#[test]
+fn edge_squeeze_moves_focus_to_the_window_that_took_the_screen() {
+    let mut e = engine();
+    let t = e
+        .dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: -590,
+        })
+        .unwrap();
+    let page = &e.snapshot.monitors[0].pages[0];
+    assert_eq!(page.columns[1].width, 1200);
+    assert_eq!((page.columns[0].width, page.viewport_x), (600, 600));
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    assert!(matches!(t.actions.last(), Some(NativeAction::Focus { window_id }) if window_id == "2"));
+}
+
+#[test]
+fn row_boundaries_resize_snap_and_squeeze_rows_out_sideways() {
+    let row = |edge, delta| Command::DragRow {
+        monitor_id: "a".into(),
+        column: 0,
+        edge,
+        delta,
+    };
+    let heights = |e: &Engine| {
+        let actions = e.placements().unwrap();
+        e.snapshot.monitors[0].pages[0].columns[0]
+            .windows
+            .iter()
+            .map(|id| placement(&actions, id).0.height)
+            .collect::<Vec<_>>()
+    };
+    // One column [2, 1, 3] filling the 1200x900 screen, rows of 300.
+    let mut e = stacked_engine();
+    e.dispatch(row(1, 60)).unwrap();
+    assert_eq!(heights(&e), [360, 240, 300]);
+    e.dispatch(row(1, 80)).unwrap(); // 440 snaps to the middle.
+    assert_eq!(heights(&e), [450, 150, 300]);
+    e.dispatch(row(2, 290)).unwrap(); // Onto the bottom edge: 3 leaves the stack.
+    assert_eq!(heights(&e), [450, 450]);
+    // The column fills the screen, so its centre is not in the left half: queued right.
+    assert_eq!(active_layout(&e, 0), (vec![vec!["2".into(), "1".into()], vec!["3".into()]], 0));
+    // A column in the left half squeezes its rows out to the left.
+    let mut e = engine();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(active_layout(&e, 0).0, [vec!["2", "1"], vec!["3"]]);
+    e.dispatch(row(1, -440)).unwrap();
+    assert_eq!(active_layout(&e, 0), (vec![vec!["2".into()], vec!["1".into()], vec!["3".into()]], 600));
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+    assert!(e.dispatch(row(1, 10)).is_err(), "a single row has no boundary");
+}

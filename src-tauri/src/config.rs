@@ -151,6 +151,9 @@ enum StrictCommand {
         monitor_id: String,
         delta: i32,
     },
+    SlideColumn {
+        direction: Direction,
+    },
     ToggleFloating {},
     ToggleFullscreen {},
     CloseWindow {
@@ -163,6 +166,12 @@ enum StrictCommand {
     },
     DragEdge {
         monitor_id: String,
+        edge: u32,
+        delta: i32,
+    },
+    DragRow {
+        monitor_id: String,
+        column: u32,
         edge: u32,
         delta: i32,
     },
@@ -276,10 +285,12 @@ impl Config {
             ("Left", HorizontalDirection::Left),
             ("Right", HorizontalDirection::Right),
         ] {
-            bind(
-                format!("Control+Alt+{key}"),
-                ShortcutAction::Scroll { direction },
-            );
+            for modifiers in ["Control", "Control+Alt"] {
+                bind(
+                    format!("{modifiers}+{key}"),
+                    ShortcutAction::Scroll { direction },
+                );
+            }
         }
         for (key, command) in [
             ("Left", Command::AdjustColumnWidth { delta: -50 }),
@@ -382,19 +393,11 @@ impl ShortcutAction {
             } => (Some(number.checked_sub(1)?), 0, *move_window),
             Self::RelativePage { delta, move_window } => (None, *delta, *move_window),
             Self::Scroll { direction } => {
-                let monitor = snapshot
-                    .monitors
-                    .iter()
-                    .find(|m| Some(&m.monitor.id) == snapshot.active_monitor.as_ref())
-                    .or(snapshot.monitors.first())?;
-                let step = (monitor.viewport.width / 3).max(1) as i32;
                 return Some(Self::Command {
-                    command: Command::Scroll {
-                        monitor_id: monitor.monitor.id.clone(),
-                        delta: if *direction == HorizontalDirection::Left {
-                            -step
-                        } else {
-                            step
+                    command: Command::SlideColumn {
+                        direction: match direction {
+                            HorizontalDirection::Left => Direction::Left,
+                            HorizontalDirection::Right => Direction::Right,
                         },
                     },
                 });
@@ -471,7 +474,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 46);
+        assert_eq!(Config::builtin_shortcuts().len(), 48);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -535,7 +538,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 46);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 48);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -543,7 +546,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 46);
+        assert_eq!(config.shortcuts.len(), 48);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(
@@ -835,9 +838,8 @@ mod tests {
         assert_eq!(
             scroll.resolve(&snapshot),
             Some(ShortcutAction::Command {
-                command: Command::Scroll {
-                    monitor_id: "b".into(),
-                    delta: 400
+                command: Command::SlideColumn {
+                    direction: Direction::Right
                 }
             })
         );
@@ -869,23 +871,13 @@ mod tests {
         );
         snapshot.active_monitor = Some("a".into());
         assert_eq!(
-            scroll.resolve(&snapshot),
-            Some(ShortcutAction::Command {
-                command: Command::Scroll {
-                    monitor_id: "a".into(),
-                    delta: 300
-                }
-            })
-        );
-        assert_eq!(
             ShortcutAction::Scroll {
                 direction: HorizontalDirection::Left
             }
             .resolve(&snapshot),
             Some(ShortcutAction::Command {
-                command: Command::Scroll {
-                    monitor_id: "a".into(),
-                    delta: -300
+                command: Command::SlideColumn {
+                    direction: Direction::Left
                 }
             })
         );
@@ -900,7 +892,6 @@ mod tests {
             .is_none()
         );
         snapshot.monitors.clear();
-        assert!(scroll.resolve(&snapshot).is_none());
         assert!(relative.resolve(&snapshot).is_none());
         for action in [
             ShortcutAction::Overview {},

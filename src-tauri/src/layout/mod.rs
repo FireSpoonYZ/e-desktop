@@ -7,6 +7,7 @@ pub mod edges;
 mod monitors;
 mod pointer;
 mod rules;
+pub mod scene;
 
 mod sizing;
 
@@ -87,6 +88,13 @@ pub fn expand_gap(rect: Rect, half: u32) -> Rect {
         width: (i64::from(rect.width) + half * 2).clamp(0, i64::from(u32::MAX)) as u32,
         height: (i64::from(rect.height) + half * 2).clamp(0, i64::from(u32::MAX)) as u32,
     }
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    (a.x as i64) < b.x as i64 + b.width as i64
+        && (b.x as i64) < a.x as i64 + a.width as i64
+        && (a.y as i64) < b.y as i64 + b.height as i64
+        && (b.y as i64) < a.y as i64 + a.height as i64
 }
 
 fn widths(page: &Page) -> Vec<u32> {
@@ -309,6 +317,15 @@ impl Engine {
             return Ok(());
         }
         self.outputs_suspended = false;
+        // Closing the focused window hands focus to its layout neighbour (niri), not to
+        // whatever window the OS activates next (often on another monitor).
+        let successor = self
+            .snapshot
+            .focused_window
+            .as_ref()
+            .filter(|id| self.snapshot.enabled && !window_ids.contains(*id))
+            .and_then(|id| self.neighbours(id).ok())
+            .and_then(|candidates| candidates.into_iter().find(|id| window_ids.contains(id)));
         let floating_origins = self.floating_origins();
         let viewport_changed = system.monitors.len() != self.snapshot.monitors.len()
             || system.monitors.iter().any(|monitor| {
@@ -389,7 +406,9 @@ impl Engine {
             }
         }
         let previous = self.snapshot.focused_window.clone();
-        if let Some(id) = system.focused_window {
+        if let Some(id) = successor.filter(|id| self.location(id).is_ok()) {
+            self.set_focus(&id, true)?;
+        } else if let Some(id) = system.focused_window {
             let (m, p, _) = self.location(&id)?;
             // Native focus must not activate a background logical page, even while paused.
             let native = &self.snapshot.windows[self.window_index(&id)?].native;
@@ -531,6 +550,27 @@ impl Engine {
             self.ensure_visible(id, false)?;
         }
         Ok(())
+    }
+
+    /// Windows that inherit focus when `id` closes, best first: the rest of its column (below,
+    /// then above), then the columns to its right, then to its left.
+    fn neighbours(&self, id: &str) -> Result<Vec<WindowId>, AppError> {
+        let (m, p, location) = self.location(id)?;
+        let page = &self.snapshot.monitors[m].pages[p];
+        let Some((c, r)) = location else {
+            return Ok(ids(page).filter(|w| *w != id).cloned().collect());
+        };
+        let column = &page.columns[c].windows;
+        let mut out: Vec<WindowId> = column[r + 1..]
+            .iter()
+            .chain(column[..r].iter().rev())
+            .cloned()
+            .collect();
+        for c in (c + 1..page.columns.len()).chain((0..c).rev()) {
+            let windows = &page.columns[c].windows;
+            out.push(windows[r.min(windows.len() - 1)].clone());
+        }
+        Ok(out)
     }
 
     fn focus_active_page(&mut self) {
@@ -862,6 +902,16 @@ impl Engine {
                     delta as i64,
                 ));
             }
+            Command::SlideColumn { direction } => {
+                self.require_focus()?;
+                if !self.slide_column(direction)? {
+                    if self.snapshot.focused_window.is_none() {
+                        return Ok(vec![]);
+                    }
+                    return self.dispatch_inner(Command::FocusDirection { direction });
+                }
+                focus_action = true;
+            }
             Command::DragEdge {
                 monitor_id,
                 edge,
@@ -891,6 +941,25 @@ impl Engine {
                     column.width = width;
                 }
                 page.viewport_x = coordinate(x);
+                let p = self.snapshot.monitors[m]
+                    .pages
+                    .iter()
+                    .position(|p| p.id == self.snapshot.monitors[m].active_page)
+                    .unwrap();
+                let before = self.snapshot.focused_window.clone();
+                self.keep_focus_on_screen(m, p)?;
+                focus_action = self.snapshot.focused_window != before;
+            }
+            Command::DragRow {
+                monitor_id,
+                column,
+                edge,
+                delta,
+            } => {
+                let m = self.monitor_index(&monitor_id)?;
+                let before = self.snapshot.focused_window.clone();
+                self.drag_row(m, column as usize, edge as usize, delta.into())?;
+                focus_action = self.snapshot.focused_window != before;
             }
             Command::ToggleFloating => {
                 let id = self.focused()?;
@@ -956,6 +1025,58 @@ impl Engine {
         Ok(actions)
     }
 
+    /// Scroll the active page until the next column toward `direction` is fully visible and
+    /// focus it (same row as the focused window). False when every column there is visible.
+    fn slide_column(&mut self, direction: Direction) -> Result<bool, AppError> {
+        let right = match direction {
+            Direction::Left => false,
+            Direction::Right => true,
+            _ => return Err(invalid("Columns slide left or right")),
+        };
+        let m = self
+            .snapshot
+            .active_monitor
+            .as_ref()
+            .and_then(|id| self.monitor_index(id).ok())
+            .ok_or_else(|| invalid("No active monitor"))?;
+        let monitor = &self.snapshot.monitors[m];
+        let view = monitor.viewport.width as i64;
+        let p = monitor
+            .pages
+            .iter()
+            .position(|p| p.id == monitor.active_page)
+            .unwrap();
+        let page = &monitor.pages[p];
+        let x = page.viewport_x as i64;
+        let (mut left, mut target) = (0i64, None);
+        for (c, column) in page.columns.iter().enumerate() {
+            let width = column.width as i64;
+            if right && left + width > x + view {
+                target = Some((c, if width >= view { left } else { left + width - view }));
+                break;
+            }
+            if !right && left < x {
+                target = Some((c, left));
+            }
+            left += width;
+        }
+        let Some((c, scroll)) = target else {
+            return Ok(false);
+        };
+        let row = match self.snapshot.focused_window.as_ref().map(|id| self.location(id)) {
+            Some(Ok((fm, fp, Some((_, row))))) if (fm, fp) == (m, p) => row,
+            _ => 0,
+        };
+        let page = &mut self.snapshot.monitors[m].pages[p];
+        page.viewport_x = clamp_scroll(page, view as u32, scroll);
+        let windows = &page.columns[c].windows;
+        let id = windows[row.min(windows.len() - 1)].clone();
+        let w = self.window_index(&id)?;
+        self.snapshot.windows[w].native.minimized = false;
+        self.set_focus(&id, false)?;
+        Ok(true)
+    }
+
     fn require_focus(&self) -> Result<(), AppError> {
         if self.snapshot.backend.capabilities.focus {
             Ok(())
@@ -994,6 +1115,7 @@ impl Engine {
                 });
                 let half = half_gap(self.snapshot.gaps, monitor.monitor.scale_factor);
                 let outer = expand_gap(monitor.viewport, half);
+                let uncovered = self.uncovered_monitors(&monitor.monitor.id);
                 let mut x = monitor.viewport.x as i64 - page.viewport_x as i64;
                 for column in &page.columns {
                     let heights = self.column_heights(column, monitor.viewport.height);
@@ -1008,7 +1130,7 @@ impl Engine {
                             },
                             half,
                         );
-                        self.place(&mut actions, id, rect, outer, active, fullscreen);
+                        self.place(&mut actions, id, rect, outer, &uncovered, active, fullscreen);
                         y += height as i64;
                     }
                     x += column.width as i64;
@@ -1020,6 +1142,7 @@ impl Engine {
                         id,
                         window.native.rect,
                         outer,
+                        &[],
                         active,
                         fullscreen,
                     );
@@ -1029,12 +1152,31 @@ impl Engine {
         Ok(actions)
     }
 
+    /// Bounds of other monitors whose active page shows no tiled windows. Composition content
+    /// ignores window regions, so a clipped window relies on the neighbouring monitor's own
+    /// windows to hide the part cut off at the edge (the backend keeps it below them).
+    fn uncovered_monitors(&self, own: &str) -> Vec<Rect> {
+        self.snapshot
+            .monitors
+            .iter()
+            .filter(|m| {
+                m.monitor.id != own
+                    && m.pages
+                        .iter()
+                        .find(|p| p.id == m.active_page)
+                        .is_none_or(|p| p.columns.is_empty())
+            })
+            .map(|m| m.monitor.bounds)
+            .collect()
+    }
+
     fn place(
         &self,
         actions: &mut Vec<NativeAction>,
         id: &str,
         rect: Rect,
         bounds: Rect,
+        uncovered: &[Rect],
         active: bool,
         fullscreen: Option<&WindowId>,
     ) {
@@ -1057,10 +1199,12 @@ impl Engine {
             && right == rect.x as i64 + rect.width as i64
             && bottom == rect.y as i64 + rect.height as i64;
         let clipping = self.snapshot.backend.capabilities.clipping;
+        // A monitor without tiled windows cannot cover the part cut off at this edge.
+        let spills = !fully_visible && uncovered.iter().any(|b| overlaps(rect, *b));
         // Without native clipping, hide whole edge windows rather than leaking onto another monitor.
         let minimized = !active
             || fullscreen.is_some_and(|w| w != id)
-            || (!window.floating && (!visible || (!clipping && !fully_visible)));
+            || (!window.floating && (!visible || spills || (!clipping && !fully_visible)));
         let clip = if clipping && !window.floating && !minimized && visible && !fully_visible {
             Some(Rect {
                 x: coordinate(left),

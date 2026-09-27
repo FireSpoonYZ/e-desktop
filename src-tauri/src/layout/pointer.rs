@@ -7,9 +7,105 @@ fn contains(rect: Rect, x: i64, y: i64) -> bool {
         && y < rect.y as i64 + rect.height as i64
 }
 
+/// Width of the strips along the left/right screen edges where a dropped window queues off
+/// screen instead of joining the layout on screen.
+pub fn queue_band(scale: f64, view: u32) -> i64 {
+    ((48.0 * scale).round() as i64).max(i64::from(view) / 24)
+}
+
 impl Engine {
+    /// Take `id` out of its column, dropping the column once empty, while the rest of the
+    /// screen stays put: columns right of a removed on-screen column close the gap.
+    fn detach(&mut self, id: &str) -> Result<u32, AppError> {
+        let (m, p, Some((c, row))) = self.location(id)? else {
+            return Err(invalid("Window has no tiled column"));
+        };
+        let page = &mut self.snapshot.monitors[m].pages[p];
+        let width = page.columns[c].width;
+        page.columns[c].windows.remove(row);
+        if page.columns[c].windows.is_empty() {
+            let left: i64 = page.columns[..c].iter().map(|c| i64::from(c.width)).sum();
+            let x = i64::from(page.viewport_x);
+            if left + i64::from(width) <= x {
+                page.viewport_x = coordinate(x - i64::from(width));
+            } else if left < x {
+                page.viewport_x = coordinate(left);
+            }
+            page.columns.remove(c);
+        }
+        Ok(width)
+    }
+
+    /// Insert `column` just past the left or right screen edge of page `p`, leaving what is
+    /// on screen in place. The columns on screen first widen to fill it if they no longer do,
+    /// so the queued column really is off screen.
+    pub(super) fn queue_column(&mut self, m: usize, p: usize, column: Column, right: bool) {
+        let view = self.snapshot.monitors[m].viewport.width;
+        let page = &mut self.snapshot.monitors[m].pages[p];
+        page.columns.retain(|c| !c.windows.is_empty());
+        let mut filled = widths(page);
+        edges::fill(&mut filled, view);
+        for (c, w) in page.columns.iter_mut().zip(&filled) {
+            c.width = *w;
+        }
+        let mut x = edges::clamp_x(&filled, view, page.viewport_x.into());
+        let (mut left, mut index) = (0i64, None);
+        for (c, &w) in filled.iter().enumerate() {
+            if right && left < x + i64::from(view) {
+                index = Some(c + 1);
+            }
+            if !right && index.is_none() && left + i64::from(w) > x {
+                index = Some(c);
+            }
+            left += i64::from(w);
+        }
+        if !right && !page.columns.is_empty() {
+            x += i64::from(column.width);
+        }
+        page.columns.insert(index.unwrap_or(0), column);
+        page.viewport_x = coordinate(x);
+    }
+
+    /// After a drag pushed the focused window off screen, focus the nearest window still on
+    /// screen, so keyboard input never goes to a hidden window.
+    pub(super) fn keep_focus_on_screen(&mut self, m: usize, p: usize) -> Result<(), AppError> {
+        let Some(id) = self.snapshot.focused_window.clone() else {
+            return Ok(());
+        };
+        let Ok((fm, fp, Some((fc, row)))) = self.location(&id) else {
+            return Ok(());
+        };
+        if (fm, fp) != (m, p) {
+            return Ok(());
+        }
+        let view = i64::from(self.snapshot.monitors[m].viewport.width);
+        let page = &self.snapshot.monitors[m].pages[p];
+        let w = widths(page);
+        let x = i64::from(page.viewport_x);
+        let on_screen = |c: usize| {
+            let left = edges::edge_position(&w, x, c);
+            left < view && left + i64::from(w[c]) > 0
+        };
+        if on_screen(fc) {
+            return Ok(());
+        }
+        let mut visible = (0..w.len()).filter(|&c| on_screen(c));
+        let nearest = if edges::edge_position(&w, x, fc) < 0 {
+            visible.next()
+        } else {
+            visible.last()
+        };
+        let Some(c) = nearest else {
+            return Ok(());
+        };
+        let windows = &page.columns[c].windows;
+        let target = windows[row.min(windows.len() - 1)].clone();
+        self.set_focus(&target, false)
+    }
+
     /// niri-style interactive move: drop onto a column's middle to stack into it (above or
-    /// below the row under the pointer), onto its outer quarters or empty space for a new column.
+    /// below the row under the pointer), onto its outer quarters or empty space for a new
+    /// column, onto the strip along a screen edge to queue it just off screen there.
     pub(super) fn drop_window(&mut self, id: &str, x: i32, y: i32) -> Result<(), AppError> {
         let w = self.window_index(id)?;
         if self.snapshot.windows[w].floating {
@@ -32,6 +128,18 @@ impl Engine {
             .position(|p| p.id == monitor.active_page)
             .unwrap();
         let page = &monitor.pages[p];
+        let band = queue_band(monitor.monitor.scale_factor, viewport.width);
+        let (vx, vw) = (i64::from(viewport.x), i64::from(viewport.width));
+        if x < vx + band || x >= vx + vw - band {
+            if (m, p) != (old_m, old_p) {
+                let page_id = page.id.clone();
+                self.record_hotplug_move(id, &page_id);
+            }
+            let width = self.detach(id)?.min(viewport.width);
+            let column = self.column(id.into(), width);
+            self.queue_column(m, p, column, x >= vx + vw / 2);
+            return self.keep_focus_on_screen(m, p);
+        }
         // (column index, Some(row) to stack into that column, None for a new column there).
         let mut target = (page.columns.len(), None);
         let mut left = viewport.x as i64 - page.viewport_x as i64;
@@ -198,7 +306,7 @@ mod tests {
         let top = x(&e, 0) + 300;
         drop(&mut e, "1", top, 10); // Top half of row 0 in the same column.
         assert_eq!(layout(&e, 0), [vec!["1", "2"], vec!["3"]]);
-        let edge = x(&e, 1) + 590;
+        let edge = x(&e, 1) + 530;
         drop(&mut e, "1", edge, 10); // Right quarter of column 3: new column after it.
         assert_eq!(layout(&e, 0), [vec!["2"], vec!["3"], vec!["1"]]);
         let own = x(&e, 2) + 300;

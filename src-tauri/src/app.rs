@@ -20,11 +20,14 @@ use crate::{
         Snapshot,
     },
     platform::Backend,
-    pointer::Gesture,
+    pointer::{Gesture, tiled},
     preview::{PreviewSession, PreviewSlot, PreviewStatus},
     rules::WindowRule,
     shortcuts::{Shortcuts, normalize_key},
 };
+
+#[cfg(target_os = "windows")]
+use crate::platform::splitter;
 
 const BAR_HEIGHT: f64 = 36.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -183,6 +186,8 @@ struct Controller {
     animation_duration: Duration,
     preview_session: PreviewSession,
     gesture: Option<Gesture>,
+    /// A tiled window is being dragged with the modifier (the splitter thread previews it).
+    window_drag: bool,
     /// Last window under the pointer: focus-follows-mouse acts on entering a window.
     hovered: Option<String>,
     in_corner: bool,
@@ -190,8 +195,9 @@ struct Controller {
     top_bar: bool,
     /// Managed window in the system move/size loop at the last refresh.
     native_drag: Option<String>,
-    /// A mouse button was released: refresh soon to adopt a native move or resize.
-    refresh_soon: bool,
+    /// Refresh within this delay: a released native move/resize, or windows that appeared or
+    /// disappeared (their neighbours close the gap right away instead of at the next poll).
+    refresh_soon: Option<Duration>,
     /// Whether bars can auto-hide (needs the pointer hook).
     autohide: bool,
     pinned: BTreeSet<String>,
@@ -211,11 +217,12 @@ impl Controller {
             animation: Animation::default(),
             preview_session: PreviewSession::default(),
             gesture: None,
+            window_drag: false,
             hovered: None,
             in_corner: false,
             top_bar: Config::default().top_bar,
             native_drag: None,
-            refresh_soon: false,
+            refresh_soon: None,
             autohide: false,
             pinned: BTreeSet::new(),
             revealed: BTreeSet::new(),
@@ -485,6 +492,14 @@ impl Controller {
                     self.record(issue);
                     continue;
                 }
+                // Windows may refuse foreground activation (foreground lock). That must not end
+                // the session; the next enumeration adopts the window actually focused.
+                if matches!(
+                    (action, &issue.code),
+                    (NativeAction::Focus { .. }, ErrorCode::OperationDenied)
+                ) {
+                    continue;
+                }
                 // Focus/close refusal is not a reason to rearrange every other window.
                 if matches!(
                     action,
@@ -676,12 +691,20 @@ impl Controller {
 
 #[cfg(target_os = "windows")]
 impl Controller {
+    fn refresh_within(&mut self, delay: Duration) {
+        self.refresh_soon = Some(self.refresh_soon.map_or(delay, |d| d.min(delay)));
+    }
+
     fn sync_pointer(&self, config: &Config) {
         use crate::platform::hook;
         let enabled = self.engine.snapshot().enabled;
         hook::configure(hook::Settings {
             targets: match (&self.backend, config.drag_modifier) {
                 (Some(backend), Some(_)) if enabled => backend.pointer_targets(),
+                _ => HashSet::new(),
+            },
+            managed: match &self.backend {
+                Some(backend) if enabled => backend.pointer_targets(),
                 _ => HashSet::new(),
             },
             modifier: config.drag_modifier,
@@ -709,82 +732,13 @@ impl Controller {
         });
     }
 
-    /// Drag strips on the column boundaries of every active page, hidden while a surface is
-    /// open or a layout fullscreen window covers the page.
+    /// Drag strips on every active page, hidden while a surface is open.
     fn sync_edges(&self, surface_open: bool) {
-        use crate::layout::{edges::edge_position, expand_gap, snap_distance};
-        use crate::platform::splitter::{Edge, configure};
-        let snapshot = self.engine.snapshot();
-        let mut edges = Vec::new();
-        for monitor in snapshot
-            .monitors
-            .iter()
-            .filter(|_| snapshot.enabled && !surface_open)
-        {
-            let Some(page) = monitor.pages.iter().find(|p| p.id == monitor.active_page) else {
-                continue;
-            };
-            let fullscreen = snapshot.windows.iter().any(|w| {
-                w.fullscreen
-                    && page
-                        .columns
-                        .iter()
-                        .any(|c| c.windows.contains(&w.native.id))
-            });
-            if fullscreen || page.columns.is_empty() {
-                continue;
-            }
-            let scale = monitor.monitor.scale_factor;
-            let inner = monitor.viewport;
-            let outer = expand_gap(inner, half_gap(snapshot.gaps, scale));
-            let widths: Vec<u32> = page.columns.iter().map(|c| c.width).collect();
-            let view = i64::from(inner.width);
-            let x = i64::from(page.viewport_x);
-            // As wide as the native resize border on both sides of the boundary.
-            let strip = ((12.0 * scale).round() as i64).max(8);
-            let (left, right) = (
-                i64::from(outer.x),
-                i64::from(outer.x) + i64::from(outer.width),
-            );
-            for index in 0..=widths.len() {
-                let pos = edge_position(&widths, x, index);
-                // Shared boundaries, plus screen edges hiding a column behind them.
-                let shown = (pos > 0 && pos < view)
-                    || (pos == 0 && index > 0)
-                    || (pos == view && index < widths.len());
-                if !shown {
-                    continue;
-                }
-                let center = i64::from(inner.x) + pos;
-                let start = (center - strip / 2).clamp(left, right - strip);
-                edges.push(Edge {
-                    monitor_id: monitor.monitor.id.clone(),
-                    index,
-                    hit: Rect {
-                        x: start as i32,
-                        y: outer.y,
-                        width: strip as u32,
-                        height: outer.height,
-                    },
-                    area: inner,
-                    widths: widths.clone(),
-                    rows: page
-                        .columns
-                        .iter()
-                        .map(|c| {
-                            c.windows
-                                .iter()
-                                .map(|id| self.placements.get(id).map_or(1, |p| p.0.height))
-                                .collect()
-                        })
-                        .collect(),
-                    scroll: x,
-                    snap: snap_distance(scale, inner.width),
-                    scale,
-                });
-            }
-        }
-        configure(edges);
+        splitter::configure(if surface_open {
+            vec![]
+        } else {
+            splitter::strips(&self.engine)
+        });
     }
 
     fn sync_decorations(&mut self, config: &Config) {
@@ -851,16 +805,43 @@ impl Controller {
         raw: crate::platform::hook::Raw,
     ) -> Result<Option<Request>, AppError> {
         use crate::platform::hook::Raw;
-        if let Raw::Up = raw {
-            // The hook runs before the dragged window's own loop sees the release.
-            if let Some(id) = self.backend.as_ref().and_then(Backend::move_size_window) {
-                self.native_drag = Some(id);
-                self.refresh_soon = true;
+        match raw {
+            Raw::Up => {
+                // The hook runs before the dragged window's own loop sees the release.
+                if let Some(id) = self.backend.as_ref().and_then(Backend::move_size_window) {
+                    self.native_drag = Some(id);
+                    self.refresh_within(Duration::from_millis(80));
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            Raw::Windows => {
+                self.refresh_within(Duration::from_millis(30));
+                return Ok(None);
+            }
+            // A title bar drag of a tiled window previews where it will land.
+            Raw::MoveSize { hwnd, start } => {
+                let snapshot = self.engine.snapshot();
+                if !start {
+                    splitter::end_window(None, snapshot.enabled);
+                } else if let Some(id) = self
+                    .backend
+                    .as_ref()
+                    .and_then(|b| b.window_for(hwnd))
+                    .filter(|id| snapshot.enabled && tiled(snapshot, id))
+                {
+                    splitter::begin_window(id, Some(hwnd));
+                }
+                return Ok(None);
+            }
+            _ => {}
         }
         let snapshot = self.engine.snapshot();
         let enabled = snapshot.enabled;
+        if let (Raw::Release { x, y }, true) = (&raw, self.window_drag) {
+            self.window_drag = false;
+            splitter::end_window(Some((*x, *y)), enabled);
+            return Ok(None);
+        }
         if !enabled {
             self.gesture = None;
             if let Raw::Move { x, y, .. } = raw {
@@ -876,11 +857,17 @@ impl Controller {
                     return Ok(None);
                 };
                 self.gesture = Gesture::start(snapshot, &id, x, y);
-                if self.gesture.is_some() && can_focus && focused.as_ref() != Some(&id) {
-                    self.command(Command::FocusWindow { window_id: id })?;
+                if self.gesture.is_some() {
+                    if can_focus && focused.as_ref() != Some(&id) {
+                        self.command(Command::FocusWindow { window_id: id })?;
+                    }
+                } else if tiled(snapshot, &id) {
+                    // Tiled windows stay put; the preview shows where the release drops them.
+                    self.window_drag = true;
+                    splitter::begin_window(id, None);
                 }
             }
-            Raw::Up => unreachable!("handled above"),
+            Raw::Up | Raw::Windows | Raw::MoveSize { .. } => unreachable!("handled above"),
             Raw::Release { x, y } => {
                 if let Some(mut gesture) = self.gesture.take() {
                     for command in gesture.update(x, y, true) {
@@ -893,6 +880,10 @@ impl Controller {
                     for command in gesture.update(x, y, false) {
                         self.run(command, false)?;
                     }
+                    return Ok(None);
+                }
+                // The drag overlay follows the pointer itself; no hover focus or hot corner.
+                if self.window_drag {
                     return Ok(None);
                 }
                 self.update_bars(x, y, config.hot_corners);
@@ -1303,6 +1294,8 @@ fn run_controller(
                     .unwrap_or(false)
             });
             controller.sync_edges(surface_open);
+            // Drags preview against the current layout (including row heights).
+            splitter::publish(controller.engine.clone());
             controller.sync_decorations(&shortcuts.config);
         }
         let next_deadline = controller
@@ -1373,14 +1366,16 @@ fn run_controller(
             }
             #[cfg(target_os = "windows")]
             Ok(Request::Edges) => {
-                for drop in crate::platform::splitter::drain() {
-                    // One real resize on release; no per-frame animation of window sizes.
-                    let command = Command::DragEdge {
-                        monitor_id: drop.monitor_id,
-                        edge: drop.index as u32,
-                        delta: drop.delta,
-                    };
-                    if let Err(issue) = controller.run(command, false) {
+                for drop in splitter::drain() {
+                    // A window carried by its title bar is already where it was dropped:
+                    // place it straight into its slot and skip adopting the native move.
+                    if let Some(id) = &drop.carried {
+                        controller.native_drag = None;
+                        controller.placements.remove(id);
+                    }
+                    // Moved windows slide into place; boundary drags resize once, unanimated.
+                    let animate = matches!(drop.command, Command::DropWindow { .. });
+                    if let Err(issue) = controller.run(drop.command, animate) {
                         controller.record(issue);
                     }
                 }
@@ -1390,9 +1385,9 @@ fn run_controller(
                 if let Some(request) = controller.pointer(&app, &shortcuts.config) {
                     let _ = sender.try_send(request);
                 }
-                if std::mem::take(&mut controller.refresh_soon) {
-                    // Give the released window's loop a moment to finish first.
-                    next_refresh = next_refresh.min(Instant::now() + Duration::from_millis(80));
+                if let Some(delay) = controller.refresh_soon.take() {
+                    // Give the released window's loop (or a closing app) a moment first.
+                    next_refresh = next_refresh.min(Instant::now() + delay);
                 }
             }
             Ok(Request::Show(surface, monitor_id)) => {

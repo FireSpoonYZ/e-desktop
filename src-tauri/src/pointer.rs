@@ -1,47 +1,47 @@
-//! Modifier + left drag: floating windows follow the pointer, tiled windows are inserted where
-//! dropped. Turned into ordinary layout commands. Physical screen pixels.
+//! Modifier + left drag of a floating window: it follows the pointer, turned into ordinary
+//! layout commands. Tiled windows are previewed and dropped by the drag overlay instead.
+//! Physical screen pixels.
 use crate::model::{Command, Rect, Snapshot, WindowId};
 
 pub struct Gesture {
     pub window_id: WindowId,
-    floating: bool,
     start: (i64, i64),
     rect: Rect,
 }
 
-impl Gesture {
-    pub fn start(snapshot: &Snapshot, window_id: &str, x: i32, y: i32) -> Option<Self> {
-        let window = snapshot.windows.iter().find(|w| w.native.id == window_id)?;
-        let tiled = snapshot
+/// A window in a column of the layout (not floating, not layout fullscreen).
+pub fn tiled(snapshot: &Snapshot, window_id: &str) -> bool {
+    snapshot
+        .windows
+        .iter()
+        .any(|w| w.native.id == window_id && !w.floating && !w.fullscreen)
+        && snapshot
             .monitors
             .iter()
             .flat_map(|m| &m.pages)
             .flat_map(|p| &p.columns)
-            .any(|c| c.windows.iter().any(|w| w == window_id));
-        if window.fullscreen || !(window.floating || tiled) {
-            return None;
-        }
+            .any(|c| c.windows.iter().any(|w| w == window_id))
+}
+
+impl Gesture {
+    /// Only floating, non-fullscreen windows follow the pointer.
+    pub fn start(snapshot: &Snapshot, window_id: &str, x: i32, y: i32) -> Option<Self> {
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|w| w.native.id == window_id && w.floating && !w.fullscreen)?;
         Some(Self {
             window_id: window_id.into(),
-            floating: window.floating,
             start: (x as i64, y as i64),
             rect: window.native.rect,
         })
     }
 
-    /// Commands for the pointer at (x, y); `release` ends the gesture.
-    pub fn update(&mut self, x: i32, y: i32, release: bool) -> Vec<Command> {
-        let window_id = self.window_id.clone();
-        if !self.floating {
-            return if release {
-                vec![Command::DropWindow { window_id, x, y }]
-            } else {
-                vec![]
-            };
-        }
+    /// The command for the pointer at (x, y).
+    pub fn update(&mut self, x: i32, y: i32, _release: bool) -> Vec<Command> {
         let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         vec![Command::SetFloatingRect {
-            window_id,
+            window_id: self.window_id.clone(),
             rect: Rect {
                 x: clamp(self.rect.x as i64 + x as i64 - self.start.0),
                 y: clamp(self.rect.y as i64 + y as i64 - self.start.1),
@@ -50,6 +50,7 @@ impl Gesture {
         }]
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,14 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn gestures_map_to_layout_commands() {
+    fn floating_windows_follow_and_tiled_windows_are_left_to_the_overlay() {
         let mut g = Gesture::start(&snapshot(true), "w", 150, 150).unwrap();
         assert!(matches!(&g.update(170, 140, false)[..],
             [Command::SetFloatingRect { rect, .. }] if (rect.x, rect.y, rect.width) == (120, 90, 400)));
-        // Tiled windows need a column; this snapshot has none.
-        assert!(Gesture::start(&snapshot(false), "w", 0, 0).is_none());
-        let mut tiled = snapshot(false);
-        tiled.monitors.push(MonitorState {
+        let mut tiled_snapshot = snapshot(false);
+        assert!(!tiled(&tiled_snapshot, "w"), "no column holds it yet");
+        tiled_snapshot.monitors.push(MonitorState {
             monitor: Monitor {
                 id: "m".into(),
                 name: String::new(),
@@ -112,11 +112,7 @@ mod tests {
             active_page: "p".into(),
             viewport: Rect::default(),
         });
-        let mut g = Gesture::start(&tiled, "w", 150, 150).unwrap();
-        assert!(g.update(900, 150, false).is_empty());
-        assert!(matches!(
-            &g.update(900, 160, true)[..],
-            [Command::DropWindow { x: 900, y: 160, .. }]
-        ));
+        assert!(tiled(&tiled_snapshot, "w"));
+        assert!(Gesture::start(&tiled_snapshot, "w", 150, 150).is_none());
     }
 }

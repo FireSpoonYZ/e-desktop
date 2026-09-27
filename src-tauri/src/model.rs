@@ -221,13 +221,19 @@ pub enum Command {
         monitor_id: MonitorId,
         delta: i32,
     },
+    /// Slide the active monitor's view left/right until the next column there is fully on
+    /// screen and focus it; at the end of the strip, focus the neighbouring column instead.
+    SlideColumn {
+        direction: Direction,
+    },
     ToggleFloating,
     ToggleFullscreen,
     CloseWindow {
         window_id: WindowId,
     },
     /// Pointer drop at a physical screen point: a tiled window joins the column under it,
-    /// or becomes a new column when dropped on a column's outer quarter or empty space.
+    /// or becomes a new column when dropped on a column's outer quarter or empty space. Near
+    /// the left/right screen edge it queues as a column just off screen on that side.
     DropWindow {
         window_id: WindowId,
         x: i32,
@@ -238,6 +244,16 @@ pub enum Command {
     /// width, cut columns slide, the edge snaps onto screen edges; the page stays filled.
     DragEdge {
         monitor_id: MonitorId,
+        edge: u32,
+        delta: i32,
+    },
+    /// Drag the boundary above row `edge` of column `column` on the monitor's active page by
+    /// `delta` physical pixels. The two rows trade height and the boundary snaps to the middle.
+    /// Dropped on the top/bottom edge, the rows it passed leave the stack and queue as one
+    /// column just off screen, on the side of the screen half the column is in.
+    DragRow {
+        monitor_id: MonitorId,
+        column: u32,
         edge: u32,
         delta: i32,
     },

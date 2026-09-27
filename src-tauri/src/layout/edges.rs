@@ -66,10 +66,27 @@ pub fn edge_position(widths: &[u32], x: i64, edge: usize) -> i64 {
     widths[..edge].iter().map(|&w| i64::from(w)).sum::<i64>() - x
 }
 
+/// Where a dragged boundary lands inside a span of `size`: on either end within `snap`, on
+/// the middle within a third of it, otherwise where the pointer put it.
+pub fn snapped(target: i64, size: i64, snap: i64) -> i64 {
+    if target.abs() <= snap {
+        0
+    } else if (target - size).abs() <= snap {
+        size
+    } else if (target - size / 2).abs() <= snap / 3 {
+        size / 2
+    } else {
+        target
+    }
+}
+
 /// Drag boundary `edge` by `delta`. Every other visible boundary keeps its screen position:
 /// a fully visible neighbour gives or takes the width; a neighbour cut by the screen edge
 /// slides instead (so a column hidden behind that edge peeks in or out). The dragged edge
-/// snaps onto a screen edge within `snap`. Returns the filled widths and clamped scroll.
+/// snaps onto the screen edges and the middle (see `snapped`). A boundary between two columns
+/// that started clear of a screen edge's snap zone and is dropped onto that edge squeezes:
+/// the column on the far side takes the whole screen and everything it passed is pushed off
+/// screen, keeping its width. Returns the filled widths and clamped scroll.
 pub fn drag_edge(
     widths: &[u32],
     view: u32,
@@ -86,11 +103,13 @@ pub fn drag_edge(
     let view_i = i64::from(view);
     let min = (view_i / 10).max(1);
     let p = edge_position(&widths, x, edge);
-    let mut target = p + delta;
-    if target.abs() <= snap {
-        target = 0;
-    } else if (target - view_i).abs() <= snap {
-        target = view_i;
+    let target = snapped(p + delta, view_i, snap);
+    if edge > 0 && edge < n && ((target == 0 && p > snap) || (target == view_i && p < view_i - snap))
+    {
+        let keep = if target == 0 { edge } else { edge - 1 };
+        widths[keep] = view;
+        let x = edge_position(&widths, 0, keep);
+        return (widths.clone(), clamp_x(&widths, view, x));
     }
     let left_full = edge > 0 && edge_position(&widths, x, edge - 1) >= 0;
     let right_full = edge < n && edge_position(&widths, x, edge + 1) <= view_i;
@@ -191,11 +210,38 @@ mod tests {
 
     #[test]
     fn unsnapped_edge_snaps_back_onto_the_screen_edge() {
-        // Column 0 peeks 150px in from the left.
-        let widths = [400, 350, 500];
-        let (w, x) = drag_edge(&widths, 1000, 250, 1, -130, 32);
-        assert_eq!(edge_position(&w, x, 1), 0);
+        // The boundary started on the left screen edge (column 0 hidden): dragging it in and
+        // back out onto that edge leaves the layout as it was.
+        let widths = [400, 500, 500];
+        let (w, x) = drag_edge(&widths, 1000, 400, 1, 20, 32);
         assert_eq!((w, x), (vec![400, 500, 500], 400));
+    }
+
+    #[test]
+    fn boundary_dropped_on_a_screen_edge_squeezes_the_neighbour_out() {
+        // [A | B] on screen with C hidden on the right. B's left edge onto the left screen
+        // edge: B takes the screen, A is pushed out left, C stays out right; widths kept.
+        let (w, x) = drag_edge(&[500, 500, 500], 1000, 0, 1, -480, 32);
+        assert_eq!((w.clone(), x), (vec![500, 1000, 500], 500));
+        assert_eq!(edge_position(&w, x, 1), 0);
+        // A's right edge onto the right screen edge: A takes the screen, B is pushed right.
+        let (w, x) = drag_edge(&[500, 500, 500], 1000, 0, 1, 490, 32);
+        assert_eq!((w, x), (vec![1000, 500, 500], 0));
+        // Three visible columns: B|C onto the left edge pushes both A and B out.
+        let (w, x) = drag_edge(&[300, 300, 400], 1000, 0, 2, -590, 32);
+        assert_eq!((w, x), (vec![300, 300, 1000], 600));
+        // A boundary grabbed inside the edge's snap zone (A peeks 50 px) only re-hides A.
+        let (w, x) = drag_edge(&[950, 500, 500], 1000, 900, 1, 10, 100);
+        assert_eq!((w, x), (vec![950, 550, 500], 950));
+    }
+
+    #[test]
+    fn boundary_snaps_to_the_middle() {
+        let (w, x) = drag_edge(&[700, 300], 1000, 0, 1, -190, 60);
+        assert_eq!((w, x), (vec![500, 500], 0));
+        // Outside a third of the snap distance the pointer wins.
+        let (w, _) = drag_edge(&[700, 300], 1000, 0, 1, -170, 60);
+        assert_eq!(w, vec![530, 470]);
     }
 
     #[test]

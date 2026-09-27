@@ -1,5 +1,7 @@
 //! Low-level mouse hook thread. The callback only swallows modifier+button presses on managed
 //! windows and queues coalesced pointer events; the controller thread does everything else.
+//! The same thread receives WinEvents: windows appearing or disappearing, and system
+//! move/size loops of managed windows.
 use std::{
     cell::Cell,
     collections::{HashSet, VecDeque},
@@ -17,7 +19,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-    UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{Accessibility::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
 use crate::{
@@ -44,12 +46,18 @@ pub enum Raw {
     },
     /// An ordinary left button release (may end a native move/resize of some window).
     Up,
+    /// A managed window entered (`start`) or left the system move/size loop.
+    MoveSize { hwnd: usize, start: bool },
+    /// A managed window was destroyed or hidden, or a new top-level window was shown.
+    Windows,
 }
 
 #[derive(Default)]
 pub struct Settings {
     /// Top-level windows a modifier+button press may grab.
     pub targets: HashSet<usize>,
+    /// Every managed top-level window (lifetime and move/size events).
+    pub managed: HashSet<usize>,
     pub modifier: Option<DragModifier>,
     /// Report all plain pointer motion (focus-follows-mouse, revealed bars).
     pub moves: bool,
@@ -81,7 +89,7 @@ fn push(event: Raw) {
         let mut events = shared.events.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(
             (events.back(), &event),
-            (Some(Raw::Move { .. }), Raw::Move { .. })
+            (Some(Raw::Move { .. }), Raw::Move { .. }) | (Some(Raw::Windows), Raw::Windows)
         ) {
             events.pop_back();
         }
@@ -209,6 +217,45 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     }
 }
 
+/// A window enumeration would pick up as a new layout window.
+fn candidate(h: HWND) -> bool {
+    unsafe {
+        GetAncestor(h, GA_ROOT) == h
+            && GetWindow(h, GW_OWNER).is_null()
+            && GetWindowLongPtrW(h, GWL_STYLE) as u32 & WS_CHILD == 0
+            && GetWindowLongPtrW(h, GWL_EXSTYLE) as u32 & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) == 0
+    }
+}
+
+unsafe extern "system" fn window_event(
+    _: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
+    _: u32,
+    _: u32,
+) {
+    if hwnd.is_null() || object != OBJID_WINDOW || child != CHILDID_SELF as i32 {
+        return;
+    }
+    let managed = shared()
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .managed
+        .contains(&(hwnd as usize));
+    match event {
+        EVENT_SYSTEM_MOVESIZESTART | EVENT_SYSTEM_MOVESIZEEND if managed => push(Raw::MoveSize {
+            hwnd: hwnd as usize,
+            start: event == EVENT_SYSTEM_MOVESIZESTART,
+        }),
+        EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE if managed => push(Raw::Windows),
+        EVENT_OBJECT_SHOW if managed || candidate(hwnd) => push(Raw::Windows),
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn procedure(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32
         && handle(wparam as u32, unsafe {
@@ -246,9 +293,21 @@ pub fn start(wake: Box<dyn Fn() + Send>) -> Result<Hook, AppError> {
                 let _ = tx.send(Err(GetLastError()));
                 return;
             }
+            // Out-of-context WinEvents arrive through this thread's message loop.
+            let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            let events = [
+                (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+                (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
+            ]
+            .map(|(min, max)| {
+                SetWinEventHook(min, max, null_mut(), Some(window_event), 0, 0, flags)
+            });
             let _ = tx.send(Ok(GetCurrentThreadId()));
             while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
                 DispatchMessageW(&message);
+            }
+            for event in events.into_iter().filter(|h| !h.is_null()) {
+                UnhookWinEvent(event);
             }
             UnhookWindowsHookEx(hook);
         })

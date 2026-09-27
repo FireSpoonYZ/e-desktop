@@ -176,6 +176,7 @@ impl Backend {
                 decor: None,
                 pads: vec![],
                 placed_pad: None,
+                region_box: None,
             });
         }
         self.previews

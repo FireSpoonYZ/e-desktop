@@ -67,7 +67,8 @@ impl Engine {
         Ok(())
     }
 
-    pub(super) fn column_heights(&self, column: &Column, total: u32) -> Vec<u32> {
+    /// Row heights of `column` in a viewport `total` pixels tall (before gaps).
+    pub fn column_heights(&self, column: &Column, total: u32) -> Vec<u32> {
         let known: Vec<_> = column
             .windows
             .iter()
@@ -139,6 +140,90 @@ impl Engine {
         let actions = next.placements()?;
         *self = next;
         Ok(Some(self.transition(actions)))
+    }
+
+    /// Drag the boundary above row `edge` of column `c` on monitor `m`'s active page (see
+    /// `Command::DragRow`).
+    pub(super) fn drag_row(
+        &mut self,
+        m: usize,
+        c: usize,
+        edge: usize,
+        delta: i64,
+    ) -> Result<(), AppError> {
+        let monitor = &self.snapshot.monitors[m];
+        let p = monitor
+            .pages
+            .iter()
+            .position(|p| p.id == monitor.active_page)
+            .unwrap();
+        let page = &monitor.pages[p];
+        let column = page
+            .columns
+            .get(c)
+            .ok_or_else(|| invalid("Column does not exist"))?;
+        let windows = column.windows.clone();
+        let rows = windows.len();
+        if edge == 0 || edge >= rows {
+            return Err(invalid("Row boundary does not exist"));
+        }
+        let total = monitor.viewport.height;
+        let snap = snap_distance(monitor.monitor.scale_factor, total);
+        let mut heights: Vec<i64> = self
+            .column_heights(column, total)
+            .into_iter()
+            .map(i64::from)
+            .collect();
+        let pos: i64 = heights[..edge].iter().sum();
+        let target = edges::snapped(pos + delta, total.into(), snap);
+        let width = column.width;
+        let left = edges::edge_position(&widths(page), page.viewport_x.into(), c);
+        let view = monitor.viewport.width;
+        let before = self.snapshot.focused_window.clone();
+        let total_i = i64::from(total);
+        // Only a boundary that started clear of the edge's snap zone squeezes rows out.
+        if (target == 0 && pos > snap) || (target == total_i && pos < total_i - snap) {
+            // Squeezed out: the rows the boundary passed leave as one column, queued off screen
+            // on the side of the screen half this column is in; the next row takes their space.
+            let top = target == 0;
+            let (leave, stay, absorber) = if top {
+                (0..edge, edge..rows, edge)
+            } else {
+                (edge..rows, 0..edge, edge - 1)
+            };
+            heights[absorber] += heights[leave.clone()].iter().sum::<i64>();
+            for r in stay {
+                self.height_weights
+                    .insert(windows[r].clone(), (heights[r] - 1) as u32);
+            }
+            let expelled = windows[leave].to_vec();
+            self.snapshot.monitors[m].pages[p].columns[c]
+                .windows
+                .retain(|w| !expelled.contains(w));
+            let right = left + i64::from(width) / 2 >= i64::from(view) / 2;
+            let column = Column {
+                id: self.id("column"),
+                width,
+                windows: expelled.clone(),
+            };
+            self.queue_column(m, p, column, right);
+            if before.as_ref().is_some_and(|f| expelled.contains(f)) {
+                self.set_focus(&windows[absorber], false)?;
+            }
+            return Ok(());
+        }
+        let min = (i64::from(total) / 10).max(1);
+        let (lo, hi) = (min - heights[edge - 1], heights[edge] - min);
+        if lo > hi {
+            return Ok(());
+        }
+        let d = (target - pos).clamp(lo, hi);
+        heights[edge - 1] += d;
+        heights[edge] -= d;
+        for (id, h) in windows.iter().zip(heights) {
+            self.height_weights.insert(id.clone(), (h - 1) as u32);
+        }
+        Ok(())
     }
 
     pub(super) fn adjust_window_height(&mut self, delta: i32) -> Result<(), AppError> {
