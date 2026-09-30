@@ -3,10 +3,10 @@ use super::*;
 pub use crate::preview::{PreviewSlot, PreviewState, PreviewStatus};
 use std::collections::HashSet;
 
-struct Thumbnail {
-    handle: isize,
+pub(super) struct Thumbnail {
+    pub(super) handle: isize,
     // Keep release injectable so ownership tests never register real DWM resources.
-    unregister: unsafe extern "system" fn(isize) -> i32,
+    pub(super) unregister: unsafe extern "system" fn(isize) -> i32,
 }
 impl Drop for Thumbnail {
     fn drop(&mut self) {
@@ -177,6 +177,7 @@ impl Backend {
                 pads: vec![],
                 placed_pad: None,
                 region_box: None,
+                at_bottom: false,
             });
         }
         self.previews

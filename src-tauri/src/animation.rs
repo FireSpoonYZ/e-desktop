@@ -28,8 +28,27 @@ struct Plan {
     duration: Duration,
     next_frame: Instant,
     moves: Vec<Move>,
-    /// Focus on a window that is still offscreen waits for its final placement.
+    /// A window not yet fully inside its viewport is activated after its final placement.
     deferred: Vec<NativeAction>,
+}
+
+/// One window of a running animation, for backends that draw frames themselves (a compositor
+/// overlay per monitor, niri style) instead of moving the real window every frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sprite {
+    pub window_id: String,
+    /// The current frame (screen coordinates), drawn cropped to `bounds`.
+    pub rect: Rect,
+    /// The monitor area the window is drawn into.
+    pub bounds: Rect,
+    /// The final placement when the real window may take it right away, hidden under the
+    /// overlay: it stays shown and at least as visible as now. Windows that shrink out of
+    /// view or end hidden keep their current state (and picture) until the animation ends.
+    pub early: Option<NativeAction>,
+}
+
+fn area(r: Option<Rect>) -> u64 {
+    r.map_or(0, |r| u64::from(r.width) * u64::from(r.height))
 }
 
 struct Move {
@@ -37,6 +56,8 @@ struct Move {
     action: NativeAction,
     from: Rect,
     to: Rect,
+    /// The last frame produced.
+    current: Rect,
     /// Monitor viewport expanded by half a gap: the area frames may draw into.
     bounds: Rect,
     /// Minimized (or never shown) since the last frame: mask before restoring it.
@@ -49,6 +70,7 @@ impl Move {
             unreachable!()
         };
         let rect = lerp_rect(self.from, self.to, t);
+        self.current = rect;
         let clip = clip_to_viewport(rect, self.bounds);
         let minimized = clip.is_none();
         // A fully visible frame of an already shown window needs no mask; a window being
@@ -67,6 +89,56 @@ impl Move {
 impl Animation {
     pub fn deadline(&self) -> Option<Instant> {
         self.plan.as_ref().map(|plan| plan.next_frame)
+    }
+
+    pub fn sprites(&self) -> Vec<Sprite> {
+        let Some(plan) = &self.plan else {
+            return vec![];
+        };
+        plan.moves
+            .iter()
+            .map(|m| {
+                let NativeAction::Placement {
+                    window_id,
+                    minimized,
+                    ..
+                } = &m.action
+                else {
+                    unreachable!()
+                };
+                let to = clip_to_viewport(m.to, m.bounds);
+                let early = !minimized
+                    && (to == Some(m.to)
+                        || area(to)
+                            >= area(clip_to_viewport(m.from, m.bounds).filter(|_| !m.hidden)));
+                Sprite {
+                    window_id: window_id.clone(),
+                    rect: m.current,
+                    bounds: m.bounds,
+                    early: early.then(|| m.action.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Restart the clock from the frame on screen: preparing a compositor overlay can take a
+    /// frame or two, which must not skip the fastest part of the ease-out curve.
+    pub fn restart(&mut self, now: Instant) {
+        if let Some(plan) = &mut self.plan {
+            for m in &mut plan.moves {
+                m.from = m.current;
+            }
+            plan.started = now;
+            plan.next_frame = now + FRAME_INTERVAL.min(plan.duration);
+        }
+    }
+
+    pub fn deferred_focus(&self) -> Option<&NativeAction> {
+        self.plan
+            .as_ref()?
+            .deferred
+            .iter()
+            .find(|a| matches!(a, NativeAction::Focus { .. }))
     }
 
     /// Taking the plan invalidates every remaining frame before a native Restore can run.
@@ -92,6 +164,36 @@ impl Animation {
         duration: Duration,
         now: Instant,
     ) -> Vec<NativeAction> {
+        // Enumeration during a slide often produces the same targets. Keep its clock and
+        // frames instead of cancelling and restarting the easing curve at every refresh.
+        if let Some(plan) = self.plan.as_ref().filter(|plan| {
+            next.enabled
+                && next.backend.capabilities.clipping
+                && plan.duration == duration
+                && plan.moves.iter().all(|m| {
+                    let NativeAction::Placement { window_id, .. } = &m.action else {
+                        return false;
+                    };
+                    actions.contains(&m.action)
+                        && locate(next, window_id).is_some_and(|(monitor, _)| {
+                            expand_gap(
+                                monitor.viewport,
+                                half_gap(next.gaps, monitor.monitor.scale_factor),
+                            ) == m.bounds
+                        })
+                })
+                && actions
+                    .iter()
+                    .filter(|a| matches!(a, NativeAction::Focus { .. }))
+                    .all(|a| plan.deferred.contains(a))
+        }) {
+            return actions
+                .into_iter()
+                .filter(|a| {
+                    !plan.moves.iter().any(|m| &m.action == a) && !plan.deferred.contains(a)
+                })
+                .collect();
+        }
         // A focus still waiting in the old plan must survive a retarget that brings none.
         let is_focus = |a: &NativeAction| matches!(a, NativeAction::Focus { .. });
         let carried = self.cancel().into_iter().rev().find(is_focus);
@@ -119,6 +221,7 @@ impl Animation {
                         action,
                         from,
                         to,
+                        current: from,
                         bounds,
                         hidden,
                     };
@@ -138,7 +241,7 @@ impl Animation {
             };
             let hidden = moves.iter().any(|m| {
                 matches!(&m.action, NativeAction::Placement { window_id: id, .. } if id == window_id)
-                    && m.hidden
+                    && (m.hidden || clip_to_viewport(m.from, m.bounds) != Some(m.from))
             });
             if hidden {
                 deferred.push(action.clone());
@@ -547,12 +650,12 @@ mod tests {
             now + MS(500),
         );
         let focused = engine.snapshot().focused_window.clone().unwrap();
-        let hidden = applied[&focused].2;
+        let (rect, _, hidden) = applied[&focused];
         assert_eq!(
             initial
                 .iter()
                 .any(|a| matches!(a, NativeAction::Focus { .. })),
-            !hidden
+            !hidden && clip_to_viewport(rect, VIEWPORT) == Some(rect)
         );
     }
 
@@ -636,5 +739,83 @@ mod tests {
             assert_eq!(json(initial), json(target));
             assert!(animation.deadline().is_none());
         }
+    }
+    #[test]
+    fn polling_preserves_the_slide_clock_and_deferred_focus() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        run(
+            &mut engine,
+            &mut animation,
+            &mut applied,
+            Command::FocusWindow {
+                window_id: "3".into(),
+            },
+            now,
+        );
+        assert!(
+            matches!(animation.deferred_focus(), Some(NativeAction::Focus { window_id }) if window_id == "3")
+        );
+        let frame = animation.frame(now + MS(32));
+        remember(&mut applied, &frame);
+        let deadline = animation.deadline();
+        let prev = engine.snapshot().clone();
+        let observed = SystemSnapshot {
+            monitors: prev.monitors.iter().map(|m| m.monitor.clone()).collect(),
+            windows: prev.windows.iter().map(|w| w.native.clone()).collect(),
+            focused_window: None, // Controller ignores stale focus while activation is deferred.
+        };
+        let mut transition = engine.reconcile(observed).unwrap();
+        transition
+            .actions
+            .push(animation.deferred_focus().unwrap().clone());
+        let initial = animation.start(
+            &prev,
+            &transition.snapshot,
+            &applied,
+            transition.actions,
+            MS(160),
+            now + MS(40),
+        );
+        assert!(initial.is_empty());
+        assert_eq!(animation.deadline(), deadline);
+        let final_frame = animation.frame(now + MS(160));
+        assert!(
+            matches!(final_frame.last(), Some(NativeAction::Focus { window_id }) if window_id == "3")
+        );
+        assert!(animation.deadline().is_none());
+    }
+    #[test]
+    fn entering_partial_window_is_not_raised_over_the_neighbouring_monitor() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        run(&mut engine, &mut animation, &mut applied, scroll(400), now);
+        let frame = animation.frame(now + MS(32));
+        remember(&mut applied, &frame);
+        let (rect, _, hidden) = applied["2"];
+        assert!(!hidden);
+        assert_ne!(clip_to_viewport(rect, VIEWPORT), Some(rect));
+        let initial = run(
+            &mut engine,
+            &mut animation,
+            &mut applied,
+            Command::FocusWindow {
+                window_id: "2".into(),
+            },
+            now + MS(32),
+        );
+        assert!(
+            !initial
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { .. }))
+        );
+        assert!(
+            matches!(animation.deferred_focus(), Some(NativeAction::Focus { window_id }) if window_id == "2")
+        );
+        assert!(
+            matches!(animation.frame(now + MS(192)).last(), Some(NativeAction::Focus { window_id }) if window_id == "2")
+        );
     }
 }

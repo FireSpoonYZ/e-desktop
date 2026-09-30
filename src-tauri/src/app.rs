@@ -14,7 +14,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use crate::{
     animation::{Animation, Placements},
     config::{Config, ConfigFile, ShortcutAction},
-    layout::{Engine, half_gap, inset_gap},
+    layout::{Engine, expand_gap, half_gap, inset_gap},
     model::{
         AppError, BackendAvailability, BackendStatus, Command, ErrorCode, NativeAction, Rect,
         Snapshot,
@@ -309,22 +309,21 @@ impl Controller {
     }
 
     fn refresh(&mut self, apply: bool) -> Result<(), AppError> {
-        // Reconcile at its normal deadline, never defer it behind a stream of commands.
-        // Drop frames BEFORE enumeration (windows/monitors may have disappeared); a focus
-        // still waiting for its window to arrive is kept.
-        let pending_focus = self
-            .animation
-            .cancel()
-            .into_iter()
-            .rev()
-            .find(|a| matches!(a, NativeAction::Focus { .. }));
+        // Keep a running slide when polling finds the same layout. A focus waiting for its
+        // target to arrive must survive reconciliation without adopting the stale foreground.
+        let pending_focus = self.animation.deferred_focus().cloned();
         let backend = self
             .backend
             .as_mut()
             .ok_or_else(|| error(ErrorCode::BackendUnavailable, "原生窗口后端尚未连接。"))?;
         let system = backend.enumerate();
         self.engine.set_backend(backend.status());
-        let system = system?;
+        let mut system = system?;
+        if pending_focus.is_some() {
+            // The old foreground window is not a new activation: the target is still
+            // arriving. Preserve layout focus until the deferred activation is applied.
+            system.focused_window = None;
+        }
         let gaps = self.engine.snapshot().gaps;
         let viewports = system
             .monitors
@@ -376,6 +375,7 @@ impl Controller {
         let dragging: Option<String> = None;
         let dragged = match dragging {
             Some(id) => {
+                self.animation.cancel();
                 self.native_drag = Some(id);
                 return Ok(());
             }
@@ -431,7 +431,9 @@ impl Controller {
                 self.animation_duration,
                 Instant::now(),
             );
-            self.apply(&actions)?;
+            self.present(actions, true)?;
+        } else {
+            self.animation.cancel();
         }
         Ok(())
     }
@@ -602,7 +604,108 @@ impl Controller {
             self.finish_animation()?;
             transition.actions
         };
+        self.present(actions, animate && layout)
+    }
+
+    /// Apply animation output. On Windows the compositor overlay draws the frames (cropped to
+    /// each monitor, as in niri) while the real windows move once; elsewhere, or if the
+    /// overlay fails, every frame moves the real windows.
+    fn present(&mut self, actions: Vec<NativeAction>, started: bool) -> Result<(), AppError> {
+        #[cfg(target_os = "windows")]
+        if self.animation.deadline().is_some() && self.backend.is_some() {
+            let sprites = self.sprites();
+            let animated: HashSet<String> = self
+                .animation
+                .sprites()
+                .into_iter()
+                .map(|s| s.window_id)
+                .collect();
+            let (frames, rest): (Vec<_>, Vec<_>) = actions.into_iter().partition(|a| {
+                matches!(a, NativeAction::Placement { window_id, .. } if animated.contains(window_id))
+            });
+            let backend = self.backend.as_mut().unwrap();
+            match backend.compose(&sprites) {
+                Ok(()) => {
+                    // The frames on screen: a retarget continues from them.
+                    for frame in frames {
+                        if let NativeAction::Placement {
+                            window_id,
+                            rect,
+                            clip,
+                            minimized,
+                        } = frame
+                        {
+                            self.placements.insert(window_id, (rect, clip, minimized));
+                        }
+                    }
+                    if started {
+                        self.animation.restart(Instant::now());
+                    }
+                    return self.apply(&rest);
+                }
+                Err(issue) => {
+                    backend.compose_end();
+                    self.record(issue);
+                    return self.apply(&frames.into_iter().chain(rest).collect::<Vec<_>>());
+                }
+            }
+        }
+        let _ = started;
         self.apply(&actions)
+    }
+
+    /// Everything the overlay of an animating monitor must draw: the animated windows, then
+    /// the other windows shown on that monitor (they would vanish under it otherwise), with
+    /// floating windows last, on top.
+    #[cfg(target_os = "windows")]
+    fn sprites(&self) -> Vec<crate::animation::Sprite> {
+        let mut sprites = self.animation.sprites();
+        let snapshot = self.engine.snapshot();
+        let areas: Vec<Rect> = sprites.iter().map(|s| s.bounds).collect();
+        for monitor in &snapshot.monitors {
+            let bounds = expand_gap(
+                monitor.viewport,
+                half_gap(snapshot.gaps, monitor.monitor.scale_factor),
+            );
+            let Some(page) = monitor
+                .pages
+                .iter()
+                .find(|p| p.id == monitor.active_page && areas.contains(&bounds))
+            else {
+                continue;
+            };
+            let tiled = page.columns.iter().flat_map(|c| c.windows.iter());
+            for id in tiled.chain(page.floating_windows.iter()) {
+                if sprites.iter().any(|s| &s.window_id == id) {
+                    continue;
+                }
+                let rect = match self.placements.get(id) {
+                    Some((rect, _, false)) => *rect,
+                    Some(_) => continue,
+                    None => match snapshot.windows.iter().find(|w| &w.native.id == id) {
+                        Some(w) if !w.native.minimized => w.native.rect,
+                        _ => continue,
+                    },
+                };
+                sprites.push(crate::animation::Sprite {
+                    window_id: id.clone(),
+                    rect,
+                    bounds,
+                    early: None,
+                });
+            }
+        }
+        sprites
+    }
+
+    /// Uncover the monitors once no animation runs (finished, finished early or dropped).
+    fn settle(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.animation.deadline().is_none() {
+            if let Some(backend) = self.backend.as_mut() {
+                backend.compose_end();
+            }
+        }
     }
 
     fn clear_previews(&mut self) {
@@ -663,7 +766,9 @@ impl Controller {
 
     fn animate(&mut self, now: Instant) -> Result<(), AppError> {
         let actions = self.animation.frame(now);
-        self.apply(&actions)
+        let result = self.present(actions, false);
+        self.settle();
+        result
     }
 
     /// niri warp-mouse-to-focus: after a non-pointer focus change, move the pointer inside.
@@ -1258,6 +1363,7 @@ fn run_controller(
         if let Err(issue) = controller.animate(Instant::now()) {
             controller.record(issue);
         }
+        controller.settle();
         let snapshot = controller.snapshot(shortcuts.available());
         // Native surface positions change only with monitor geometry or enabled state.
         let visible = controller.visible_bars();

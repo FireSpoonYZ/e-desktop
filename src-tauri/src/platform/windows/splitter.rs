@@ -481,14 +481,16 @@ fn update(point: Option<POINT>) {
                 strip.monitor_id.clone(),
             ),
             Kind::Window { id, native, moved } => {
-                if let Some((h, initial)) = native {
-                    // The system loop also resizes by the border: only a move is a drop.
+                if let Some((h, initial)) = native.as_ref().filter(|_| !*moved) {
+                    // The system loop also resizes by the border: only a move is a drop. Decide
+                    // on the first change; afterwards the app resizes itself when it crosses
+                    // into a monitor with another scale (WM_DPICHANGED), still a move.
                     let mut now: RECT = unsafe { zeroed() };
                     if unsafe { GetWindowRect(*h, &mut now) } == 0 || size(now) != size(*initial)
                     {
                         return Step::Cancel;
                     }
-                    if !*moved && (now.left, now.top) == (initial.left, initial.top) {
+                    if (now.left, now.top) == (initial.left, initial.top) {
                         return Step::Wait;
                     }
                 } else if !*moved && dx.abs().max(dy.abs()) < THRESHOLD {

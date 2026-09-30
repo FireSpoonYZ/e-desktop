@@ -1626,3 +1626,24 @@ fn row_boundaries_resize_snap_and_squeeze_rows_out_sideways() {
     assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
     assert!(e.dispatch(row(1, 10)).is_err(), "a single row has no boundary");
 }
+
+#[test]
+fn refresh_with_deferred_activation_keeps_the_slide_target() {
+    let mut e = engine();
+    e.dispatch(Command::SlideColumn {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    let focus = e.snapshot.focused_window.clone();
+    let x = e.snapshot.monitors[0].pages[0].viewport_x;
+    // Controller suppresses the stale foreground observation while animation defers focus.
+    let mut observed = system();
+    observed.focused_window = None;
+    e.reconcile(observed).unwrap();
+    assert_eq!(e.snapshot.focused_window, focus);
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, x);
+    // Once activation completes, a genuine activation of another window is adopted normally.
+    e.reconcile(system()).unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+}

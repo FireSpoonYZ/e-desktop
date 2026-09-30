@@ -303,7 +303,7 @@ impl std::fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 /// Backend retains original placement/region/state before the first mutation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",

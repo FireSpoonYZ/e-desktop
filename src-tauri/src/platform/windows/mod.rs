@@ -1,4 +1,5 @@
 //! Win32 backend. Poll on the owning thread; no hooks or desktop mutation at construction.
+mod compositor;
 pub mod hook;
 pub mod preview;
 pub mod splitter;
@@ -68,8 +69,11 @@ struct Entry {
     placed_pad: Option<[i32; 4]>,
     /// Our clip region's box in window coordinates; None while the original region applies.
     region_box: Option<RECT>,
+    /// A partial window has been placed below neighbouring monitors' windows.
+    at_bottom: bool,
 }
 pub struct Backend {
+    compositor: compositor::Compositor,
     previews: preview::Previews,
     entries: HashMap<String, Entry>,
     property: Vec<u16>,
@@ -256,9 +260,15 @@ fn copy_region(source: &Region) -> Result<Region, AppError> {
     }
     Ok(r)
 }
-fn set_region(hwnd: HWND, region: Option<Region>) -> Result<(), AppError> {
+/// Use a measured border while DWM cannot report it (minimized or region-clipped).
+fn scaled_pad(pad: [i32; 4], from: u32, to: u32) -> [i32; 4] {
+    pad.map(|p| {
+        ((i64::from(p) * i64::from(to) + i64::from(from) / 2) / i64::from(from.max(1))) as i32
+    })
+}
+fn set_region(hwnd: HWND, region: Option<Region>, redraw: bool) -> Result<(), AppError> {
     let handle = region.as_ref().map_or(null_mut(), Region::handle);
-    if unsafe { SetWindowRgn(hwnd, handle, 1) } == 0 {
+    if unsafe { SetWindowRgn(hwnd, handle, i32::from(redraw)) } == 0 {
         return Err(failed("SetWindowRgn", None));
     }
     // On success ownership transfers to USER, including when the window later dies.
@@ -287,6 +297,7 @@ impl Backend {
             .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string(), None))?
             .as_nanos();
         Ok(Self {
+            compositor: compositor::Compositor::default(),
             previews: preview::Previews::default(),
             entries: HashMap::new(),
             property: wide(&format!(
@@ -537,6 +548,7 @@ impl Backend {
                         pads: vec![],
                         placed_pad: None,
                         region_box: None,
+                        at_bottom: false,
                     },
                 );
                 id
@@ -626,7 +638,23 @@ impl Backend {
     }
     /// Replace our clip with `local` (window coordinates; None = nothing visible), always
     /// intersected with the application's own original region.
-    fn set_clip(&mut self, id: &str, h: HWND, local: Option<RECT>) -> Result<(), AppError> {
+    fn set_clip(
+        &mut self,
+        id: &str,
+        h: HWND,
+        local: Option<RECT>,
+        redraw: bool,
+    ) -> Result<(), AppError> {
+        let entry = &self.entries[id];
+        if entry.saved.as_ref().is_some_and(|s| s.clipped)
+            && match (entry.region_box, local) {
+                (Some(a), Some(b)) => same_rect(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+        {
+            return Ok(());
+        }
         let region = match local {
             Some(r) => Region(unsafe { CreateRectRgn(r.left, r.top, r.right, r.bottom) } as usize),
             None => fresh_region()?,
@@ -643,7 +671,7 @@ impl Backend {
                 return Err(failed("CombineRgn", Some(id)));
             }
         }
-        set_region(h, Some(region))?;
+        set_region(h, Some(region), redraw)?;
         saved.clipped = true;
         entry.region_box = local;
         Ok(())
@@ -653,7 +681,7 @@ impl Backend {
         let entry = self.entries.get_mut(id).unwrap();
         let saved = entry.saved.as_mut().unwrap();
         let original = saved.region.as_ref().map(copy_region).transpose()?;
-        set_region(h, original)?;
+        set_region(h, original, true)?;
         saved.clipped = false;
         entry.region_box = None;
         Ok(())
@@ -693,7 +721,9 @@ impl Backend {
                             Some(window_id),
                         ));
                     }
-                    self.entries.get_mut(window_id).unwrap().minimized = false;
+                    let entry = self.entries.get_mut(window_id).unwrap();
+                    entry.minimized = false;
+                    entry.at_bottom = false;
                 }
                 NativeAction::Close { window_id } => {
                     let h = self.entry(window_id)?.hwnd as HWND;
@@ -728,7 +758,14 @@ impl Backend {
         let e = self.entries.get_mut(id)?;
         let known = e.pads.iter().find(|(d, _)| *d == dpi).map(|(_, p)| *p);
         if unsafe { IsIconic(h) } != 0 || e.saved.as_ref().is_some_and(|s| s.clipped) {
-            return known;
+            // A clipped frame cannot be measured by DWM. Scale the last measured border for
+            // a new DPI until the window is unclipped; do not unmask it and wait a full vsync
+            // just to measure its border in the middle of a slide.
+            return known.or_else(|| {
+                e.pads
+                    .last()
+                    .map(|(old_dpi, pad)| scaled_pad(*pad, *old_dpi, dpi))
+            });
         }
         let (Some(outer), Some(visible)) = (outer_frame(h), dwm_frame(h)) else {
             return known;
@@ -750,6 +787,7 @@ impl Backend {
     ) -> Result<(), AppError> {
         let r = native(target)?;
         let h = self.entry(id)?.hwnd as HWND;
+        let mut work = None;
         let clipping = if let Some(c) = clip {
             let c = native(c)?;
             let monitor = unsafe { MonitorFromRect(&c, MONITOR_DEFAULTTONEAREST) };
@@ -758,15 +796,14 @@ impl Backend {
             if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
                 return Err(failed("GetMonitorInfoW", Some(id)));
             }
+            work = Some(info.rcWork);
             Some(intersect(r, c).and_then(|v| intersect(v, info.rcWork)))
         } else {
             None
         };
-        if clipping.is_some()
-            && unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32
-                & (WS_EX_LAYERED | WS_EX_LAYOUTRTL)
-                != 0
-        {
+        let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
+        let region_clipping = ex & WS_EX_NOREDIRECTIONBITMAP == 0;
+        if clipping.is_some() && ex & (WS_EX_LAYERED | WS_EX_LAYOUTRTL) != 0 {
             return Err(error(
                 ErrorCode::OperationDenied,
                 "Safe region clipping is unsupported for layered/RTL windows",
@@ -788,7 +825,7 @@ impl Backend {
         let iconic = unsafe { IsIconic(h) } != 0;
         // Mask BEFORE moving/restoring with the part visible both before and after the move,
         // so a GDI window never paints outside either clip (an empty mask would blink it).
-        if let Some(Some(c)) = clipping {
+        if let Some(Some(c)) = clipping.filter(|_| region_clipping) {
             let next = local_clip(c, outset(r, pad))?;
             let now = self.entries[id].region_box.or_else(|| {
                 let o = outer_frame(h)?;
@@ -804,8 +841,9 @@ impl Backend {
             } else {
                 now.and_then(|now| intersect(now, next))
             };
-            self.set_clip(id, h, mask)?;
+            self.set_clip(id, h, mask, false)?;
         }
+        let partial = matches!(clipping, Some(Some(c)) if !same_rect(c, r));
         if iconic {
             // Restore straight into the target slot, not first at the old normal position.
             let mut placement: WINDOWPLACEMENT = unsafe { zeroed() };
@@ -815,7 +853,23 @@ impl Backend {
             }
             placement.flags = 0;
             placement.showCmd = SW_SHOWNOACTIVATE as u32;
-            placement.rcNormalPosition = workspace(outset(r, pad));
+            let outer = outset(r, pad);
+            // Restoring always raises the window. A partial window would first cover the
+            // neighbouring monitor (DirectComposition ignores regions; still unpainted, it
+            // shows as a black block) before SetWindowPos lowers it. Restore it hanging below
+            // its monitor instead: Windows keeps one row inside the work area, then the move
+            // below places it at the bottom of the Z order in one step.
+            // ponytail: assumes no monitor directly below this one; the park would flash there.
+            let normal = match work.filter(|_| partial) {
+                Some(w) => RECT {
+                    left: w.left,
+                    top: w.bottom - 1,
+                    right: w.left + (outer.right - outer.left),
+                    bottom: w.bottom - 1 + (outer.bottom - outer.top),
+                },
+                None => outer,
+            };
+            placement.rcNormalPosition = workspace(normal);
             unsafe {
                 SetWindowPlacement(h, &placement);
             }
@@ -828,7 +882,8 @@ impl Backend {
         // Window regions do not clip DirectComposition content (Chromium, Electron, WinUI,
         // Terminal): the cut-off part would still show on a neighbouring monitor. Keep clipped
         // windows at the bottom, below that monitor's own windows, which then cover it.
-        let (after, order) = if clipping.is_some() {
+        let sink = partial && (iconic || !self.entries[id].at_bottom);
+        let (after, order) = if sink {
             (HWND_BOTTOM, 0)
         } else {
             (null_mut(), SWP_NOZORDER)
@@ -837,6 +892,16 @@ impl Backend {
         // invisible resize border.
         let position = |pad: [i32; 4]| {
             let outer = outset(r, pad);
+            let current = outer_frame(h);
+            if !sink && current.is_some_and(|current| same_rect(current, outer)) {
+                return Ok(outer);
+            }
+            // Sliding a fixed-size window should not trigger resize work or synchronous
+            // repainting of the neighbouring windows it uncovers.
+            let no_size = current.is_some_and(|current| {
+                current.right - current.left == outer.right - outer.left
+                    && current.bottom - current.top == outer.bottom - outer.top
+            });
             (unsafe {
                 SetWindowPos(
                     h,
@@ -845,7 +910,11 @@ impl Backend {
                     outer.top,
                     outer.right - outer.left,
                     outer.bottom - outer.top,
-                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | order,
+                    SWP_NOACTIVATE
+                        | SWP_NOOWNERZORDER
+                        | SWP_DEFERERASE
+                        | order
+                        | if no_size { SWP_NOSIZE } else { 0 },
                 )
             } != 0)
                 .then_some(outer)
@@ -857,17 +926,6 @@ impl Backend {
         // edge does this when most of it lies on the neighbouring monitor. Place once more
         // with the new DPI's border: the window is already there, so the size now holds.
         let resized = outer_frame(h).is_some_and(|actual| !same_rect(actual, outer));
-        // A first clipped move to a new DPI has no cached border there. Regions make DWM
-        // report the outer frame, so restore the original region and synchronize composition
-        // before measuring. Never turn an unavailable measurement into a zero-width border.
-        if self.measure_pad(id, h).is_none()
-            && self.entries[id].saved.as_ref().is_some_and(|s| s.clipped)
-        {
-            self.unclip(id, h)?;
-            unsafe {
-                DwmFlush();
-            }
-        }
         let new_pad = self.measure_pad(id, h).unwrap_or(pad);
         if resized || new_pad != pad {
             pad = new_pad;
@@ -875,7 +933,7 @@ impl Backend {
         }
         self.entries.get_mut(id).unwrap().placed_pad = Some(pad);
         let actual = outer_frame(h).ok_or_else(|| failed("GetWindowRect", Some(id)))?;
-        if let Some(Some(c)) = clipping {
+        if let Some(Some(c)) = clipping.filter(|_| region_clipping) {
             let c = intersect(c, actual).ok_or_else(|| {
                 error(
                     ErrorCode::OperationDenied,
@@ -885,13 +943,18 @@ impl Backend {
             })?;
             // Region coordinates are relative to the outer frame, not the visible bounds.
             let local = local_clip(c, actual)?;
-            if self.entries[id].region_box.is_none_or(|b| !same_rect(b, local)) {
-                self.set_clip(id, h, Some(local))?;
+            if self.entries[id]
+                .region_box
+                .is_none_or(|b| !same_rect(b, local))
+            {
+                self.set_clip(id, h, Some(local), true)?;
             }
         } else if self.entries[id].saved.as_ref().unwrap().clipped {
             self.unclip(id, h)?;
         }
-        self.entries.get_mut(id).unwrap().minimized = false;
+        let entry = self.entries.get_mut(id).unwrap();
+        entry.minimized = false;
+        entry.at_bottom = partial;
         if !same_rect(actual, outer) {
             return Err(error(
                 ErrorCode::OperationDenied,
@@ -981,8 +1044,15 @@ impl Backend {
             placement.showCmd = SW_HIDE as u32;
         }
         // Restore geometry while still masked, then restore the original region.
-        let placement_error = (unsafe { SetWindowPlacement(h, &placement) } == 0)
+        let was_iconic = unsafe { IsIconic(h) } != 0;
+        let mut placement_error = (unsafe { SetWindowPlacement(h, &placement) } == 0)
             .then(|| failed("SetWindowPlacement", Some(id)));
+        // WinForms restores its own cached normal bounds during SIZE_RESTORED, overriding
+        // rcNormalPosition on the first call. Apply the saved geometry after that transition.
+        if placement_error.is_none() && was_iconic && unsafe { IsIconic(h) } == 0 {
+            placement_error = (unsafe { SetWindowPlacement(h, &placement) } == 0)
+                .then(|| failed("SetWindowPlacement", Some(id)));
+        }
         // Region recovery must still run if placement failed (the current region may be empty).
         let region_result = if saved.clipped {
             saved
@@ -990,7 +1060,7 @@ impl Backend {
                 .as_ref()
                 .map(copy_region)
                 .transpose()
-                .and_then(|r| set_region(h, r))
+                .and_then(|r| set_region(h, r, true))
         } else {
             Ok(())
         };
@@ -1007,6 +1077,7 @@ impl Backend {
         set_transitions(h, false);
         let e = self.entries.get_mut(id).unwrap();
         e.region_box = None;
+        e.at_bottom = false;
         if e.decor.is_some() {
             reset_decor(h);
             e.decor = None;
@@ -1017,6 +1088,7 @@ impl Backend {
         Ok(())
     }
     pub fn restore(&mut self) -> Result<(), AppError> {
+        self.compose_end();
         self.clear_previews();
         let _dpi = DpiScope::enter()?;
         let ids: Vec<_> = self.entries.keys().cloned().collect();
@@ -1050,6 +1122,13 @@ impl Drop for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipped_border_scales_without_unmasking_the_window() {
+        assert_eq!(scaled_pad([9, 0, 9, 9], 144, 96), [6, 0, 6, 6]);
+        assert_eq!(scaled_pad([6, 0, 6, 6], 96, 144), [9, 0, 9, 9]);
+        assert_eq!(scaled_pad([7, 0, 7, 7], 120, 144), [8, 0, 8, 8]);
+    }
+
     #[test]
     fn physical_rectangles_and_clip_edges() {
         fn assert_send<T: Send>() {}
