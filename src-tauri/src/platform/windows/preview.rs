@@ -178,6 +178,8 @@ impl Backend {
                 placed_pad: None,
                 region_box: None,
                 at_bottom: false,
+                min_width: None,
+                placed_visible: None,
             });
         }
         self.previews

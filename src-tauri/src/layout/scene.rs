@@ -38,6 +38,10 @@ impl Engine {
     /// The tiled layout of `monitor_id`'s active page after `command`; `active` windows are
     /// highlighted. None when the command would be rejected.
     pub fn scene(&self, command: Command, monitor_id: &str, active: &[WindowId]) -> Option<Scene> {
+        // A no-op onto a paused monitor still has a page; painting it would cover the app.
+        if self.hits_suspended(monitor_id) || self.command_hits_suspended(&command) {
+            return None;
+        }
         let shown: BTreeSet<WindowId> = self
             .placements()
             .ok()?
@@ -84,7 +88,6 @@ impl Engine {
         let mut left = -i64::from(page.viewport_x);
         for column in &page.columns {
             let width = i64::from(column.width);
-            let visible = (left + width).min(view) - left.max(0);
             let heights = next.column_heights(column, area.height);
             for (id, height) in column.windows.iter().zip(heights) {
                 let Some((rect, clip, minimized)) = actions.iter().find_map(|a| match a {
@@ -110,7 +113,9 @@ impl Engine {
                     continue;
                 }
                 let r = clip.unwrap_or(rect);
-                let w = percent(visible, area.width);
+                // Label the column's real width. A 100% column scrolled halfway is still 100%,
+                // not the clipped slice (that would look like a resize).
+                let w = percent(width, area.width);
                 let label = if column.windows.len() > 1 {
                     format!("{w}% × {}%", percent(height.into(), area.height))
                 } else {
@@ -158,17 +163,41 @@ mod tests {
             .iter()
             .map(|t| (t.title.as_str(), t.rect.x, t.label.as_str(), t.active))
             .collect();
-        assert_eq!(tiles, [("1", 0, "50%", false), ("3", 600, "50%", false)]);
+        assert_eq!(
+            tiles,
+            [("3", 0, "50%", false), ("2", 600, "50%", true)]
+        );
         assert_eq!(
             scene.marks,
             [Mark {
-                right: true,
-                title: "2".into(),
-                active: true
+                right: false,
+                title: "1".into(),
+                active: false
             }]
         );
         // The engine itself is untouched; a rejected command has no scene.
         assert_eq!(e.snapshot().monitors[0].pages[0].columns[1].windows, ["2"]);
+        // A full-width column scrolled halfway stays labeled 100%; the tile is the clipped slice.
+        let mut wide = engine();
+        wide.dispatch(Command::SetColumnWidth { width: 1200 })
+            .unwrap();
+        let scene = wide
+            .scene(
+                Command::Scroll {
+                    monitor_id: "a".into(),
+                    delta: 300,
+                },
+                "a",
+                &[],
+            )
+            .unwrap();
+        let tile = scene.tiles.iter().find(|t| t.title == "1").unwrap();
+        assert_eq!(tile.label, "100%");
+        assert!(
+            tile.rect.width < 1200,
+            "paint the clipped frame, not the full column"
+        );
+        assert_eq!(wide.snapshot().monitors[0].pages[0].columns[0].width, 1200);
         assert!(
             e.scene(
                 Command::DropWindow {

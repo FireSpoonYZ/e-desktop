@@ -94,8 +94,15 @@ impl Engine {
             .position(|m| m.monitor.primary)
             .unwrap_or(0);
         for old in removed {
-            for page in old.pages.into_iter().filter(|p| !empty(p)) {
-                self.append_hotplug_page(receiver, page);
+            for page in old.pages {
+                if !empty(&page)
+                    || self
+                        .minimized_slots
+                        .iter()
+                        .any(|slot| slot.page_id == page.id)
+                {
+                    self.append_hotplug_page(receiver, page);
+                }
             }
         }
         // Restore in session order, never in native enumeration order.
@@ -159,7 +166,13 @@ impl Engine {
             }
             let monitor = &mut self.snapshot.monitors[m];
             // Discard the reconnect placeholder, keeping the original empty tail identity.
-            monitor.pages.retain(|page| !empty(page));
+            monitor.pages.retain(|page| {
+                !empty(page)
+                    || self
+                        .minimized_slots
+                        .iter()
+                        .any(|slot| slot.page_id == page.id)
+            });
             // Keep pages received from other disconnected outputs after this monitor's own pages.
             restored.append(&mut monitor.pages);
             monitor.pages = restored;

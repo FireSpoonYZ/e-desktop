@@ -343,8 +343,8 @@ mod tests {
         .unwrap();
         e.snapshot.monitors[1].viewport.width = 700;
         e.snapshot.backend.capabilities.focus = false;
-        // b is alone on its page, so it always fills the 700px viewport.
-        for (requested, expected) in [(1, 700), (513, 700), (u32::MAX, 700)] {
+        // A lone column keeps the requested width, clamped to the 700px viewport.
+        for (requested, expected) in [(1, 1), (513, 513), (u32::MAX, 700)] {
             let before = e.snapshot.clone();
             let page_focus = e.page_focus.clone();
             let t = e.dispatch(width("b", requested)).unwrap();
@@ -390,8 +390,7 @@ mod tests {
             })
             .unwrap();
         }
-        // A second column keeps the page wider than the screen, so widths can change
-        // (a lone column always fills the viewport).
+        // A second column keeps the page wider than the screen, so a left-edge drag can scroll.
         let mut system = SystemSnapshot {
             monitors: e
                 .snapshot

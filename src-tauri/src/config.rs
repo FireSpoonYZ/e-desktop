@@ -463,6 +463,46 @@ impl ConfigFile {
     }
 }
 
+/// Implicit shortcuts follow the snapshot's active monitor, which stays behind an unmanaged
+/// fullscreen window. Block those. A command that names an unsuspended monitor still runs.
+pub fn foreground_blocks_shortcut(action: &ShortcutAction, suspended: &[String]) -> bool {
+    match action {
+        ShortcutAction::Quit {} | ShortcutAction::Unbind {} => false,
+        ShortcutAction::Overview {}
+        | ShortcutAction::Commands {}
+        | ShortcutAction::Page { .. }
+        | ShortcutAction::RelativePage { .. }
+        | ShortcutAction::Scroll { .. } => true,
+        ShortcutAction::Command { command } => !explicit_live_target(command, suspended),
+    }
+}
+
+fn explicit_live_target(command: &Command, suspended: &[String]) -> bool {
+    let live = |id: &str| !id.is_empty() && !suspended.iter().any(|paused| paused == id);
+    match command {
+        Command::Refresh | Command::Enable | Command::Disable => true,
+        Command::SwitchPage { monitor_id, .. }
+        | Command::AddPage { monitor_id }
+        | Command::Scroll { monitor_id, .. }
+        | Command::DragEdge { monitor_id, .. }
+        | Command::DragRow { monitor_id, .. } => live(monitor_id),
+        _ => false,
+    }
+}
+
+/// Check both native foreground and the resolved host before showing any surface.
+pub fn foreground_blocks_show(
+    explicit: Option<&str>,
+    resolved: Option<&str>,
+    foreground_suspended: bool,
+    suspended: &[String],
+) -> bool {
+    (explicit.is_none() && foreground_suspended)
+        || explicit
+            .or(resolved)
+            .is_some_and(|id| suspended.iter().any(|paused| paused == id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,11 +747,8 @@ mod tests {
             .set_window_rules(shortcuts.config.window_rules.clone())
             .unwrap();
         assert!(engine.reconcile(system.clone()).unwrap().actions.is_empty());
-        // The rule applied, but a lone column fills the screen.
-        assert_eq!(
-            engine.snapshot().monitors[0].pages[0].columns[0].width,
-            1200
-        );
+        // The rule's width is kept; a lone column is not stretched to the screen.
+        assert_eq!(engine.snapshot().monitors[0].pages[0].columns[0].width, 700);
         engine.dispatch(Command::Enable).unwrap();
         engine
             .dispatch(Command::AdjustColumnWidth { delta: 50 })
@@ -737,7 +774,7 @@ mod tests {
         system.windows.push(window("new"));
         engine.reconcile(system).unwrap();
         let columns = &engine.snapshot().monitors[0].pages[0].columns;
-        assert_eq!((columns[0].width, columns[1].width), (1200, 333));
+        assert_eq!((columns[0].width, columns[1].width), (750, 333));
         assert!(Config::parse(b"{}").unwrap().window_rules.is_empty());
     }
 
@@ -903,5 +940,63 @@ mod tests {
         ] {
             assert_eq!(action.resolve(&snapshot), Some(action));
         }
+    }
+
+    #[test]
+    fn a_paused_foreground_blocks_implicit_shortcuts_not_an_explicit_other_monitor() {
+        let paused = ["a".to_string()];
+        assert!(foreground_blocks_shortcut(&ShortcutAction::Overview {}, &paused));
+        assert!(foreground_blocks_shortcut(&ShortcutAction::Commands {}, &paused));
+        assert!(foreground_blocks_shortcut(
+            &ShortcutAction::Scroll {
+                direction: HorizontalDirection::Left,
+            },
+            &paused,
+        ));
+        assert!(foreground_blocks_shortcut(
+            &ShortcutAction::Command {
+                command: Command::FocusDirection {
+                    direction: Direction::Left,
+                },
+            },
+            &paused,
+        ));
+        assert!(!foreground_blocks_shortcut(&ShortcutAction::Quit {}, &paused));
+        assert!(!foreground_blocks_shortcut(
+            &ShortcutAction::Command {
+                command: Command::SwitchPage {
+                    monitor_id: "b".into(),
+                    page_id: "b-1".into(),
+                },
+            },
+            &paused,
+        ));
+        assert!(foreground_blocks_shortcut(
+            &ShortcutAction::Command {
+                command: Command::SwitchPage {
+                    monitor_id: "a".into(),
+                    page_id: "a-1".into(),
+                },
+            },
+            &paused,
+        ));
+        // The actual built-in AddPage action uses an empty monitor id until routing.
+        let add_page = Config::builtin_shortcuts()
+            .into_iter()
+            .find(|binding| matches!(&binding.action,
+                ShortcutAction::Command { command: Command::AddPage { monitor_id } }
+                    if monitor_id.is_empty()))
+            .expect("built-in implicit AddPage shortcut");
+        assert!(foreground_blocks_shortcut(&add_page.action, &paused));
+        assert!(!foreground_blocks_shortcut(
+            &ShortcutAction::Command { command: Command::AddPage { monitor_id: "b".into() } },
+            &paused,
+        ));
+        assert!(!foreground_blocks_show(Some("b"), Some("b"), true, &paused));
+        assert!(foreground_blocks_show(Some("a"), Some("a"), false, &paused));
+        assert!(foreground_blocks_show(None, Some("b"), true, &paused));
+        // Ordinary unmanaged foreground on B must not show over stale layout host A.
+        assert!(foreground_blocks_show(None, Some("a"), false, &paused));
+        assert!(!foreground_blocks_show(None, Some("b"), false, &paused));
     }
 }

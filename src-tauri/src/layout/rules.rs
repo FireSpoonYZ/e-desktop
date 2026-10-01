@@ -65,6 +65,9 @@ impl Engine {
                     .position(|p| p.id == monitor.active_page)
                     .unwrap()
             });
+        if !native.resizable && matched.floating != Some(true) {
+            self.size_floating.insert(id.into());
+        }
         self.snapshot.windows[w].floating = !native.resizable || matched.floating.unwrap_or(false);
         if self.snapshot.windows[w].floating && source != m {
             let source = self.snapshot.monitors[source].viewport;
@@ -194,7 +197,7 @@ mod tests {
         assert_eq!((m, p), (1, 1));
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            1200 // The rule applied, but a lone column fills its viewport.
+            333
         );
         assert!(!e.snapshot.windows[e.window_index("new").unwrap()].floating);
         assert!(placement(&t.actions, "new").2);
@@ -425,7 +428,7 @@ mod tests {
         assert_eq!((m, p), (0, 0));
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            1200 // A lone column fills its viewport.
+            1
         );
         assert_eq!(e.snapshot.monitors[m].pages.len(), 2);
     }
@@ -590,7 +593,7 @@ mod tests {
         assert_eq!(m, 0);
         assert_eq!(
             e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width,
-            1200 // Not the rule's 7: a lone column fills its viewport.
+            600 // Existing window: not the rule's 7, and not stretched to the viewport.
         );
         assert!(!e.snapshot.windows[e.window_index("4").unwrap()].floating);
     }

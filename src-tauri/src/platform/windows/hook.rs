@@ -47,7 +47,11 @@ pub enum Raw {
     /// An ordinary left button release (may end a native move/resize of some window).
     Up,
     /// A managed window entered (`start`) or left the system move/size loop.
-    MoveSize { hwnd: usize, start: bool },
+    MoveSize {
+        hwnd: usize,
+        start: bool,
+        moving: Option<bool>,
+    },
     /// A managed window was destroyed or hidden, or a new top-level window was shown.
     Windows,
 }
@@ -63,6 +67,8 @@ pub struct Settings {
     pub moves: bool,
     /// Otherwise report motion only when entering or leaving these zones (hot corners, top edges).
     pub zones: Vec<Rect>,
+    /// Monitor bounds where a foreign window covers the display. Clicks there are not swallowed.
+    pub suspended: Vec<Rect>,
 }
 
 #[derive(Default)]
@@ -156,6 +162,21 @@ fn clamp(pt: POINT) -> (i32, i32) {
     )
 }
 
+pub(super) fn on_suspended(rects: &[Rect], x: i32, y: i32) -> bool {
+    let (x, y) = (i64::from(x), i64::from(y));
+    rects.iter().any(|r| {
+        x >= i64::from(r.x)
+            && y >= i64::from(r.y)
+            && x < i64::from(r.x) + i64::from(r.width)
+            && y < i64::from(r.y) + i64::from(r.height)
+    })
+}
+
+/// Modifier-click is swallowed only for a grab target that is not on a suspended monitor.
+pub(super) fn swallows_grab(on_suspended_monitor: bool, is_target: bool) -> bool {
+    is_target && !on_suspended_monitor
+}
+
 fn handle(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     let (x, y) = clamp(info.pt);
     let grabbed = GRABBED.get();
@@ -184,6 +205,10 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
             }
             let hwnd = {
                 let settings = shared().settings.lock().unwrap_or_else(|e| e.into_inner());
+                // Before any swallow: a covering app on this monitor gets the click.
+                if !swallows_grab(on_suspended(&settings.suspended, x, y), true) {
+                    return false;
+                }
                 let held = match settings.modifier {
                     Some(DragModifier::Alt) => down(VK_MENU),
                     Some(DragModifier::Super) => down(VK_LWIN) || down(VK_RWIN),
@@ -194,7 +219,7 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
                 }
                 // WindowFromPoint only hit-tests windows of the calling thread (none here).
                 let hwnd = unsafe { GetAncestor(WindowFromPoint(info.pt), GA_ROOT) } as usize;
-                if !settings.targets.contains(&hwnd) {
+                if !swallows_grab(false, settings.targets.contains(&hwnd)) {
                     return false;
                 }
                 hwnd
@@ -227,6 +252,38 @@ fn candidate(h: HWND) -> bool {
     }
 }
 
+/// Classify the native operation from its hit target, not the size it eventually reports:
+/// a title-bar drag may restore, snap, or change DPI while it is still a move.
+pub(super) fn moving_from_hit(hit: i32) -> Option<bool> {
+    match hit as u32 {
+        HTCAPTION => Some(true),
+        HTLEFT | HTRIGHT | HTTOP | HTTOPLEFT | HTTOPRIGHT | HTBOTTOM | HTBOTTOMLEFT
+        | HTBOTTOMRIGHT => Some(false),
+        _ => None,
+    }
+}
+
+fn native_moving(hwnd: HWND) -> Option<bool> {
+    let mut point: POINT = unsafe { zeroed() };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return None;
+    }
+    let coords = ((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff);
+    let mut hit = 0;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NCHITTEST,
+            0,
+            coords as LPARAM,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            30,
+            &mut hit,
+        )
+    };
+    (ok != 0).then(|| moving_from_hit(hit as i32)).flatten()
+}
+
 unsafe extern "system" fn window_event(
     _: HWINEVENTHOOK,
     event: u32,
@@ -249,6 +306,11 @@ unsafe extern "system" fn window_event(
         EVENT_SYSTEM_MOVESIZESTART | EVENT_SYSTEM_MOVESIZEEND if managed => push(Raw::MoveSize {
             hwnd: hwnd as usize,
             start: event == EVENT_SYSTEM_MOVESIZESTART,
+            moving: if event == EVENT_SYSTEM_MOVESIZESTART {
+                native_moving(hwnd)
+            } else {
+                None
+            },
         }),
         EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE if managed => push(Raw::Windows),
         EVENT_OBJECT_SHOW if managed || candidate(hwnd) => push(Raw::Windows),
@@ -332,5 +394,44 @@ impl Drop for Hook {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_title_move_is_distinct_from_border_resize() {
+        assert_eq!(moving_from_hit(HTCAPTION as i32), Some(true));
+        for hit in [
+            HTLEFT,
+            HTRIGHT,
+            HTTOP,
+            HTTOPLEFT,
+            HTTOPRIGHT,
+            HTBOTTOM,
+            HTBOTTOMLEFT,
+            HTBOTTOMRIGHT,
+        ] {
+            assert_eq!(moving_from_hit(hit as i32), Some(false));
+        }
+        assert_eq!(moving_from_hit(HTCLIENT as i32), None);
+        assert_eq!(moving_from_hit(HTERROR), None);
+    }
+
+    #[test]
+    fn a_suspended_monitor_is_not_a_grab_target() {
+        assert!(swallows_grab(false, true));
+        assert!(!swallows_grab(true, true), "click reaches the covering app");
+        assert!(!swallows_grab(false, false));
+        let covered = Rect {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert!(on_suspended(&[covered], -10, 20));
+        assert!(!on_suspended(&[covered], 10, 20), "the other monitor still grabs");
     }
 }

@@ -6,6 +6,7 @@ use crate::rules::WindowRule;
 pub mod edges;
 mod monitors;
 mod pointer;
+pub use pointer::top_band;
 mod rules;
 pub mod scene;
 
@@ -13,6 +14,20 @@ mod sizing;
 
 /// Monitor/page indices plus optional column/row (None for floating windows).
 type WindowLocation = (usize, usize, Option<(usize, usize)>);
+
+/// Tiled window the user minimized. It is out of the active strip, but the slot is enough to
+/// put it back in the same page, column and row when it returns, including out of order.
+#[derive(Clone)]
+struct MinimizedSlot {
+    id: WindowId,
+    page_id: PageId,
+    column_id: ColumnId,
+    width: u32,
+    /// Same-column windows that were above this one, nearest first.
+    above: Vec<WindowId>,
+    /// Columns that were to the left, nearest first.
+    left: Vec<ColumnId>,
+}
 
 /// Pure, transactional layout state. Native effects are returned to the caller, never applied here.
 #[derive(Clone)]
@@ -24,13 +39,22 @@ pub struct Engine {
     fullscreen_restore: BTreeMap<WindowId, Rect>,
     /// Relative shares of space above each tiled window's one-pixel minimum.
     height_weights: BTreeMap<WindowId, u32>,
+    /// User-minimized tiled windows, kept out of columns until restored.
+    minimized_slots: Vec<MinimizedSlot>,
     window_rules: Vec<WindowRule>,
     pending_rule_floating: BTreeSet<WindowId>,
+    /// Floating only because they were not resizable when discovered (Chromium drops the
+    /// resize frame while fullscreen); they tile once they become resizable.
+    size_floating: BTreeSet<WindowId>,
+    /// Minimum widths windows enforce natively; their columns are never narrower (niri).
+    min_widths: BTreeMap<WindowId, u32>,
     disconnected_monitors: BTreeMap<MonitorId, monitors::DisconnectedMonitor>,
     monitor_order: Vec<MonitorId>,
     /// Explicit moves into borrowed pages stay on their chosen host when the owner returns.
     hotplug_pinned: BTreeMap<WindowId, MonitorId>,
     outputs_suspended: bool,
+    /// Managed windows detected covering some monitor, wherever their column lives.
+    covering_windows: BTreeSet<WindowId>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -101,9 +125,63 @@ fn widths(page: &Page) -> Vec<u32> {
     page.columns.iter().map(|c| c.width).collect()
 }
 
-/// The strip always fills the viewport: no empty space before the first or after the last column.
+/// Default scroll: no gap before the first column or after the last.
 fn clamp_scroll(page: &Page, viewport: u32, target: i64) -> i32 {
     coordinate(edges::clamp_x(&widths(page), viewport, target))
+}
+
+/// Also allows centering gaps and an off-screen queue.
+fn clamp_scroll_relaxed(page: &Page, viewport: u32, target: i64) -> i32 {
+    coordinate(edges::clamp_x_relaxed(&widths(page), viewport, target))
+}
+
+fn user_minimized(window: &WindowState) -> bool {
+    window.native.minimized && !window.native.minimized_by_manager
+}
+
+/// Index just after the nearest predecessor still present; otherwise the start.
+fn insert_after<T: PartialEq>(existing: &[T], predecessors: &[T]) -> usize {
+    predecessors
+        .iter()
+        .find_map(|pred| existing.iter().position(|id| id == pred).map(|i| i + 1))
+        .unwrap_or(0)
+}
+
+/// Present ids plus parked ones, using each parked id's nearest-first predecessors.
+fn logical_ids(present: &[String], parked: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut order = present.to_vec();
+    let mut pending: Vec<_> = parked
+        .iter()
+        .filter(|(id, _)| !order.iter().any(|have| have == id))
+        .cloned()
+        .collect();
+    while !pending.is_empty() {
+        let start = pending.len();
+        let batch = std::mem::take(&mut pending);
+        for (id, preds) in batch {
+            if let Some(pred) = preds
+                .iter()
+                .find(|pred| order.iter().any(|have| have == *pred))
+            {
+                let at = order.iter().position(|have| have == pred).unwrap();
+                order.insert(at + 1, id);
+            } else if preds.iter().any(|pred| {
+                parked.iter().any(|(other, _)| other == pred)
+                    && !order.iter().any(|have| have == pred)
+            }) {
+                pending.push((id, preds));
+            } else {
+                order.insert(0, id);
+            }
+        }
+        if pending.len() == start {
+            for (id, _) in pending {
+                order.push(id);
+            }
+            break;
+        }
+    }
+    order
 }
 
 /// Snap distance for boundary drags: 1/12 of the viewport width, at least 64 logical pixels,
@@ -124,17 +202,103 @@ impl Engine {
             page_focus: BTreeMap::new(),
             fullscreen_restore: BTreeMap::new(),
             height_weights: BTreeMap::new(),
+            minimized_slots: vec![],
             window_rules: vec![],
             pending_rule_floating: BTreeSet::new(),
+            size_floating: BTreeSet::new(),
+            min_widths: BTreeMap::new(),
             disconnected_monitors: BTreeMap::new(),
             monitor_order: vec![],
             hotplug_pinned: BTreeMap::new(),
             outputs_suspended: false,
+            covering_windows: BTreeSet::new(),
         }
     }
 
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Replace the per-monitor full-display pause. Empty resumes every monitor.
+    pub fn set_suspended_monitors(&mut self, ids: Vec<MonitorId>) {
+        self.snapshot.suspended_monitors = ids;
+    }
+
+    /// Ids from the last enumerate, not from column membership.
+    pub fn set_covering_windows(&mut self, ids: Vec<WindowId>) {
+        self.covering_windows = ids.into_iter().collect();
+    }
+
+    pub(crate) fn window_on_suspended(&self, id: &str) -> bool {
+        self.location(id)
+            .ok()
+            .is_some_and(|(m, _, _)| self.monitor_suspended(m))
+    }
+
+    /// Logical suspension or a managed window detected covering another display.
+    pub(crate) fn window_protected(&self, id: &str) -> bool {
+        self.covering_windows.contains(id) || self.window_on_suspended(id)
+    }
+
+    fn monitor_suspended(&self, index: usize) -> bool {
+        let id = &self.snapshot.monitors[index].monitor.id;
+        self.snapshot.suspended_monitors.iter().any(|s| s == id)
+    }
+
+    fn hits_suspended(&self, monitor_id: &str) -> bool {
+        self.snapshot
+            .suspended_monitors
+            .iter()
+            .any(|id| id == monitor_id)
+    }
+
+    /// Commands that would move a suspended monitor, or pull a window onto/off it.
+    fn command_hits_suspended(&self, command: &Command) -> bool {
+        let win = |id: &str| self.window_protected(id);
+        let mon = |id: &str| self.hits_suspended(id);
+        let point = |x: i32, y: i32| {
+            let (x, y) = (i64::from(x), i64::from(y));
+            self.snapshot.monitors.iter().any(|m| {
+                let b = m.monitor.bounds;
+                mon(&m.monitor.id)
+                    && x >= i64::from(b.x)
+                    && y >= i64::from(b.y)
+                    && x < i64::from(b.x) + i64::from(b.width)
+                    && y < i64::from(b.y) + i64::from(b.height)
+            })
+        };
+        match command {
+            Command::DragEdge { monitor_id, .. }
+            | Command::DragRow { monitor_id, .. }
+            | Command::Scroll { monitor_id, .. }
+            | Command::SwitchPage { monitor_id, .. }
+            | Command::AddPage { monitor_id } => mon(monitor_id),
+            Command::SlideColumn { .. } => self.snapshot.active_monitor.as_deref().is_some_and(mon),
+            Command::DropWindow { window_id, x, y } => point(*x, *y) || win(window_id),
+            Command::MoveWindowToPage { window_id, page_id } => {
+                win(window_id)
+                    || self.snapshot.monitors.iter().any(|m| {
+                        mon(&m.monitor.id) && m.pages.iter().any(|p| &p.id == page_id)
+                    })
+            }
+            Command::FocusWindow { window_id }
+            | Command::SetWindowColumnWidth { window_id, .. }
+            | Command::SetFloatingRect { window_id, .. }
+            | Command::CloseWindow { window_id } => win(window_id),
+            Command::FocusDirection { .. }
+            | Command::MoveWindow { .. }
+            | Command::CycleWidth
+            | Command::SetColumnWidth { .. }
+            | Command::AdjustColumnWidth { .. }
+            | Command::AdjustWindowHeight { .. }
+            | Command::ResetWindowHeights
+            | Command::CenterFocused
+            | Command::ToggleFloating
+            | Command::ToggleFullscreen => {
+                self.snapshot.focused_window.as_deref().is_some_and(win)
+            }
+            _ => false,
+        }
     }
 
     /// Refresh native availability/capabilities without discarding the user's layout.
@@ -146,6 +310,10 @@ impl Engine {
     /// Native monitor work areas remain unchanged; missing overrides use the native work area.
     pub fn set_viewports(&mut self, viewports: BTreeMap<MonitorId, Rect>) {
         self.viewports = viewports;
+    }
+
+    pub fn set_min_widths(&mut self, min_widths: BTreeMap<WindowId, u32>) {
+        self.min_widths = min_widths;
     }
 
     pub fn set_gaps(&mut self, gaps: u32) {
@@ -257,9 +425,11 @@ impl Engine {
                 && self.snapshot.focused_window != next.snapshot.focused_window
                 && native_focus != next.snapshot.focused_window
         }) {
-            actions.push(NativeAction::Focus {
-                window_id: id.clone(),
-            });
+            if !next.window_protected(id) {
+                actions.push(NativeAction::Focus {
+                    window_id: id.clone(),
+                });
+            }
         }
         next.update_pending_rule_floating(&actions);
         *self = next;
@@ -375,9 +545,30 @@ impl Engine {
                 });
             }
         }
+        self.size_floating.retain(|id| window_ids.contains(id));
+        for id in self.size_floating.clone() {
+            let w = self.window_index(&id)?;
+            if !self.snapshot.windows[w].native.resizable {
+                continue;
+            }
+            self.size_floating.remove(&id);
+            if let Ok((m, p, None)) = self.location(&id) {
+                self.remove_window(&id);
+                self.snapshot.windows[w].floating = false;
+                self.insert_window(m, p, &id, None)?;
+            }
+        }
         // Preserve logical monitor/page membership: clipped native rectangles can straddle monitors.
         for window in self.snapshot.windows.clone() {
             if self.location(&window.native.id).is_ok() {
+                continue;
+            }
+            // Parked user-minimized windows are restored by cleanup, not reinserted at the tail.
+            if self
+                .minimized_slots
+                .iter()
+                .any(|slot| slot.id == window.native.id)
+            {
                 continue;
             }
             if new_windows.contains(&window.native.id) {
@@ -400,22 +591,28 @@ impl Engine {
                 .snapshot
                 .focused_window
                 .clone()
-                .filter(|id| window_ids.contains(id))
+                .filter(|id| window_ids.contains(id) && !self.window_protected(id))
             {
                 self.ensure_visible(&id, false)?;
             }
         }
         let previous = self.snapshot.focused_window.clone();
-        if let Some(id) = successor.filter(|id| self.location(id).is_ok()) {
+        if let Some(id) = successor.filter(|id| {
+            self.location(id).is_ok() && !self.window_protected(id)
+        }) {
             self.set_focus(&id, true)?;
         } else if let Some(id) = system.focused_window {
-            let (m, p, _) = self.location(&id)?;
-            // Native focus must not activate a background logical page, even while paused.
-            let native = &self.snapshot.windows[self.window_index(&id)?].native;
-            if (!self.snapshot.enabled || !native.minimized)
-                && self.snapshot.monitors[m].pages[p].id == self.snapshot.monitors[m].active_page
-            {
-                self.set_focus(&id, viewport_changed || previous.as_ref() != Some(&id))?;
+            // A user-minimized window has left the columns; native focus must not error or wake it.
+            // Focus on a suspended monitor must not scroll that page back into the covering window.
+            if let Ok((m, p, _)) = self.location(&id) {
+                let native = &self.snapshot.windows[self.window_index(&id)?].native;
+                if !self.window_protected(&id)
+                    && (!self.snapshot.enabled || !native.minimized)
+                    && self.snapshot.monitors[m].pages[p].id
+                        == self.snapshot.monitors[m].active_page
+                {
+                    self.set_focus(&id, viewport_changed || previous.as_ref() != Some(&id))?;
+                }
             }
         }
         if self
@@ -478,32 +675,236 @@ impl Engine {
         }
     }
 
+    /// User-minimized tiled windows leave the active strip. Their slot keeps the page,
+    /// column, row and width so a later restore (in any order) lands where they were.
+    /// Manager-hidden windows stay in their columns.
+    fn sync_minimized(&mut self) {
+        let mut keep = Vec::new();
+        let mut ready = Vec::new();
+        for slot in std::mem::take(&mut self.minimized_slots) {
+            match self
+                .snapshot
+                .windows
+                .iter()
+                .find(|w| w.native.id == slot.id)
+            {
+                Some(w) if w.floating => ready.push(slot),
+                Some(w) if user_minimized(w) => keep.push(slot),
+                Some(_) => ready.push(slot),
+                None => {}
+            }
+        }
+        self.minimized_slots = keep;
+        for slot in ready {
+            self.restore_slot(slot);
+        }
+        let focused = self.snapshot.focused_window.clone();
+        let parked: Vec<WindowId> = self
+            .snapshot
+            .windows
+            .iter()
+            .filter(|w| {
+                !w.floating
+                    && user_minimized(w)
+                    && self
+                        .minimized_slots
+                        .iter()
+                        .all(|slot| slot.id != w.native.id)
+                    && matches!(self.location(&w.native.id), Ok((_, _, Some(_))))
+            })
+            .map(|w| w.native.id.clone())
+            .collect();
+        for id in &parked {
+            self.park_window(id);
+        }
+        for monitor in &mut self.snapshot.monitors {
+            for page in &mut monitor.pages {
+                page.columns.retain(|c| !c.windows.is_empty());
+            }
+        }
+        if focused.as_ref().is_some_and(|id| {
+            self.snapshot
+                .windows
+                .iter()
+                .any(|w| w.native.id == *id && user_minimized(w))
+        }) {
+            self.snapshot.focused_window = None;
+            self.focus_active_page();
+        }
+    }
+
+    fn park_window(&mut self, id: &str) {
+        let Ok((m, p, Some((c, row)))) = self.location(id) else {
+            return;
+        };
+        let page_id = self.snapshot.monitors[m].pages[p].id.clone();
+        let column_id = self.snapshot.monitors[m].pages[p].columns[c].id.clone();
+        let width = self.snapshot.monitors[m].pages[p].columns[c].width;
+        let rows = logical_ids(
+            &self.snapshot.monitors[m].pages[p].columns[c].windows,
+            &self
+                .minimized_slots
+                .iter()
+                .filter(|slot| slot.page_id == page_id && slot.column_id == column_id)
+                .map(|slot| (slot.id.clone(), slot.above.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let columns = logical_ids(
+            &self.snapshot.monitors[m].pages[p]
+                .columns
+                .iter()
+                .map(|column| column.id.clone())
+                .collect::<Vec<_>>(),
+            &self.column_preds(&page_id),
+        );
+        let above = rows[..rows.iter().position(|window| window == id).unwrap_or(row)]
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        let left = columns[..columns
+            .iter()
+            .position(|column| column == &column_id)
+            .unwrap_or(c)]
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        self.minimized_slots.push(MinimizedSlot {
+            id: id.into(),
+            page_id,
+            column_id,
+            width,
+            above,
+            left,
+        });
+        // Use the same detach geometry as a drag: removing a column left of the viewport
+        // must not move the remaining visible windows.
+        let _ = self.detach(id);
+    }
+
+    fn column_preds(&self, page_id: &str) -> Vec<(ColumnId, Vec<ColumnId>)> {
+        let mut seen = BTreeSet::new();
+        self.minimized_slots
+            .iter()
+            .filter(|slot| slot.page_id == page_id && seen.insert(slot.column_id.clone()))
+            .map(|slot| (slot.column_id.clone(), slot.left.clone()))
+            .collect()
+    }
+
+    fn restore_slot(&mut self, slot: MinimizedSlot) {
+        if self.location(&slot.id).is_ok() {
+            return;
+        }
+        let Some((m, p)) = self.page_pos(&slot.page_id) else {
+            let Ok(m) = self
+                .window_index(&slot.id)
+                .and_then(|w| self.monitor_index(&self.snapshot.windows[w].native.monitor_id))
+            else {
+                return;
+            };
+            let p = self.snapshot.monitors[m]
+                .pages
+                .iter()
+                .position(|page| page.id == self.snapshot.monitors[m].active_page)
+                .unwrap();
+            let _ = self.insert_window(m, p, &slot.id, Some(slot.width));
+            return;
+        };
+        if self.snapshot.windows[self.window_index(&slot.id).unwrap()].floating {
+            let floating = &mut self.snapshot.monitors[m].pages[p].floating_windows;
+            if !floating.iter().any(|id| id == &slot.id) {
+                floating.push(slot.id);
+            }
+            return;
+        }
+        let column_ids: Vec<ColumnId> = self.snapshot.monitors[m].pages[p]
+            .columns
+            .iter()
+            .map(|column| column.id.clone())
+            .collect();
+        let existing = column_ids.iter().position(|id| id == &slot.column_id);
+        let index = insert_after(&column_ids, &slot.left);
+        let page = &mut self.snapshot.monitors[m].pages[p];
+        if let Some(c) = existing {
+            let row = insert_after(&page.columns[c].windows, &slot.above);
+            page.columns[c].windows.insert(row, slot.id);
+            return;
+        }
+        let left: i64 = page.columns[..index]
+            .iter()
+            .map(|c| i64::from(c.width))
+            .sum();
+        if !page.columns.is_empty() && left <= i64::from(page.viewport_x) {
+            page.viewport_x = coordinate(i64::from(page.viewport_x) + i64::from(slot.width));
+        }
+        page.columns.insert(
+            index,
+            Column {
+                id: slot.column_id,
+                width: slot.width.max(1),
+                windows: vec![slot.id],
+            },
+        );
+    }
+
+    fn page_pos(&self, id: &str) -> Option<(usize, usize)> {
+        self.snapshot
+            .monitors
+            .iter()
+            .enumerate()
+            .find_map(|(m, monitor)| {
+                monitor
+                    .pages
+                    .iter()
+                    .position(|page| page.id == id)
+                    .map(|p| (m, p))
+            })
+    }
+
+    fn navigable(&self, id: &str) -> bool {
+        self.snapshot
+            .windows
+            .iter()
+            .any(|w| w.native.id == id && (!w.native.minimized || w.native.minimized_by_manager))
+    }
+
     fn cleanup(&mut self) {
+        self.sync_minimized();
+        let parked: BTreeSet<PageId> = self
+            .minimized_slots
+            .iter()
+            .map(|slot| slot.page_id.clone())
+            .collect();
+        let gaps = self.snapshot.gaps;
         for m in 0..self.snapshot.monitors.len() {
             let monitor = &mut self.snapshot.monitors[m];
+            let gap = 2 * half_gap(gaps, monitor.monitor.scale_factor);
             for page in &mut monitor.pages {
                 for column in &mut page.columns {
-                    column.width = column.width.min(monitor.viewport.width).max(1);
+                    let min = column
+                        .windows
+                        .iter()
+                        .filter_map(|id| self.min_widths.get(id))
+                        .max()
+                        .map_or(0, |w| w + gap);
+                    column.width = column.width.max(min).min(monitor.viewport.width).max(1);
                 }
                 page.columns.retain(|c| !c.windows.is_empty());
-                let mut filled = widths(page);
-                edges::fill(&mut filled, monitor.viewport.width);
-                for (column, width) in page.columns.iter_mut().zip(filled) {
-                    column.width = width;
-                }
             }
-            // Keep the selected empty page and a stable empty tail, but coalesce adjacent empties.
+            // A page whose tiled windows are all user-minimized is not a disposable empty tail.
+            let disposable = |page: &Page| empty(page) && !parked.contains(&page.id);
             let last = monitor.pages.last().map(|p| p.id.clone());
             monitor.pages.retain(|p| {
-                !empty(p) || p.id == monitor.active_page || Some(&p.id) == last.as_ref()
+                !disposable(p) || p.id == monitor.active_page || Some(&p.id) == last.as_ref()
             });
             if monitor.pages.len() > 1
-                && empty(monitor.pages.last().unwrap())
-                && empty(&monitor.pages[monitor.pages.len() - 2])
+                && disposable(monitor.pages.last().unwrap())
+                && disposable(&monitor.pages[monitor.pages.len() - 2])
             {
                 monitor.pages.pop();
             }
-            if monitor.pages.last().is_none_or(|p| !empty(p)) {
+            if monitor.pages.last().is_none_or(|p| !disposable(p)) {
                 let page = self.page();
                 self.snapshot.monitors[m].pages.push(page);
             }
@@ -514,7 +915,7 @@ impl Engine {
             for (i, page) in monitor.pages.iter_mut().enumerate() {
                 page.name = format!("Desktop {}", i + 1);
                 page.viewport_x =
-                    clamp_scroll(page, monitor.viewport.width, page.viewport_x as i64);
+                    clamp_scroll_relaxed(page, monitor.viewport.width, page.viewport_x as i64);
             }
         }
         let valid: BTreeMap<_, BTreeSet<_>> = self
@@ -537,16 +938,21 @@ impl Engine {
         self.snapshot.focused_window = Some(id.into());
         self.page_focus
             .insert(self.snapshot.monitors[m].active_page.clone(), id.into());
-        let neighbors: Vec<_> = ids(&self.snapshot.monitors[m].pages[p]).cloned().collect();
-        for window in &mut self.snapshot.windows {
-            if window.native.id != id && neighbors.contains(&window.native.id) {
-                window.fullscreen = false;
-                if let Some(rect) = self.fullscreen_restore.remove(&window.native.id) {
-                    window.native.rect = rect;
+        // Floating focus leaves a tiled layout fullscreen in place; the floating window covers it.
+        let floating = self.snapshot.windows[self.window_index(id)?].floating;
+        if !floating {
+            let neighbors: Vec<_> = ids(&self.snapshot.monitors[m].pages[p]).cloned().collect();
+            for window in &mut self.snapshot.windows {
+                if window.native.id != id && neighbors.contains(&window.native.id) {
+                    window.fullscreen = false;
+                    if let Some(rect) = self.fullscreen_restore.remove(&window.native.id) {
+                        window.native.rect = rect;
+                    }
                 }
             }
         }
-        if ensure_visible {
+        // A suspended monitor keeps its scroll; revealing would reflow under the covering window.
+        if ensure_visible && !self.monitor_suspended(m) {
             self.ensure_visible(id, false)?;
         }
         Ok(())
@@ -634,7 +1040,8 @@ impl Engine {
         } else {
             x
         };
-        page.viewport_x = clamp_scroll(page, viewport as u32, target);
+        // Keep an already visible column in place, including explicit centering/queue gaps.
+        page.viewport_x = clamp_scroll_relaxed(page, viewport as u32, target);
         Ok(())
     }
 
@@ -701,12 +1108,16 @@ impl Engine {
         if !self.snapshot.enabled {
             return Err(invalid("Window management is paused"));
         }
+        if self.command_hits_suspended(&command) {
+            return Ok(vec![]);
+        }
         let mut focus_action = false;
         match command {
             Command::FocusWindow { window_id } => {
                 self.require_focus()?;
                 let w = self.window_index(&window_id)?;
                 self.snapshot.windows[w].native.minimized = false;
+                self.sync_minimized();
                 self.set_focus(&window_id, true)?;
                 focus_action = true;
             }
@@ -732,7 +1143,8 @@ impl Engine {
                         }
                     }
                 } else {
-                    let windows: Vec<_> = ids(page).cloned().collect();
+                    let windows: Vec<_> =
+                        ids(page).filter(|w| self.navigable(w)).cloned().collect();
                     let index = windows.iter().position(|w| w == &id).unwrap();
                     let index = match direction {
                         Direction::Left | Direction::Up => index.checked_sub(1),
@@ -740,7 +1152,7 @@ impl Engine {
                     };
                     index.and_then(|i| windows.get(i).cloned())
                 };
-                if let Some(target) = target {
+                if let Some(target) = target.filter(|id| self.navigable(id)) {
                     let w = self.window_index(&target)?;
                     self.snapshot.windows[w].native.minimized = false;
                     self.set_focus(&target, true)?;
@@ -969,6 +1381,7 @@ impl Engine {
                 }
                 let (m, p, _) = self.location(&id)?;
                 self.remove_window(&id);
+                self.size_floating.remove(&id);
                 self.snapshot.windows[w].floating = !self.snapshot.windows[w].floating;
                 self.snapshot.windows[w].fullscreen = false;
                 if let Some(rect) = self.fullscreen_restore.remove(&id) {
@@ -1069,9 +1482,18 @@ impl Engine {
         };
         let page = &mut self.snapshot.monitors[m].pages[p];
         page.viewport_x = clamp_scroll(page, view as u32, scroll);
-        let windows = &page.columns[c].windows;
-        let id = windows[row.min(windows.len() - 1)].clone();
+        let windows = page.columns[c].windows.clone();
+        let preferred = row.min(windows.len() - 1);
+        let Some(id) = windows
+            .get(preferred)
+            .filter(|id| self.navigable(id))
+            .cloned()
+            .or_else(|| windows.into_iter().find(|id| self.navigable(id)))
+        else {
+            return Ok(true);
+        };
         let w = self.window_index(&id)?;
+        // Manager-hidden columns come back on screen. User-minimized windows are not targets.
         self.snapshot.windows[w].native.minimized = false;
         self.set_focus(&id, false)?;
         Ok(true)
@@ -1105,6 +1527,15 @@ impl Engine {
         }
         let mut actions = Vec::new();
         for monitor in &self.snapshot.monitors {
+            // Leave the covering window and the tiles under it where they are.
+            if self
+                .snapshot
+                .suspended_monitors
+                .iter()
+                .any(|id| id == &monitor.monitor.id)
+            {
+                continue;
+            }
             for page in &monitor.pages {
                 let active = page.id == monitor.active_page;
                 let fullscreen = ids(page).find(|id| {
@@ -1181,7 +1612,9 @@ impl Engine {
         fullscreen: Option<&WindowId>,
     ) {
         let window = &self.snapshot.windows[self.window_index(id).unwrap()];
-        if window.native.minimized && !window.native.minimized_by_manager {
+        if self.covering_windows.contains(id)
+            || (window.native.minimized && !window.native.minimized_by_manager)
+        {
             return;
         }
         // `bounds` is the viewport expanded by half a gap: fullscreen has no gap, and
@@ -1202,8 +1635,9 @@ impl Engine {
         // A monitor without tiled windows cannot cover the part cut off at this edge.
         let spills = !fully_visible && uncovered.iter().any(|b| overlaps(rect, *b));
         // Without native clipping, hide whole edge windows rather than leaking onto another monitor.
+        // A floating window stays up over layout fullscreen instead of being covered by it.
         let minimized = !active
-            || fullscreen.is_some_and(|w| w != id)
+            || (fullscreen.is_some_and(|w| w != id) && !window.floating)
             || (!window.floating && (!visible || spills || (!clipping && !fully_visible)));
         let clip = if clipping && !window.floating && !minimized && visible && !fully_visible {
             Some(Rect {

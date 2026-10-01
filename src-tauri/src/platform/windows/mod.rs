@@ -5,7 +5,7 @@ pub mod preview;
 pub mod splitter;
 use crate::model::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
 };
@@ -71,6 +71,12 @@ struct Entry {
     region_box: Option<RECT>,
     /// A partial window has been placed below neighbouring monitors' windows.
     at_bottom: bool,
+    /// Smallest visible width the window accepted (window DPI, width), learned when Windows
+    /// kept it wider than a placement asked (WM_GETMINMAXINFO cannot be read from outside).
+    min_width: Option<(u32, u32)>,
+    /// Visible rectangle last applied by this manager. Still matching it is our geometry,
+    /// even when that rectangle fills the monitor bounds.
+    placed_visible: Option<Rect>,
 }
 pub struct Backend {
     compositor: compositor::Compositor,
@@ -78,6 +84,10 @@ pub struct Backend {
     entries: HashMap<String, Entry>,
     property: Vec<u16>,
     next: usize,
+    /// Monitors whose bounds a foreign window currently covers.
+    full_display: Vec<String>,
+    /// Managed window ids that are the covering windows (column may be elsewhere).
+    covering: Vec<String>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -104,6 +114,38 @@ fn rect(r: RECT) -> Rect {
         width: (i64::from(r.right) - i64::from(r.left)).max(0) as u32,
         height: (i64::from(r.bottom) - i64::from(r.top)).max(0) as u32,
     }
+}
+/// `window` contains every pixel of `bounds`. A work-area maximize does not.
+/// ponytail: one pixel short of the bounds is not coverage; widen only if a real game needs it.
+pub(crate) fn covers_bounds(window: Rect, bounds: Rect) -> bool {
+    if bounds.width == 0 || bounds.height == 0 {
+        return false;
+    }
+    let (x, y) = (i64::from(window.x), i64::from(window.y));
+    let (bx, by) = (i64::from(bounds.x), i64::from(bounds.y));
+    x <= bx
+        && y <= by
+        && x + i64::from(window.width) >= bx + i64::from(bounds.width)
+        && y + i64::from(window.height) >= by + i64::from(bounds.height)
+}
+/// Full-display coverage that this manager did not just place and that is not maximized.
+/// Not a D3D exclusive-mode query (`QUNS_RUNNING_D3D_FULL_SCREEN` is global and misses
+/// borderless fullscreen).
+pub(crate) fn external_full_display(
+    outer: Rect,
+    bounds: Rect,
+    zoomed: bool,
+    at_planned: bool,
+) -> bool {
+    !zoomed && !at_planned && covers_bounds(outer, bounds)
+}
+/// Unmanaged covering windows stay out of the layout. Managed ones keep their column.
+pub(crate) fn admit_window(managed: bool, external: bool) -> bool {
+    !external || managed
+}
+/// Native foreground display against the paused set. Unmanaged HWNDs still have a monitor.
+pub(crate) fn foreground_paused(monitor_id: &str, suspended: &[String]) -> bool {
+    suspended.iter().any(|id| id == monitor_id)
 }
 fn native(r: Rect) -> Result<RECT, AppError> {
     let right = i64::from(r.x) + i64::from(r.width);
@@ -306,7 +348,38 @@ impl Backend {
                 nonce
             )),
             next: 1,
+            full_display: Vec::new(),
+            covering: Vec::new(),
         })
+    }
+    /// Monitor ids whose bounds a foreign window covered during the last enumerate.
+    pub fn full_display_monitors(&self) -> Vec<String> {
+        self.full_display.clone()
+    }
+    /// Managed windows that covered a display. Empty when none did.
+    pub fn covering_windows(&self) -> Vec<String> {
+        self.covering.clone()
+    }
+    /// Foreground monitor is one we marked paused. The HWND need not be managed.
+    pub fn foreground_on_paused(&self) -> bool {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_null() {
+            return false;
+        }
+        let id = monitor_id(unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) });
+        foreground_paused(&id, &self.full_display)
+    }
+    /// Learned minimum visible widths at each window's current DPI.
+    pub fn min_widths(&self) -> BTreeMap<String, u32> {
+        self.entries
+            .iter()
+            .filter_map(|(id, e)| {
+                let (dpi, width) = e.min_width?;
+                let now = unsafe { GetDpiForWindow(e.hwnd as HWND) };
+                let scaled = u64::from(width) * u64::from(now.max(1)) / u64::from(dpi.max(1));
+                Some((id.clone(), scaled as u32))
+            })
+            .collect()
     }
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
@@ -458,6 +531,8 @@ impl Backend {
         if unsafe { EnumWindows(Some(collect_window), &mut handles as *mut _ as LPARAM) } == 0 {
             return Err(failed("EnumWindows", None));
         }
+        self.full_display.clear();
+        self.covering.clear();
         for raw in handles {
             let h = raw as HWND;
             let existing = self
@@ -516,6 +591,42 @@ impl Backend {
             let Some(outer) = outer_frame(h) else {
                 continue;
             };
+            // Our own full-bounds placement still matches `placed_visible` (no taskbar, no
+            // top bar). A window that left that rectangle, or was never ours, is external.
+            let at_planned = !minimized
+                && existing.as_ref().is_some_and(|id| {
+                    self.entries.get(id).is_some_and(|entry| {
+                        match (entry.placed_visible, entry.placed_pad) {
+                            (Some(planned), Some(pad)) => planned == rect(inset(outer, pad)),
+                            _ => false,
+                        }
+                    })
+                });
+            let zoomed = !minimized && unsafe { IsZoomed(h) } != 0;
+            let outer_rect = rect(outer);
+            let external = !minimized
+                && result.monitors.iter().any(|monitor| {
+                    external_full_display(outer_rect, monitor.bounds, zoomed, at_planned)
+                });
+            if external {
+                for monitor in &result.monitors {
+                    if external_full_display(outer_rect, monitor.bounds, zoomed, at_planned)
+                        && !self.full_display.iter().any(|id| id == &monitor.id)
+                    {
+                        self.full_display.push(monitor.id.clone());
+                    }
+                }
+                if managed {
+                    if let Some(id) = &existing {
+                        if !self.covering.iter().any(|known| known == id) {
+                            self.covering.push(id.clone());
+                        }
+                    }
+                }
+            }
+            if !admit_window(managed, external) {
+                continue;
+            }
             let id = if let Some(id) = existing {
                 id
             } else {
@@ -549,6 +660,8 @@ impl Backend {
                         placed_pad: None,
                         region_box: None,
                         at_bottom: false,
+                        min_width: None,
+                        placed_visible: None,
                     },
                 );
                 id
@@ -580,6 +693,11 @@ impl Backend {
                 unsafe {
                     CloseHandle(process);
                 }
+            }
+            // Not iconic means our minimization is over. Leave the flag set and a later
+            // user minimize is reported as ours.
+            if !minimized {
+                self.entries.get_mut(&id).unwrap().minimized = false;
             }
             result.windows.push(NativeWindow {
                 id: id.clone(),
@@ -956,12 +1074,19 @@ impl Backend {
         entry.minimized = false;
         entry.at_bottom = partial;
         if !same_rect(actual, outer) {
+            let visible = inset(actual, pad);
+            let width = visible.right - visible.left;
+            if width > r.right - r.left {
+                let dpi = unsafe { GetDpiForWindow(h) };
+                self.entries.get_mut(id).unwrap().min_width = Some((dpi, width as u32));
+            }
             return Err(error(
                 ErrorCode::OperationDenied,
                 "Window constrained requested size/position; refresh required",
                 Some(id),
             ));
         }
+        self.entries.get_mut(id).unwrap().placed_visible = Some(target);
         Ok(())
     }
     /// Focus border and corners for managed windows. Unchanged windows are not touched.
@@ -1084,6 +1209,7 @@ impl Backend {
         }
         e.saved = None;
         e.placed_pad = None;
+        e.placed_visible = None;
         e.minimized = false;
         Ok(())
     }
@@ -1245,5 +1371,51 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn full_display_coverage_ignores_maximize_and_our_own_placement() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let work = Rect {
+            x: 0,
+            y: 40,
+            width: 1920,
+            height: 1040,
+        };
+        assert!(!covers_bounds(work, bounds), "taskbar still visible");
+        assert!(covers_bounds(bounds, bounds));
+        // No taskbar: the invisible resize border makes our placed window's outer rect
+        // contain the bounds. It is still the rectangle we applied.
+        let outer = Rect {
+            x: -7,
+            y: -7,
+            width: 1934,
+            height: 1094,
+        };
+        assert!(covers_bounds(outer, bounds));
+        assert!(
+            !external_full_display(outer, bounds, false, true),
+            "manager-placed full column"
+        );
+        assert!(
+            !external_full_display(bounds, bounds, true, false),
+            "maximized, including auto-hidden taskbar"
+        );
+        assert!(
+            external_full_display(bounds, bounds, false, false),
+            "borderless or a managed window that left its tile"
+        );
+        assert!(!external_full_display(work, bounds, false, false));
+        assert!(!admit_window(false, true), "do not tile the covering hwnd");
+        assert!(admit_window(true, true), "keep the managed column");
+        assert!(admit_window(false, false));
+        assert!(foreground_paused("a", &["a".into(), "b".into()]));
+        assert!(!foreground_paused("b", &["a".into()]));
+        assert!(!foreground_paused("", &[]));
     }
 }

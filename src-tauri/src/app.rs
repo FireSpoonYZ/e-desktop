@@ -16,8 +16,8 @@ use crate::{
     config::{Config, ConfigFile, ShortcutAction},
     layout::{Engine, expand_gap, half_gap, inset_gap},
     model::{
-        AppError, BackendAvailability, BackendStatus, Command, ErrorCode, NativeAction, Rect,
-        Snapshot,
+        AppError, BackendAvailability, BackendStatus, Command, ErrorCode, MonitorState,
+        NativeAction, Rect, Snapshot,
     },
     platform::Backend,
     pointer::{Gesture, tiled},
@@ -195,6 +195,11 @@ struct Controller {
     top_bar: bool,
     /// Managed window in the system move/size loop at the last refresh.
     native_drag: Option<String>,
+    /// Known title-bar move: Snap/DPI size changes are not manual border resizes.
+    native_move: Option<String>,
+    /// Native foreground when a deferred slide began. Later polls of that window are not clicks.
+    /// `None` means nothing managed was in front, not that the anchor is unset.
+    ignored_foreground: Option<String>,
     /// Refresh within this delay: a released native move/resize, or windows that appeared or
     /// disappeared (their neighbours close the gap right away instead of at the next poll).
     refresh_soon: Option<Duration>,
@@ -202,6 +207,9 @@ struct Controller {
     autohide: bool,
     pinned: BTreeSet<String>,
     revealed: BTreeSet<String>,
+    /// Monitor the overview or commands surface was opened on.
+    overview_host: Option<String>,
+    commands_host: Option<String>,
 }
 
 impl Controller {
@@ -222,10 +230,14 @@ impl Controller {
             in_corner: false,
             top_bar: Config::default().top_bar,
             native_drag: None,
+            native_move: None,
+            ignored_foreground: None,
             refresh_soon: None,
             autohide: false,
             pinned: BTreeSet::new(),
             revealed: BTreeSet::new(),
+            overview_host: None,
+            commands_host: None,
             animation_duration: Duration::from_millis(u64::from(
                 Config::default().animation_duration_ms,
             )),
@@ -304,24 +316,50 @@ impl Controller {
             .monitors
             .iter()
             .map(|m| m.monitor.id.clone())
-            .filter(|id| self.bar_pinned(id) || self.revealed.contains(id))
+            .filter(|id| {
+                !self
+                    .engine
+                    .snapshot()
+                    .suspended_monitors
+                    .iter()
+                    .any(|s| s == id)
+                    && (self.bar_pinned(id) || self.revealed.contains(id))
+            })
             .collect()
     }
 
     fn refresh(&mut self, apply: bool) -> Result<(), AppError> {
         // Keep a running slide when polling finds the same layout. A focus waiting for its
         // target to arrive must survive reconciliation without adopting the stale foreground.
-        let pending_focus = self.animation.deferred_focus().cloned();
+        let deferred_focus = self.animation.deferred_focus_id().map(str::to_owned);
         let backend = self
             .backend
             .as_mut()
             .ok_or_else(|| error(ErrorCode::BackendUnavailable, "原生窗口后端尚未连接。"))?;
         let system = backend.enumerate();
         self.engine.set_backend(backend.status());
+        #[cfg(target_os = "windows")]
+        self.engine.set_min_widths(backend.min_widths());
         let mut system = system?;
-        if pending_focus.is_some() {
-            // The old foreground window is not a new activation: the target is still
-            // arriving. Preserve layout focus until the deferred activation is applied.
+        #[cfg(target_os = "windows")]
+        {
+            self.engine
+                .set_suspended_monitors(backend.full_display_monitors());
+            self.engine
+                .set_covering_windows(backend.covering_windows());
+        }
+        let enumerated = system.focused_window.clone();
+        let managed = enumerated
+            .as_ref()
+            .is_some_and(|id| system.windows.iter().any(|w| &w.id == id));
+        if crate::animation::suppress_observed_focus(
+            deferred_focus.as_deref(),
+            enumerated.as_deref(),
+            self.ignored_foreground.as_deref(),
+            managed,
+        ) {
+            // The foreground left behind (or an unmanaged palette) is not a new activation.
+            // A different managed window is a click: leave it for reconcile.
             system.focused_window = None;
         }
         let gaps = self.engine.snapshot().gaps;
@@ -376,6 +414,7 @@ impl Controller {
         let dragged = match dragging {
             Some(id) => {
                 self.animation.cancel();
+                self.ignored_foreground = None;
                 self.native_drag = Some(id);
                 return Ok(());
             }
@@ -387,59 +426,92 @@ impl Controller {
             // A window resized through its own border keeps the new size. Only the window the
             // user dragged counts: apps also resize themselves (e.g. after moving to a monitor
             // with other scaling), and those changes are placed back into the layout.
-            if let Some((planned, id)) =
-                dragged.and_then(|id| Some((self.placements.get(&id).filter(|p| !p.2)?.0, id)))
+            if let Some((planned, id)) = dragged
+                .filter(|id| !self.engine.window_protected(id))
+                .and_then(|id| Some((self.placements.get(&id).filter(|p| !p.2)?.0, id)))
             {
                 let adopted = match self.engine.adopt_native_move(&id, planned)? {
                     Some(moved) => Some(moved),
+                    None if self.native_move.as_ref() == Some(&id) => None,
                     None => self.engine.adopt_native_sizes(&[(id, planned)])?,
                 };
                 if let Some(adopted) = adopted {
                     transition = adopted;
                 }
             }
-            // Observation must not steal focus from an open palette, menu or dialog.
-            let actions: Vec<_> = transition
-                .actions
-                .into_iter()
-                .filter(|a| !matches!(a, NativeAction::Focus { .. }))
-                .chain(pending_focus)
-                .collect();
-            // Opened/closed windows push neighbours: animate those from where they are on
-            // screen. A window the user moved or resized itself starts at its target.
-            let windows = &transition.snapshot.windows;
-            let on_screen: Placements = self
-                .placements
-                .iter()
-                .filter(|(id, (rect, _, hidden))| {
-                    windows.iter().any(|w| {
-                        &w.native.id == *id
-                            && if *hidden {
-                                w.native.minimized_by_manager
-                            } else {
-                                !w.native.minimized && w.native.rect == *rect
-                            }
-                    })
-                })
-                .map(|(id, plan)| (id.clone(), *plan))
-                .collect();
-            let actions = self.animation.start(
+            // Opened/closed windows push neighbours. Animating windows start from the
+            // displayed frame; a native resize outside the plan still has to match.
+            // The plan already in flight must not be reinserted onto a paused foreground.
+            // A focus the user requested since then is marked and stays.
+            #[cfg(target_os = "windows")]
+            if self
+                .backend
+                .as_ref()
+                .is_some_and(Backend::foreground_on_paused)
+            {
+                self.animation.discard_stale_focus();
+            }
+            let (actions, fresh) = crate::animation::poll_refresh(
+                &mut self.animation,
+                &self.placements,
                 &prev,
                 &transition.snapshot,
-                &on_screen,
-                actions,
+                transition.actions,
+                enumerated.as_deref(),
+                self.ignored_foreground.as_deref(),
                 self.animation_duration,
                 Instant::now(),
             );
-            self.present(actions, true)?;
+            self.note_ignored(fresh, deferred_focus.is_some(), None);
+            self.present(actions, fresh)?;
         } else {
             self.animation.cancel();
+            self.ignored_foreground = None;
         }
         Ok(())
     }
 
+    fn note_ignored(&mut self, fresh: bool, already_deferred: bool, observed: Option<String>) {
+        let deferred = self.animation.deferred_focus_id().map(str::to_owned);
+        crate::animation::note_ignored_foreground(
+            &mut self.ignored_foreground,
+            fresh,
+            already_deferred,
+            deferred.as_deref(),
+            observed,
+        );
+    }
+
+    /// Foreground before a shortcut installs a plan. Not a full enumeration: one HWND lookup.
+    /// Non-Windows backends do not defer slides (no clipping); layout focus is enough there.
+    fn observed_foreground(&self) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        {
+            let hwnd =
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            if hwnd.is_null() {
+                return None;
+            }
+            return self
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.window_for(hwnd as usize));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.engine.snapshot().focused_window.clone()
+        }
+    }
+
     fn apply(&mut self, actions: &[NativeAction]) -> Result<(), AppError> {
         for action in actions {
+            if matches!(
+                action,
+                NativeAction::Placement { window_id, .. } | NativeAction::Focus { window_id }
+                    if self.engine.window_protected(window_id)
+            ) {
+                continue;
+            }
             if let NativeAction::Placement {
                 window_id,
                 rect,
@@ -536,6 +608,7 @@ impl Controller {
     fn stop(&mut self) -> Result<(), AppError> {
         self.clear_previews();
         self.animation.cancel();
+        self.ignored_foreground = None;
         self.placements.clear();
         self.refused.clear();
         // Always turn off automatic reflow, even when one native restore fails.
@@ -577,6 +650,10 @@ impl Controller {
         if matches!(command, Command::Enable) {
             self.refresh(false)?;
         }
+        let foreground_paused = self.foreground_on_paused_display();
+        self.animation.note_user_focus(foreground_paused);
+        let already_deferred = self.animation.deferred_focus_id().is_some();
+        let observed = self.observed_foreground();
         let prev = self.engine.snapshot().clone();
         let transition = match self.engine.dispatch(command) {
             Ok(transition) => transition,
@@ -604,7 +681,9 @@ impl Controller {
             self.finish_animation()?;
             transition.actions
         };
-        self.present(actions, animate && layout)
+        let fresh = self.animation.started_fresh();
+        self.note_ignored(fresh, already_deferred, observed);
+        self.present(actions, fresh)
     }
 
     /// Apply animation output. On Windows the compositor overlay draws the frames (cropped to
@@ -619,6 +698,16 @@ impl Controller {
                 .sprites()
                 .into_iter()
                 .map(|s| s.window_id)
+                .collect();
+            let actions: Vec<_> = actions
+                .into_iter()
+                .filter(|a| {
+                    !matches!(
+                        a,
+                        NativeAction::Placement { window_id, .. } | NativeAction::Focus { window_id }
+                            if self.engine.window_protected(window_id)
+                    )
+                })
                 .collect();
             let (frames, rest): (Vec<_>, Vec<_>) = actions.into_iter().partition(|a| {
                 matches!(a, NativeAction::Placement { window_id, .. } if animated.contains(window_id))
@@ -660,9 +749,15 @@ impl Controller {
     #[cfg(target_os = "windows")]
     fn sprites(&self) -> Vec<crate::animation::Sprite> {
         let mut sprites = self.animation.sprites();
+        sprites.retain(|sprite| !self.engine.window_protected(&sprite.window_id));
         let snapshot = self.engine.snapshot();
         let areas: Vec<Rect> = sprites.iter().map(|s| s.bounds).collect();
-        for monitor in &snapshot.monitors {
+        for monitor in snapshot.monitors.iter().filter(|monitor| {
+            !snapshot
+                .suspended_monitors
+                .iter()
+                .any(|id| id == &monitor.monitor.id)
+        }) {
             let bounds = expand_gap(
                 monitor.viewport,
                 half_gap(snapshot.gaps, monitor.monitor.scale_factor),
@@ -760,13 +855,31 @@ impl Controller {
     }
 
     fn finish_animation(&mut self) -> Result<(), AppError> {
+        // Preserve normal activation when finishing early; only fullscreen makes it stale.
+        if self.foreground_on_paused_display() {
+            self.animation.discard_stale_focus();
+        }
+        self.animation.clear_user_focus();
         let actions = self.animation.cancel();
+        self.ignored_foreground = None;
         self.apply(&actions)
     }
 
     fn animate(&mut self, now: Instant) -> Result<(), AppError> {
+        // Frame end applies the plan's deferred focus. Only the pre-pause one is stale.
+        #[cfg(target_os = "windows")]
+        if self
+            .backend
+            .as_ref()
+            .is_some_and(Backend::foreground_on_paused)
+        {
+            self.animation.discard_stale_focus();
+        }
         let actions = self.animation.frame(now);
         let result = self.present(actions, false);
+        if self.animation.deferred_focus_id().is_none() {
+            self.ignored_foreground = None;
+        }
         self.settle();
         result
     }
@@ -783,6 +896,9 @@ impl Controller {
             else {
                 return;
             };
+            if self.engine.window_protected(id) {
+                return;
+            }
             if let (Some(backend), Some((rect, clip, false))) =
                 (&self.backend, self.placements.get(id).copied())
             {
@@ -791,6 +907,49 @@ impl Controller {
         }
         #[cfg(not(target_os = "windows"))]
         let _ = before;
+    }
+
+    fn note_surface(&mut self, surface: Surface, host: Option<String>) {
+        *match surface {
+            Surface::Overview => &mut self.overview_host,
+            Surface::Commands => &mut self.commands_host,
+        } = host;
+    }
+
+    fn foreground_on_paused_display(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            return self
+                .backend
+                .as_ref()
+                .is_some_and(Backend::foreground_on_paused);
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+
+    /// Hide a surface whose host display is paused. Previews die only with the overview.
+    fn conceal_suspended_surfaces(&mut self, app: &tauri::AppHandle) {
+        let suspended = self.engine.snapshot().suspended_monitors.clone();
+        for surface in [Surface::Overview, Surface::Commands] {
+            let host = match surface {
+                Surface::Overview => self.overview_host.clone(),
+                Surface::Commands => self.commands_host.clone(),
+            };
+            let Some(id) = host else { continue };
+            if !suspended.iter().any(|paused| paused == &id) {
+                continue;
+            }
+            if let Some(window) = app.get_webview_window(surface.label()) {
+                if window.is_visible().unwrap_or(false) {
+                    let _ = window.hide();
+                    if matches!(surface, Surface::Overview) {
+                        self.clear_previews();
+                    }
+                }
+            }
+            self.note_surface(surface, None);
+        }
     }
 }
 
@@ -802,10 +961,20 @@ impl Controller {
 
     fn sync_pointer(&self, config: &Config) {
         use crate::platform::hook;
-        let enabled = self.engine.snapshot().enabled;
+        let snapshot = self.engine.snapshot();
+        let enabled = snapshot.enabled;
+        let suspended = |id: &str| snapshot.suspended_monitors.iter().any(|s| s == id);
         hook::configure(hook::Settings {
             targets: match (&self.backend, config.drag_modifier) {
-                (Some(backend), Some(_)) if enabled => backend.pointer_targets(),
+                (Some(backend), Some(_)) if enabled => backend
+                    .pointer_targets()
+                    .into_iter()
+                    .filter(|hwnd| {
+                        backend
+                            .window_for(*hwnd)
+                            .is_none_or(|id| !self.engine.window_protected(&id))
+                    })
+                    .collect(),
                 _ => HashSet::new(),
             },
             managed: match &self.backend {
@@ -814,11 +983,10 @@ impl Controller {
             },
             modifier: config.drag_modifier,
             moves: (enabled && config.focus_follows_mouse) || !self.revealed.is_empty(),
-            zones: self
-                .engine
-                .snapshot()
+            zones: snapshot
                 .monitors
                 .iter()
+                .filter(|m| !suspended(&m.monitor.id))
                 .flat_map(|m| {
                     let b = m.monitor.bounds;
                     let corner = Rect {
@@ -833,6 +1001,12 @@ impl Controller {
                     ]
                 })
                 .flatten()
+                .collect(),
+            suspended: snapshot
+                .monitors
+                .iter()
+                .filter(|m| suspended(&m.monitor.id))
+                .map(|m| m.monitor.bounds)
                 .collect(),
         });
     }
@@ -859,6 +1033,21 @@ impl Controller {
         backend.set_decorations(focused, border, corners);
     }
 
+    fn point_on_suspended(&self, x: i32, y: i32) -> bool {
+        let snapshot = self.engine.snapshot();
+        let (x, y) = (i64::from(x), i64::from(y));
+        snapshot.monitors.iter().any(|m| {
+            snapshot
+                .suspended_monitors
+                .iter()
+                .any(|id| id == &m.monitor.id)
+                && x >= i64::from(m.monitor.bounds.x)
+                && y >= i64::from(m.monitor.bounds.y)
+                && x < i64::from(m.monitor.bounds.x) + i64::from(m.monitor.bounds.width)
+                && y < i64::from(m.monitor.bounds.y) + i64::from(m.monitor.bounds.height)
+        })
+    }
+
     /// Reveal an unpinned bar at its monitor's top edge; hide it once the pointer leaves it.
     fn update_bars(&mut self, x: i32, y: i32, corner_active: bool) {
         if !self.top_bar {
@@ -874,6 +1063,16 @@ impl Controller {
         };
         for m in &self.engine.snapshot().monitors {
             let id = &m.monitor.id;
+            if self
+                .engine
+                .snapshot()
+                .suspended_monitors
+                .iter()
+                .any(|s| s == id)
+            {
+                self.revealed.remove(id);
+                continue;
+            }
             if self.bar_pinned(id) {
                 continue;
             }
@@ -924,7 +1123,11 @@ impl Controller {
                 return Ok(None);
             }
             // A title bar drag of a tiled window previews where it will land.
-            Raw::MoveSize { hwnd, start } => {
+            Raw::MoveSize {
+                hwnd,
+                start,
+                moving,
+            } => {
                 let snapshot = self.engine.snapshot();
                 if !start {
                     splitter::end_window(None, snapshot.enabled);
@@ -934,7 +1137,8 @@ impl Controller {
                     .and_then(|b| b.window_for(hwnd))
                     .filter(|id| snapshot.enabled && tiled(snapshot, id))
                 {
-                    splitter::begin_window(id, Some(hwnd));
+                    self.native_move = (moving == Some(true)).then(|| id.clone());
+                    splitter::begin_window(id, Some(hwnd), moving);
                 }
                 return Ok(None);
             }
@@ -969,7 +1173,7 @@ impl Controller {
                 } else if tiled(snapshot, &id) {
                     // Tiled windows stay put; the preview shows where the release drops them.
                     self.window_drag = true;
-                    splitter::begin_window(id, None);
+                    splitter::begin_window(id, None, None);
                 }
             }
             Raw::Up | Raw::Windows | Raw::MoveSize { .. } => unreachable!("handled above"),
@@ -992,11 +1196,17 @@ impl Controller {
                     return Ok(None);
                 }
                 self.update_bars(x, y, config.hot_corners);
+                if self.point_on_suspended(x, y) {
+                    return Ok(None);
+                }
                 let snapshot = self.engine.snapshot();
                 let corner = snapshot
                     .monitors
                     .iter()
-                    .find(|m| (m.monitor.bounds.x, m.monitor.bounds.y) == (x, y))
+                    .find(|m| {
+                        (m.monitor.bounds.x, m.monitor.bounds.y) == (x, y)
+                            && !snapshot.suspended_monitors.iter().any(|id| id == &m.monitor.id)
+                    })
                     .filter(|_| config.hot_corners && !pressed)
                     .map(|m| m.monitor.id.clone());
                 if corner.is_some() != self.in_corner {
@@ -1157,30 +1367,34 @@ fn position_controls(
     Ok(())
 }
 
-fn show_surface(
-    app: &tauri::AppHandle,
-    snapshot: &Snapshot,
-    surface: Surface,
+fn surface_monitor<'a>(
+    snapshot: &'a Snapshot,
     monitor_id: Option<&str>,
-    preview_session: Option<u64>,
-) -> Result<(), AppError> {
-    let window = app
-        .get_webview_window(surface.label())
-        .ok_or_else(|| error(ErrorCode::BackendUnavailable, "控制窗口不存在。"))?;
-    let monitor = match monitor_id {
-        Some(id) => Some(
-            snapshot
-                .monitors
-                .iter()
-                .find(|m| m.monitor.id == id)
-                .ok_or_else(|| error(ErrorCode::InvalidCommand, "目标显示器已断开。"))?,
-        ),
-        None => snapshot
+) -> Result<Option<&'a MonitorState>, AppError> {
+    match monitor_id {
+        Some(id) => snapshot
+            .monitors
+            .iter()
+            .find(|m| m.monitor.id == id)
+            .map(Some)
+            .ok_or_else(|| error(ErrorCode::InvalidCommand, "目标显示器已断开。")),
+        None => Ok(snapshot
             .monitors
             .iter()
             .find(|m| Some(&m.monitor.id) == snapshot.active_monitor.as_ref())
-            .or(snapshot.monitors.first()),
-    };
+            .or(snapshot.monitors.first())),
+    }
+}
+
+fn show_surface(
+    app: &tauri::AppHandle,
+    monitor: Option<&MonitorState>,
+    surface: Surface,
+    preview_session: Option<u64>,
+) -> Result<Option<String>, AppError> {
+    let window = app
+        .get_webview_window(surface.label())
+        .ok_or_else(|| error(ErrorCode::BackendUnavailable, "控制窗口不存在。"))?;
     if let Some(monitor) = monitor {
         let area = monitor.monitor.work_area;
         let rect = match surface {
@@ -1211,12 +1425,14 @@ fn show_surface(
         .and_then(|_| window.show())
         .and_then(|_| window.set_focus())
         .map_err(|e| error(ErrorCode::OperationDenied, e.to_string()))?;
+    let host = monitor.map(|m| m.monitor.id.clone());
     app.emit_to(
         surface.label(),
         "surface-opened",
-        serde_json::json!({ "monitorId": monitor.map(|m| &m.monitor.id), "previewSession": preview_session }),
+        serde_json::json!({ "monitorId": host, "previewSession": preview_session }),
     )
-    .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))
+    .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?;
+    Ok(host)
 }
 
 fn set_shortcut(
@@ -1393,15 +1609,16 @@ fn run_controller(
         }
         #[cfg(target_os = "windows")]
         {
+            controller.conceal_suspended_surfaces(&app);
             controller.sync_pointer(&shortcuts.config);
             let surface_open = [Surface::Overview, Surface::Commands].iter().any(|s| {
                 app.get_webview_window(s.label())
                     .and_then(|w| w.is_visible().ok())
                     .unwrap_or(false)
             });
-            controller.sync_edges(surface_open);
-            // Drags preview against the current layout (including row heights).
+            // Publish pause state before SYNC can inspect the configured strips.
             splitter::publish(controller.engine.clone());
+            controller.sync_edges(surface_open);
             controller.sync_decorations(&shortcuts.config);
         }
         let next_deadline = controller
@@ -1412,10 +1629,16 @@ fn run_controller(
             .recv_timeout(next_deadline.saturating_duration_since(Instant::now()))
         {
             Ok(Request::Shortcut(key)) => {
-                match shortcuts
-                    .action(&key)
-                    .and_then(|action| action.resolve(controller.engine.snapshot()))
+                let Some(action) = shortcuts.action(&key).cloned() else {
+                    continue;
+                };
+                let suspended = controller.engine.snapshot().suspended_monitors.clone();
+                if controller.foreground_on_paused_display()
+                    && crate::config::foreground_blocks_shortcut(&action, &suspended)
                 {
+                    continue;
+                }
+                match action.resolve(controller.engine.snapshot()) {
                     Some(ShortcutAction::Command { command }) => {
                         Ok(Request::Command(command, None))
                     }
@@ -1477,6 +1700,7 @@ fn run_controller(
                     // place it straight into its slot and skip adopting the native move.
                     if let Some(id) = &drop.carried {
                         controller.native_drag = None;
+                        controller.native_move = None;
                         controller.placements.remove(id);
                     }
                     // Moved windows slide into place; boundary drags resize once, unanimated.
@@ -1497,6 +1721,22 @@ fn run_controller(
                 }
             }
             Ok(Request::Show(surface, monitor_id)) => {
+                let host = match surface_monitor(&snapshot, monitor_id.as_deref()) {
+                    Ok(host) => host,
+                    Err(issue) => {
+                        controller.record(issue);
+                        continue;
+                    }
+                };
+                let suspended = controller.engine.snapshot().suspended_monitors.clone();
+                if crate::config::foreground_blocks_show(
+                    monitor_id.as_deref(),
+                    host.map(|m| m.monitor.id.as_str()),
+                    controller.foreground_on_paused_display(),
+                    &suspended,
+                ) {
+                    continue;
+                }
                 if let Err(issue) = controller.finish_animation() {
                     controller.record(issue);
                     continue;
@@ -1505,11 +1745,19 @@ fn run_controller(
                 let available =
                     matches!(surface, Surface::Overview) && controller.preview_capable();
                 let session = controller.preview_session.begin(available);
-                if let Err(issue) =
-                    show_surface(&app, &snapshot, surface, monitor_id.as_deref(), session)
-                {
-                    controller.clear_previews();
-                    controller.record(issue);
+                match show_surface(&app, host, surface, session) {
+                    Ok(host) => {
+                        controller.note_surface(surface, host);
+                        let other = match surface {
+                            Surface::Overview => Surface::Commands,
+                            Surface::Commands => Surface::Overview,
+                        };
+                        controller.note_surface(other, None);
+                    }
+                    Err(issue) => {
+                        controller.clear_previews();
+                        controller.record(issue);
+                    }
                 }
             }
             Ok(Request::Previews(session, slots, reply)) => {
@@ -1517,6 +1765,7 @@ fn run_controller(
                 let _ = reply.send(result);
             }
             Ok(Request::Dismiss(surface)) => {
+                controller.note_surface(surface, None);
                 if matches!(surface, Surface::Overview) {
                     controller.clear_previews();
                 }
@@ -1619,4 +1868,47 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Monitor;
+
+    #[test]
+    fn surface_gate_checks_the_selected_host_before_showing() {
+        let mut snapshot = Snapshot {
+            monitors: ["a", "b", "c"]
+                .into_iter()
+                .map(|id| MonitorState {
+                    monitor: Monitor {
+                        id: id.into(), name: id.into(), bounds: Rect::default(),
+                        work_area: Rect::default(), scale_factor: 1.0, primary: id == "a",
+                    },
+                    pages: vec![], active_page: String::new(), viewport: Rect::default(),
+                })
+                .collect(),
+            active_monitor: Some("a".into()),
+            suspended_monitors: vec!["a".into()],
+            ..Snapshot::default()
+        };
+        let blocked = |snapshot: &Snapshot, requested: Option<&str>, foreground_paused| {
+            let host = surface_monitor(snapshot, requested).unwrap();
+            crate::config::foreground_blocks_show(
+                requested, host.map(|m| m.monitor.id.as_str()), foreground_paused,
+                &snapshot.suspended_monitors,
+            )
+        };
+        // Native foreground moved to an ordinary unmanaged B window; layout still names A.
+        assert!(blocked(&snapshot, None, false));
+        assert!(!blocked(&snapshot, Some("b"), true));
+        assert!(blocked(&snapshot, Some("a"), false));
+        assert!(surface_monitor(&snapshot, Some("missing")).is_err());
+        // The first-monitor fallback must obey the same pause gate.
+        snapshot.active_monitor = Some("disconnected".into());
+        assert!(blocked(&snapshot, None, false));
+        snapshot.active_monitor = Some("b".into());
+        assert!(!blocked(&snapshot, None, false));
+        assert!(blocked(&snapshot, None, true));
+    }
 }

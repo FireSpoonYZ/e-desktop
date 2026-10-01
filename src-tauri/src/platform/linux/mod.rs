@@ -854,6 +854,10 @@ impl X11 {
                 continue;
             }
             let minimized = self.is_minimized(w)?;
+            // Same as macOS/Windows: a visible window is no longer manager-minimized.
+            if !minimized {
+                self.minimized.remove(&w);
+            }
             if attrs.map_state != MapState::VIEWABLE && !minimized && !self.saved.contains_key(&w) {
                 continue;
             }

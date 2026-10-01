@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     layout::{expand_gap, half_gap},
-    model::{MonitorState, NativeAction, Page, Rect, Snapshot},
+    model::{MonitorState, NativeAction, Page, Rect, Snapshot, WindowState},
 };
 
 /// Last successful native plans; minimized rectangles are logical (not moved by the backend).
@@ -21,6 +21,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 #[derive(Default)]
 pub struct Animation {
     plan: Option<Plan>,
+    /// `start` installed this plan and `restart` has not consumed it yet.
+    fresh: bool,
+    /// The next `start` explicitly requests focus while fullscreen already owns foreground.
+    user_focus: bool,
 }
 
 struct Plan {
@@ -30,6 +34,8 @@ struct Plan {
     moves: Vec<Move>,
     /// A window not yet fully inside its viewport is activated after its final placement.
     deferred: Vec<NativeAction>,
+    /// This activation was explicitly requested while fullscreen already owned foreground.
+    user_deferred: bool,
 }
 
 /// One window of a running animation, for backends that draw frames themselves (a compositor
@@ -123,14 +129,25 @@ impl Animation {
 
     /// Restart the clock from the frame on screen: preparing a compositor overlay can take a
     /// frame or two, which must not skip the fastest part of the ease-out curve.
+    /// A poll that kept the same plan is not a new ease (niri leaves an unchanged view-offset
+    /// target alone). No velocity is carried; a real retarget eases from the displayed frame.
     pub fn restart(&mut self, now: Instant) {
-        if let Some(plan) = &mut self.plan {
-            for m in &mut plan.moves {
-                m.from = m.current;
-            }
-            plan.started = now;
-            plan.next_frame = now + FRAME_INTERVAL.min(plan.duration);
+        if !self.fresh {
+            return;
         }
+        self.fresh = false;
+        let Some(plan) = &mut self.plan else {
+            return;
+        };
+        for m in &mut plan.moves {
+            m.from = m.current;
+        }
+        plan.started = now;
+        plan.next_frame = now + FRAME_INTERVAL.min(plan.duration);
+    }
+
+    pub fn started_fresh(&self) -> bool {
+        self.fresh
     }
 
     pub fn deferred_focus(&self) -> Option<&NativeAction> {
@@ -141,9 +158,74 @@ impl Animation {
             .find(|a| matches!(a, NativeAction::Focus { .. }))
     }
 
+    pub fn deferred_focus_id(&self) -> Option<&str> {
+        match self.deferred_focus() {
+            Some(NativeAction::Focus { window_id }) => Some(window_id),
+            _ => None,
+        }
+    }
+
+    /// Preserve a new explicit activation only if fullscreen already owns foreground.
+    /// An ordinary navigation request made before fullscreen begins must remain cancellable.
+    pub fn note_user_focus(&mut self, foreground_paused: bool) {
+        self.user_focus = foreground_paused;
+    }
+
+    pub fn clear_user_focus(&mut self) {
+        self.user_focus = false;
+    }
+
+    /// Drop a focus that is still waiting. The next `start` must not put it back.
+    pub fn discard_deferred_focus(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.deferred
+                .retain(|a| !matches!(a, NativeAction::Focus { .. }));
+            plan.user_deferred = false;
+        }
+    }
+
+    /// Drop pre-fullscreen activation; keep an explicit activation requested during fullscreen.
+    pub fn discard_stale_focus(&mut self) {
+        if self.plan.as_ref().is_some_and(|plan| plan.user_deferred) {
+            return;
+        }
+        self.discard_deferred_focus();
+    }
+
+    /// Frames a retarget may start from. Windows in the running plan contribute the displayed
+    /// frame even when the compositor has parked the HWND at its target or left the old one.
+    /// Anything else must still match the enumerated native rect, so a user resize outside the
+    /// animation settles at its target instead of easing from a stale plan.
+    pub fn retarget_from(&self, placements: &Placements, windows: &[WindowState]) -> Placements {
+        placements
+            .iter()
+            .filter(|(id, (rect, _, hidden))| {
+                self.animating(id)
+                    || windows.iter().any(|w| {
+                        &w.native.id == *id
+                            && if *hidden {
+                                w.native.minimized_by_manager
+                            } else {
+                                !w.native.minimized && w.native.rect == *rect
+                            }
+                    })
+            })
+            .map(|(id, plan)| (id.clone(), *plan))
+            .collect()
+    }
+
+    fn animating(&self, id: &str) -> bool {
+        self.plan.as_ref().is_some_and(|plan| {
+            plan.moves.iter().any(|m| {
+                matches!(&m.action, NativeAction::Placement { window_id, .. } if window_id == id)
+            })
+        })
+    }
+
     /// Taking the plan invalidates every remaining frame before a native Restore can run.
     /// Returns the exact final actions that were still pending.
     pub fn cancel(&mut self) -> Vec<NativeAction> {
+        self.fresh = false;
         self.plan.take().map_or_else(Vec::new, |plan| {
             plan.moves
                 .into_iter()
@@ -164,9 +246,10 @@ impl Animation {
         duration: Duration,
         now: Instant,
     ) -> Vec<NativeAction> {
+        let user = std::mem::take(&mut self.user_focus);
         // Enumeration during a slide often produces the same targets. Keep its clock and
         // frames instead of cancelling and restarting the easing curve at every refresh.
-        if let Some(plan) = self.plan.as_ref().filter(|plan| {
+        let keep = self.plan.as_ref().is_some_and(|plan| {
             next.enabled
                 && next.backend.capabilities.clipping
                 && plan.duration == duration
@@ -186,7 +269,25 @@ impl Animation {
                     .iter()
                     .filter(|a| matches!(a, NativeAction::Focus { .. }))
                     .all(|a| plan.deferred.contains(a))
-        }) {
+        });
+        if keep {
+            if user {
+                let requested = actions.iter().find_map(|a| match a {
+                    NativeAction::Focus { window_id } => Some(window_id.clone()),
+                    _ => None,
+                });
+                if let Some(plan) = self.plan.as_mut() {
+                    if requested.as_ref().is_some_and(|id| {
+                        plan.deferred.iter().any(|a| {
+                            matches!(a, NativeAction::Focus { window_id } if window_id == id)
+                        })
+                    }) {
+                        plan.user_deferred = true;
+                    }
+                }
+            }
+            self.fresh = false;
+            let plan = self.plan.as_ref().unwrap();
             return actions
                 .into_iter()
                 .filter(|a| {
@@ -196,6 +297,18 @@ impl Animation {
         }
         // A focus still waiting in the old plan must survive a retarget that brings none.
         let is_focus = |a: &NativeAction| matches!(a, NativeAction::Focus { .. });
+        let incoming_focus = actions.iter().find_map(|a| match a {
+            NativeAction::Focus { window_id } => Some(window_id.clone()),
+            _ => None,
+        });
+        let old_user_focus = self.plan.as_ref().and_then(|plan| {
+            plan.user_deferred.then(|| {
+                plan.deferred.iter().find_map(|a| match a {
+                    NativeAction::Focus { window_id } => Some(window_id.clone()),
+                    _ => None,
+                })
+            })?
+        });
         let carried = self.cancel().into_iter().rev().find(is_focus);
         if let Some(focus) = carried.filter(|_| !actions.iter().any(is_focus)) {
             actions.push(focus);
@@ -253,8 +366,16 @@ impl Animation {
             duration,
             next_frame: now + FRAME_INTERVAL.min(duration),
             moves,
+            user_deferred: deferred.iter().any(|a| match a {
+                NativeAction::Focus { window_id } => {
+                    incoming_focus.as_ref() == Some(window_id) && user
+                        || old_user_focus.as_ref() == Some(window_id)
+                }
+                _ => false,
+            }),
             deferred,
         });
+        self.fresh = true;
         now_actions
     }
 
@@ -273,6 +394,80 @@ impl Animation {
         let t = ease(elapsed.as_secs_f64() / plan.duration.as_secs_f64());
         plan.moves.iter_mut().map(|m| m.frame(t)).collect()
     }
+}
+
+/// While a deferred activation is in flight, ignore the foreground we left and any focus that
+/// is not a managed window. A different managed window is a real click and must reach reconcile.
+pub fn suppress_observed_focus(
+    deferred_target: Option<&str>,
+    enumerated: Option<&str>,
+    ignored_foreground: Option<&str>,
+    enumerated_is_managed: bool,
+) -> bool {
+    let Some(target) = deferred_target else {
+        return false;
+    };
+    !enumerated_is_managed
+        || enumerated.is_none_or(|id| id == target || ignored_foreground == Some(id))
+}
+
+/// Remember the foreground a deferred slide left behind. Cleared once that activation is gone.
+/// Only the plan that first defers records it. `None` is a real foreground (nothing focused), not
+/// "no anchor yet"; a later retarget must not fill that with the layout target.
+pub fn note_ignored_foreground(
+    ignored: &mut Option<String>,
+    fresh: bool,
+    already_deferred: bool,
+    deferred_target: Option<&str>,
+    observed_foreground: Option<String>,
+) {
+    if deferred_target.is_none() {
+        *ignored = None;
+        return;
+    }
+    if fresh && !already_deferred {
+        *ignored = observed_foreground;
+    }
+}
+
+/// One refresh of a running plan: displayed frames, same-target clock, deferred focus.
+/// Returns actions to present and whether `restart` should run (new plan only).
+pub fn poll_refresh(
+    animation: &mut Animation,
+    placements: &Placements,
+    prev: &Snapshot,
+    next: &Snapshot,
+    actions: Vec<NativeAction>,
+    enumerated_focus: Option<&str>,
+    ignored_foreground: Option<&str>,
+    duration: Duration,
+    now: Instant,
+) -> (Vec<NativeAction>, bool) {
+    let pending = animation.deferred_focus().cloned();
+    let target = animation.deferred_focus_id();
+    let adopt = target.is_some_and(|target| {
+        enumerated_focus.is_some_and(|id| {
+            id != target
+                && ignored_foreground != Some(id)
+                && next.focused_window.as_deref() == Some(id)
+        })
+    });
+    if adopt {
+        // Native focus is already the clicked window. Drop the slide's activation so the
+        // finishing frame cannot steal it back; do not emit another Focus (a palette or
+        // dialog must not be overridden either).
+        animation.discard_deferred_focus();
+    }
+    let mut actions: Vec<_> = actions
+        .into_iter()
+        .filter(|a| !matches!(a, NativeAction::Focus { .. }))
+        .collect();
+    if let Some(focus) = pending.filter(|_| !adopt) {
+        actions.push(focus);
+    }
+    let from = animation.retarget_from(placements, &next.windows);
+    let actions = animation.start(prev, next, &from, actions, duration, now);
+    (actions, animation.started_fresh())
 }
 
 /// Tiled windows only; floating and layout fullscreen windows settle immediately.
@@ -741,6 +936,127 @@ mod tests {
         }
     }
     #[test]
+    fn discarding_deferred_focus_keeps_the_placement_clock() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(&prev, engine.snapshot(), &applied, target.clone(), MS(160), now);
+        remember(&mut applied, &initial);
+        assert!(animation.deferred_focus_id().is_some());
+        let deadline = animation.deadline();
+        assert!(deadline.is_some());
+        animation.discard_deferred_focus();
+        assert!(animation.deferred_focus_id().is_none());
+        assert_eq!(animation.deadline(), deadline);
+        let placements: Vec<_> = target
+            .into_iter()
+            .filter(|action| !matches!(action, NativeAction::Focus { .. }))
+            .collect();
+        let (actions, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &prev,
+            engine.snapshot(),
+            placements,
+            None,
+            None,
+            MS(160),
+            now + MS(40),
+        );
+        assert!(!fresh);
+        assert!(actions.iter().all(|action| !matches!(action, NativeAction::Focus { .. })));
+        assert_eq!(animation.deadline(), deadline);
+    }
+
+    #[test]
+    fn a_paused_foreground_drops_only_the_focus_that_was_already_waiting() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        // Controller::run records foreground context before dispatch/start. A user command
+        // made before fullscreen begins must not gain a permanent activation exemption.
+        animation.note_user_focus(false);
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            target.clone(),
+            MS(160),
+            now,
+        );
+        remember(&mut applied, &initial);
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+        let deadline = animation.deadline();
+        animation.discard_stale_focus();
+        assert!(animation.deferred_focus_id().is_none());
+        let placements: Vec<_> = target
+            .iter()
+            .filter(|action| !matches!(action, NativeAction::Focus { .. }))
+            .cloned()
+            .collect();
+        let (actions, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &prev,
+            engine.snapshot(),
+            placements.clone(),
+            None,
+            None,
+            MS(160),
+            now + MS(40),
+        );
+        assert!(!fresh);
+        assert!(actions.iter().all(|action| !matches!(action, NativeAction::Focus { .. })));
+        assert_eq!(animation.deferred_focus_id(), None);
+        assert_eq!(animation.deadline(), deadline);
+
+        animation.note_user_focus(true);
+        let again = animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            target.clone(),
+            MS(160),
+            now + MS(48),
+        );
+        remember(&mut applied, &again);
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+        animation.discard_stale_focus();
+        assert_eq!(
+            animation.deferred_focus_id(),
+            Some("3"),
+            "explicit focus on the live monitor stays"
+        );
+        let (actions, _) = poll_refresh(
+            &mut animation,
+            &applied,
+            &prev,
+            engine.snapshot(),
+            placements,
+            None,
+            None,
+            MS(160),
+            now + MS(64),
+        );
+        assert!(actions.iter().all(|action| !matches!(action, NativeAction::Focus { .. })));
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+    }
+
+    #[test]
     fn polling_preserves_the_slide_clock_and_deferred_focus() {
         let (mut engine, mut applied) = fixture();
         let mut animation = Animation::default();
@@ -817,5 +1133,421 @@ mod tests {
         assert!(
             matches!(animation.frame(now + MS(192)).last(), Some(NativeAction::Focus { window_id }) if window_id == "2")
         );
+    }
+
+    fn placement_actions(actions: &[NativeAction]) -> Vec<NativeAction> {
+        actions
+            .iter()
+            .filter(|a| matches!(a, NativeAction::Placement { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn same_target_poll_keeps_the_clock_when_present_restarts() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            target.clone(),
+            MS(160),
+            now,
+        );
+        remember(&mut applied, &initial);
+        assert!(animation.started_fresh());
+        animation.restart(now + MS(20));
+        assert_eq!(
+            animation.deadline(),
+            Some(now + MS(20) + FRAME_INTERVAL.min(MS(160)))
+        );
+        assert!(!animation.started_fresh());
+        let running = animation.deadline();
+        animation.restart(now + MS(30));
+        assert_eq!(animation.deadline(), running, "restart is one-shot");
+
+        remember(&mut applied, &animation.frame(now + MS(52)));
+        let deadline = animation.deadline();
+        let native = engine
+            .snapshot()
+            .windows
+            .iter()
+            .find(|w| w.native.id == "0")
+            .unwrap()
+            .native
+            .rect;
+        assert_ne!(applied["0"].0, native);
+        let snapshot = engine.snapshot().clone();
+        let (_actions, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &snapshot,
+            &snapshot,
+            placement_actions(&target),
+            Some("0"),
+            Some("0"),
+            MS(160),
+            now + MS(60),
+        );
+        assert!(!fresh);
+        assert_eq!(animation.deadline(), deadline);
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+        animation.restart(now + MS(60));
+        assert_eq!(animation.deadline(), deadline);
+    }
+
+    #[test]
+    fn retarget_starts_from_displayed_frames_when_native_rects_differ() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        run(&mut engine, &mut animation, &mut applied, scroll(400), now);
+        remember(&mut applied, &animation.frame(now + MS(80)));
+        let mid = applied["0"].0;
+        let native = engine
+            .snapshot()
+            .windows
+            .iter()
+            .find(|w| w.native.id == "0")
+            .unwrap()
+            .native
+            .rect;
+        assert_ne!(mid, native);
+        let prev = engine.snapshot().clone();
+        let target = engine.dispatch(scroll(-300)).unwrap().actions;
+        let end = target.iter().find_map(|a| match a {
+            NativeAction::Placement {
+                window_id, rect, ..
+            } if window_id == "0" => Some(*rect),
+            _ => None,
+        });
+        assert_ne!(Some(mid), end);
+        let (initial, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &prev,
+            engine.snapshot(),
+            target,
+            None,
+            None,
+            MS(160),
+            now + MS(80),
+        );
+        assert!(fresh);
+        assert!(initial.iter().any(|a| {
+            matches!(a, NativeAction::Placement { window_id, rect, .. } if window_id == "0" && *rect == mid)
+        }));
+    }
+
+    #[test]
+    fn user_resize_outside_animation_is_not_a_displayed_frame() {
+        let (mut engine, applied) = fixture();
+        let mut mismatched = engine.snapshot().windows.clone();
+        for window in &mut mismatched {
+            window.native.rect.x += 40;
+        }
+        let from = Animation::default().retarget_from(&applied, &mismatched);
+        assert!(from.is_empty());
+        let mut matched = engine.snapshot().windows.clone();
+        for window in &mut matched {
+            if let Some((rect, _, hidden)) = applied.get(&window.native.id) {
+                window.native.rect = *rect;
+                window.native.minimized = *hidden;
+                window.native.minimized_by_manager = *hidden;
+            }
+        }
+        assert_eq!(
+            Animation::default().retarget_from(&applied, &matched).len(),
+            applied.len()
+        );
+        let prev = engine.snapshot().clone();
+        let target = engine.dispatch(scroll(300)).unwrap().actions;
+        let mut animation = Animation::default();
+        let initial = animation.start(
+            &prev,
+            engine.snapshot(),
+            &from,
+            target.clone(),
+            MS(160),
+            Instant::now(),
+        );
+        assert_eq!(json(initial), json(target));
+        assert!(animation.deadline().is_none());
+    }
+
+    #[test]
+    fn stale_foreground_keeps_deferred_focus_and_a_click_replaces_it() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            target.clone(),
+            MS(160),
+            now,
+        );
+        remember(&mut applied, &initial);
+        remember(&mut applied, &animation.frame(now + MS(32)));
+        let deadline = animation.deadline();
+        let snapshot = engine.snapshot().clone();
+        let actions = placement_actions(&target);
+        let (_kept, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &snapshot,
+            &snapshot,
+            actions.clone(),
+            Some("0"),
+            Some("0"),
+            MS(160),
+            now + MS(40),
+        );
+        assert!(!fresh);
+        assert_eq!(animation.deadline(), deadline);
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+        animation.restart(now + MS(40));
+        assert_eq!(animation.deadline(), deadline);
+
+        // Enumerated focus changed, but reconcile left the slide target in place.
+        let (_kept, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &snapshot,
+            &snapshot,
+            actions.clone(),
+            Some("1"),
+            Some("0"),
+            MS(160),
+            now + MS(48),
+        );
+        assert!(!fresh);
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+
+        let mut clicked = snapshot.clone();
+        clicked.focused_window = Some("1".into());
+        let (replaced, fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &snapshot,
+            &clicked,
+            actions,
+            Some("1"),
+            Some("0"),
+            MS(160),
+            now + MS(56),
+        );
+        assert!(!fresh);
+        assert_eq!(animation.deadline(), deadline);
+        assert!(animation.deferred_focus_id().is_none());
+        assert!(
+            !replaced
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { window_id } if window_id == "3"))
+        );
+        assert!(
+            !animation
+                .frame(now + MS(400))
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { window_id } if window_id == "3"))
+        );
+    }
+
+    #[test]
+    fn deferred_focus_ignores_only_the_foreground_it_left() {
+        assert!(!suppress_observed_focus(None, Some("0"), Some("0"), true));
+        assert!(suppress_observed_focus(
+            Some("3"),
+            Some("0"),
+            Some("0"),
+            true
+        ));
+        assert!(suppress_observed_focus(
+            Some("3"),
+            Some("3"),
+            Some("0"),
+            true
+        ));
+        assert!(suppress_observed_focus(Some("3"), None, Some("0"), true));
+        assert!(suppress_observed_focus(
+            Some("3"),
+            Some("1"),
+            Some("0"),
+            false
+        ));
+        assert!(!suppress_observed_focus(
+            Some("3"),
+            Some("1"),
+            Some("0"),
+            true
+        ));
+        assert!(!suppress_observed_focus(Some("3"), Some("0"), None, true));
+
+        let mut ignored = None;
+        note_ignored_foreground(&mut ignored, true, false, Some("3"), Some("0".into()));
+        assert_eq!(ignored.as_deref(), Some("0"));
+        note_ignored_foreground(&mut ignored, true, true, Some("4"), Some("3".into()));
+        assert_eq!(
+            ignored.as_deref(),
+            Some("0"),
+            "retarget keeps the original foreground"
+        );
+        note_ignored_foreground(&mut ignored, false, true, Some("4"), Some("9".into()));
+        assert_eq!(ignored.as_deref(), Some("0"));
+        note_ignored_foreground(&mut ignored, true, true, None, Some("3".into()));
+        assert_eq!(ignored, None);
+    }
+
+    #[test]
+    fn native_foreground_anchors_a_deferred_slide_not_the_layout_focus() {
+        // Layout focus is "0". Native foreground is already "1". The command defers "3".
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        assert_eq!(engine.snapshot().focused_window.as_deref(), Some("0"));
+        let already_deferred = animation.deferred_focus_id().is_some();
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            target.clone(),
+            MS(160),
+            now,
+        );
+        remember(&mut applied, &initial);
+        let mut ignored = None;
+        note_ignored_foreground(
+            &mut ignored,
+            animation.started_fresh(),
+            already_deferred,
+            animation.deferred_focus_id(),
+            Some("1".into()),
+        );
+        assert_eq!(ignored.as_deref(), Some("1"));
+        assert_ne!(
+            ignored.as_deref(),
+            engine.snapshot().focused_window.as_deref()
+        );
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+
+        remember(&mut applied, &animation.frame(now + MS(32)));
+        let deadline = animation.deadline();
+        let snapshot = engine.snapshot().clone();
+        let actions = placement_actions(&target);
+        for at in [MS(40), MS(48)] {
+            let (_kept, fresh) = poll_refresh(
+                &mut animation,
+                &applied,
+                &snapshot,
+                &snapshot,
+                actions.clone(),
+                Some("1"),
+                ignored.as_deref(),
+                MS(160),
+                now + at,
+            );
+            assert!(!fresh);
+            assert_eq!(animation.deadline(), deadline);
+            assert_eq!(animation.deferred_focus_id(), Some("3"));
+        }
+        animation.restart(now + MS(48));
+        assert_eq!(animation.deadline(), deadline);
+
+        // A later real activation still cancels the deferred slide.
+        let mut clicked = snapshot.clone();
+        clicked.focused_window = Some("2".into());
+        let (replaced, _fresh) = poll_refresh(
+            &mut animation,
+            &applied,
+            &snapshot,
+            &clicked,
+            actions,
+            Some("2"),
+            ignored.as_deref(),
+            MS(160),
+            now + MS(56),
+        );
+        assert!(animation.deferred_focus_id().is_none());
+        assert!(
+            !replaced
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { window_id } if window_id == "3"))
+        );
+        assert!(
+            !animation
+                .frame(now + MS(400))
+                .iter()
+                .any(|a| matches!(a, NativeAction::Focus { window_id } if window_id == "3"))
+        );
+
+        // No managed foreground is itself the anchor. A fresh retarget must not replace it
+        // with the layout target.
+        let mut animation = Animation::default();
+        let (mut engine, mut applied) = fixture();
+        let already_deferred = animation.deferred_focus_id().is_some();
+        let prev = engine.snapshot().clone();
+        let target = engine
+            .dispatch(Command::FocusWindow {
+                window_id: "3".into(),
+            })
+            .unwrap()
+            .actions;
+        let initial = animation.start(&prev, engine.snapshot(), &applied, target, MS(160), now);
+        remember(&mut applied, &initial);
+        let mut ignored = None;
+        note_ignored_foreground(
+            &mut ignored,
+            animation.started_fresh(),
+            already_deferred,
+            animation.deferred_focus_id(),
+            None,
+        );
+        assert!(ignored.is_none());
+        let already_deferred = animation.deferred_focus_id().is_some();
+        assert!(already_deferred);
+        let prev = engine.snapshot().clone();
+        let retarget = engine.dispatch(scroll(-200)).unwrap().actions;
+        animation.start(
+            &prev,
+            engine.snapshot(),
+            &applied,
+            retarget,
+            MS(160),
+            now + MS(16),
+        );
+        assert!(animation.started_fresh(), "retarget installs a new plan");
+        assert_eq!(animation.deferred_focus_id(), Some("3"));
+        note_ignored_foreground(
+            &mut ignored,
+            animation.started_fresh(),
+            already_deferred,
+            animation.deferred_focus_id(),
+            Some(engine.snapshot().focused_window.clone().unwrap()),
+        );
+        assert!(ignored.is_none());
     }
 }

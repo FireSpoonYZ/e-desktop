@@ -1,27 +1,27 @@
-//! "Always fill" strip geometry and column-boundary drags. Pure functions shared by the
-//! engine and the Windows drag preview, so the preview is exactly what a drop applies.
-//! Positions are offsets inside a viewport of width `view`; `x` is the page scroll.
+//! Column scroll limits and boundary drags. Pure functions shared by the engine and the
+//! Windows drag preview, so the preview is exactly what a drop applies. Positions are
+//! offsets inside a viewport of width `view`; `x` is the page scroll. Columns keep the
+//! widths they were given: nothing here stretches them to cover the viewport.
 
-/// Widen the columns proportionally when together they are narrower than the viewport.
-pub fn fill(widths: &mut [u32], view: u32) {
-    let extent: u64 = widths.iter().map(|&w| u64::from(w)).sum();
-    if widths.is_empty() || extent >= u64::from(view) {
-        return;
-    }
-    // Cumulative rounding: the last boundary lands exactly on `view`.
-    let (mut cumulative, mut previous) = (0u64, 0u64);
-    for w in widths.iter_mut() {
-        cumulative += u64::from(*w);
-        let boundary = u64::from(view) * cumulative / extent.max(1);
-        *w = ((boundary - previous) as u32).max(1);
-        previous = boundary;
-    }
-}
-
-/// No empty space at either end: 0 ..= extent - view.
+/// Default scroll: no gap before the first column or after the last.
+/// `0 ..= max(0, extent - view)`.
 pub fn clamp_x(widths: &[u32], view: u32, x: i64) -> i64 {
     let extent: i64 = widths.iter().map(|&w| i64::from(w)).sum();
     x.clamp(0, (extent - i64::from(view)).max(0))
+}
+
+/// Like `clamp_x`, but also allows the gaps `CenterFocused` and an off-screen queue need:
+/// centering any column, or parking one column just outside either screen edge.
+pub fn clamp_x_relaxed(widths: &[u32], view: u32, x: i64) -> i64 {
+    let view_i = i64::from(view);
+    if widths.is_empty() {
+        return 0;
+    }
+    let extent: i64 = widths.iter().map(|&w| i64::from(w)).sum();
+    // Keep at least an end column on screen, even after explicit centering or edge queuing.
+    let lo = (i64::from(widths[0]) - view_i).min(0);
+    let hi = (extent - i64::from(*widths.last().unwrap())).max(0);
+    x.clamp(lo, hi)
 }
 
 /// Scroll positions that align a column edge with the left or right screen edge.
@@ -44,21 +44,18 @@ fn stops(widths: &[u32], view: u32) -> Vec<i64> {
 /// Scroll by `delta`, then settle on the nearest aligned position; a nonzero scroll that
 /// would settle back where it started moves one stop further in its direction.
 pub fn snap_scroll(widths: &[u32], view: u32, x: i64, delta: i64) -> i64 {
-    let stops = stops(widths, view);
+    if delta == 0 {
+        return x;
+    }
+    let stops: Vec<_> = stops(widths, view)
+        .into_iter()
+        .filter(|&stop| if delta > 0 { stop > x } else { stop < x })
+        .collect();
     let target = x + delta;
-    let nearest = *stops
+    *stops
         .iter()
         .min_by_key(|s| (*s - target).abs())
-        .unwrap_or(&0);
-    if nearest != x || delta == 0 {
-        return nearest;
-    }
-    let next = if delta > 0 {
-        stops.iter().find(|s| **s > x)
-    } else {
-        stops.iter().rev().find(|s| **s < x)
-    };
-    next.copied().unwrap_or(x)
+        .unwrap_or(&x)
 }
 
 /// Offset of boundary `edge` (0 = left of the first column) inside the viewport.
@@ -86,7 +83,7 @@ pub fn snapped(target: i64, size: i64, snap: i64) -> i64 {
 /// snaps onto the screen edges and the middle (see `snapped`). A boundary between two columns
 /// that started clear of a screen edge's snap zone and is dropped onto that edge squeezes:
 /// the column on the far side takes the whole screen and everything it passed is pushed off
-/// screen, keeping its width. Returns the filled widths and clamped scroll.
+/// screen, keeping its width. Returns the widths and clamped scroll; nothing is stretched to fill the view.
 pub fn drag_edge(
     widths: &[u32],
     view: u32,
@@ -109,7 +106,7 @@ pub fn drag_edge(
         let keep = if target == 0 { edge } else { edge - 1 };
         widths[keep] = view;
         let x = edge_position(&widths, 0, keep);
-        return (widths.clone(), clamp_x(&widths, view, x));
+        return (widths.clone(), clamp_x_relaxed(&widths, view, x));
     }
     let left_full = edge > 0 && edge_position(&widths, x, edge - 1) >= 0;
     let right_full = edge < n && edge_position(&widths, x, edge + 1) <= view_i;
@@ -133,7 +130,7 @@ pub fn drag_edge(
         hi = hi.min(w - min);
     }
     if lo > hi {
-        let x = clamp_x(&widths, view, x);
+        let x = clamp_x_relaxed(&widths, view, x);
         return (widths, x);
     }
     let d = (target - p).clamp(lo, hi);
@@ -147,8 +144,7 @@ pub fn drag_edge(
             x -= d; // The left side slides with the dragged edge.
         }
     }
-    fill(&mut widths, view);
-    let x = clamp_x(&widths, view, x);
+    let x = clamp_x_relaxed(&widths, view, x);
     (widths, x)
 }
 
@@ -157,21 +153,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fill_widens_proportionally_and_exactly() {
-        let mut w = vec![500];
-        fill(&mut w, 1000);
-        assert_eq!(w, [1000]);
-        let mut w = vec![300, 100];
-        fill(&mut w, 1000);
-        assert_eq!(w, [750, 250]);
-        let mut w = vec![1, 1, 1];
-        fill(&mut w, 1000);
-        assert_eq!(w.iter().sum::<u32>(), 1000);
-        let mut w = vec![600, 600];
-        fill(&mut w, 1000);
-        assert_eq!(w, [600, 600]);
+    fn narrow_columns_are_not_widened_and_default_scroll_has_no_edge_gap() {
+        let w = [600, 600];
         assert_eq!(clamp_x(&w, 1000, -50), 0);
         assert_eq!(clamp_x(&w, 1000, 900), 200);
+        // Centering the first column needs a leading gap; relaxed scroll keeps it.
+        // The lower bound is also wide enough to park a column just off the right edge.
+        assert_eq!(clamp_x_relaxed(&w, 1000, -200), -200);
+        assert_eq!(clamp_x_relaxed(&w, 1000, -50_000), -400);
     }
 
     #[test]
@@ -245,11 +234,11 @@ mod tests {
     }
 
     #[test]
-    fn widths_stay_above_the_minimum_and_the_screen_stays_filled() {
+    fn widths_stay_above_the_minimum_and_a_lone_column_can_shrink() {
         let (w, x) = drag_edge(&[500, 500], 1000, 0, 1, 900, 0);
         assert_eq!((w, x), (vec![900, 100], 0));
-        // Shrinking the only column refills it.
+        // A lone column keeps the dragged width; it is not stretched back to the view.
         let (w, x) = drag_edge(&[1000], 1000, 0, 1, -300, 0);
-        assert_eq!((w, x), (vec![1000], 0));
+        assert_eq!((w, x), (vec![700], 0));
     }
 }

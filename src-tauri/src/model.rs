@@ -158,6 +158,11 @@ pub struct Snapshot {
     pub gaps: u32,
     /// Layout and overview animation length; 0 disables animations.
     pub animation_duration_ms: u32,
+    /// Monitors paused while a foreign window covers the full display.
+    /// Not layout fullscreen, not a maximized work-area window, and not a
+    /// rectangle this manager itself just placed. Empty when nothing is covered.
+    #[serde(default)]
+    pub suspended_monitors: Vec<MonitorId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,7 +238,7 @@ pub enum Command {
     },
     /// Pointer drop at a physical screen point: a tiled window joins the column under it,
     /// or becomes a new column when dropped on a column's outer quarter or empty space. Near
-    /// the left/right screen edge it queues as a column just off screen on that side.
+    /// the left/right screen edge it becomes a column scrolled fully on screen on that side.
     DropWindow {
         window_id: WindowId,
         x: i32,
@@ -241,7 +246,7 @@ pub enum Command {
     },
     /// Drag the boundary left of column `edge` on the monitor's active page by `delta`
     /// physical pixels (`edge` = column count is the right end). Neighbours give or take the
-    /// width, cut columns slide, the edge snaps onto screen edges; the page stays filled.
+    /// width, cut columns slide, and the edge snaps onto screen edges without auto-filling.
     DragEdge {
         monitor_id: MonitorId,
         edge: u32,

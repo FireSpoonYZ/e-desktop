@@ -77,6 +77,8 @@ export interface Snapshot {
   gaps: number;
   /** 概览开合动画时长（毫秒）；0 禁用。 */
   animationDurationMs: number;
+  /** Monitors paused while a foreign window covers the full display. */
+  suspendedMonitors: MonitorId[];
 }
 export type Direction = 'left' | 'right' | 'up' | 'down';
 export type Command =
@@ -135,4 +137,5 @@ export const emptySnapshot: Snapshot = {
   },
   monitors: [], windows: [], focusedWindow: null, activeMonitor: null, errors: [],
   pinnedBars: [], barsAutohide: false, gaps: 0, animationDurationMs: 0,
+  suspendedMonitors: [],
 };

@@ -55,6 +55,10 @@ fn stacked_engine() -> Engine {
         e.snapshot.monitors[0].pages[0].columns[0].windows,
         ["2", "1", "3"]
     );
+    // The stack used to become full-width only because narrow columns were stretched.
+    // Keep that fixture width explicitly; auto-fill is gone.
+    let width = e.snapshot.monitors[0].viewport.width;
+    e.snapshot.monitors[0].pages[0].columns[0].width = width;
     e
 }
 
@@ -312,11 +316,28 @@ fn sizing_handles_maximum_viewport_dimensions_without_overflow() {
     e.reconcile(native).unwrap();
     e.dispatch(Command::SetColumnWidth { width: u32::MAX })
         .unwrap();
-    // A lone column always fills the viewport, whatever the requested width.
-    for delta in [i32::MAX, i32::MIN, i32::MIN, i32::MAX] {
-        let t = e.dispatch(Command::AdjustColumnWidth { delta }).unwrap();
-        assert_eq!(placement(&t.actions, "1").0.width, u32::MAX);
-    }
+    // Width is clamped to the viewport. i32::MIN cannot jump a u32::MAX column to 1 in one step,
+    // and the column is not stretched back to the viewport afterwards.
+    let t = e
+        .dispatch(Command::AdjustColumnWidth { delta: i32::MAX })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.width, u32::MAX);
+    let t = e
+        .dispatch(Command::AdjustColumnWidth { delta: i32::MIN })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.width, 2147483647);
+    let t = e
+        .dispatch(Command::AdjustColumnWidth { delta: i32::MIN })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.width, 1);
+    let t = e
+        .dispatch(Command::AdjustColumnWidth { delta: i32::MAX })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.width, 2147483648);
+    let t = e
+        .dispatch(Command::AdjustColumnWidth { delta: i32::MAX })
+        .unwrap();
+    assert_eq!(placement(&t.actions, "1").0.width, u32::MAX);
     for delta in [i32::MAX, i32::MIN, i32::MIN, i32::MAX] {
         let t = e.dispatch(Command::AdjustWindowHeight { delta }).unwrap();
         assert_column_coverage(&e, &t.actions);
@@ -717,8 +738,8 @@ fn focus_scroll_clipping_and_independent_monitors() {
     e.reconcile(system()).unwrap(); // Actual focus changes to 1; follows it into view.
     assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
     e.dispatch(Command::CenterFocused).unwrap();
-    // The strip never leaves empty space, so centering the first column is clamped.
-    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+    // Explicit centering of the leading narrow column leaves a gap. Default scroll does not.
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, -300);
     e.dispatch(Command::FocusDirection {
         direction: Direction::Right,
     })
@@ -975,7 +996,7 @@ fn assert_hotplug_consistent(e: &Engine) {
             }
             assert_eq!(
                 page.viewport_x,
-                clamp_scroll(page, monitor.viewport.width, page.viewport_x as i64)
+                clamp_scroll_relaxed(page, monitor.viewport.width, page.viewport_x as i64)
             );
             for column in &page.columns {
                 assert!(!column.windows.is_empty());
@@ -1545,7 +1566,7 @@ fn active_layout(e: &Engine, m: usize) -> (Vec<Vec<String>>, i32) {
 }
 
 #[test]
-fn drops_on_a_screen_edge_queue_the_window_off_screen() {
+fn drops_on_a_screen_edge_reveal_the_window_on_that_side() {
     // Monitor a (x 0..1200): columns 1, 2, 3 of 600 px; 1 and 2 on screen.
     let mut e = engine();
     let drop = |e: &mut Engine, id: &str, x: i32| {
@@ -1557,18 +1578,89 @@ fn drops_on_a_screen_edge_queue_the_window_off_screen() {
         .unwrap()
     };
     let t = drop(&mut e, "2", 1190);
-    assert_eq!(active_layout(&e, 0), (vec![vec!["1".into()], vec!["3".into()], vec!["2".into()]], 0));
-    assert!(placement(&t.actions, "2").2, "queued past the right edge");
-    // The focused window queued on the left: focus stays on screen.
+    assert_eq!(
+        active_layout(&e, 0),
+        (vec![vec!["1".into()], vec!["3".into()], vec!["2".into()]], 600)
+    );
+    assert!(e.snapshot.monitors[0].pages[0].columns.iter().all(|c| c.width == 600));
+    let (rect, _, minimized) = placement(&t.actions, "2");
+    assert!(!minimized);
+    assert_eq!(rect.x + rect.width as i32, 1200, "right edge flush with the screen");
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    // Left band scrolls the other way and focuses the dropped window.
     let t = drop(&mut e, "1", 10);
     assert_eq!(active_layout(&e, 0).0, [["1"], ["3"], ["2"]]);
-    assert_eq!(active_layout(&e, 0).1, 600);
-    assert!(placement(&t.actions, "1").2);
-    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
-    // Onto another monitor's edge: a lone column there widens to keep the queue off screen.
+    assert_eq!(active_layout(&e, 0).1, 0);
+    let (rect, _, minimized) = placement(&t.actions, "1");
+    assert!(!minimized && rect.x == 0);
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+    // Onto another monitor's right edge. Widths stay half; that monitor shows the new
+    // column and the source monitor's scroll and remaining widths stay put.
     drop(&mut e, "3", -10);
-    assert_eq!(active_layout(&e, 1), (vec![vec!["4".into()], vec!["3".into()]], 0));
-    assert_eq!(e.snapshot.monitors[1].pages[0].columns[0].width, 1200);
+    assert_eq!(
+        active_layout(&e, 1),
+        (vec![vec!["4".into()], vec!["3".into()]], 0)
+    );
+    assert_eq!(e.snapshot.monitors[1].pages[0].columns[0].width, 600);
+    assert_eq!(e.snapshot.monitors[1].pages[0].columns[1].width, 600);
+    let (rect, _, minimized) = placement(&e.placements().unwrap(), "3");
+    assert!(!minimized);
+    assert_eq!(rect.x + rect.width as i32, 0);
+    assert_eq!(active_layout(&e, 0), (vec![vec!["1".into()], vec!["2".into()]], 0));
+    assert!(e.snapshot.monitors[0].pages[0].columns.iter().all(|c| c.width == 600));
+}
+
+#[test]
+fn full_width_column_drag_shrinks_without_dropping_a_real_minimum() {
+    let width_x = |e: &Engine| {
+        let page = &e.snapshot.monitors[0].pages[0];
+        (page.columns[0].width, page.viewport_x)
+    };
+    let drag = |e: &mut Engine, edge, delta| {
+        e.dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge,
+            delta,
+        })
+        .unwrap();
+    };
+    let mut e = stacked_engine();
+    let view = e.snapshot.monitors[0].viewport.width;
+    assert_eq!(width_x(&e).0, view);
+    // Right edge released on the middle snap.
+    drag(&mut e, 1, -((view / 2) as i32));
+    assert_eq!(width_x(&e), (view / 2, 0));
+    // Left edge, same snap, column stays fully on screen flush right.
+    let mut e = stacked_engine();
+    drag(&mut e, 0, (view / 2) as i32);
+    assert_eq!(width_x(&e), (view / 2, -((view / 2) as i32)));
+    // Short of the screen-edge snap (view/12 == 100): cleanup must not restore `view`.
+    let mut e = stacked_engine();
+    drag(&mut e, 1, -200);
+    assert_eq!(width_x(&e), (view - 200, 0));
+    let mut e = stacked_engine();
+    drag(&mut e, 0, 200);
+    assert_eq!(width_x(&e), (view - 200, -200));
+    // Genuine recorded minimum: the gesture moves, cleanup clamps, and a min past the
+    // viewport still pins the column at the viewport.
+    let mut e = stacked_engine();
+    e.set_min_widths(BTreeMap::from([("1".into(), view - 50)]));
+    drag(&mut e, 1, -((view / 2) as i32));
+    assert_eq!(width_x(&e).0, view - 50);
+    let mut e = stacked_engine();
+    e.set_min_widths(BTreeMap::from([("1".into(), view + 500)]));
+    drag(&mut e, 1, -((view / 2) as i32));
+    assert_eq!(width_x(&e).0, view);
+    // Shared boundary between two on-screen columns still trades width.
+    let mut e = engine();
+    drag(&mut e, 1, 80);
+    let widths: Vec<_> = e.snapshot.monitors[0].pages[0]
+        .columns
+        .iter()
+        .map(|c| c.width)
+        .collect();
+    assert_eq!(widths, vec![680, 520, 600]);
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
 }
 
 #[test]
@@ -1646,4 +1738,543 @@ fn refresh_with_deferred_activation_keeps_the_slide_target() {
     e.reconcile(system()).unwrap();
     assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
     assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+}
+
+fn native_of(e: &Engine) -> SystemSnapshot {
+    SystemSnapshot {
+        monitors: e
+            .snapshot
+            .monitors
+            .iter()
+            .map(|m| m.monitor.clone())
+            .collect(),
+        windows: e
+            .snapshot
+            .windows
+            .iter()
+            .map(|w| w.native.clone())
+            .collect(),
+        focused_window: e.snapshot.focused_window.clone(),
+    }
+}
+
+fn set_minimized(e: &mut Engine, id: &str, minimized: bool, by_manager: bool) {
+    let mut native = native_of(e);
+    let window = native.windows.iter_mut().find(|w| w.id == id).unwrap();
+    window.minimized = minimized;
+    window.minimized_by_manager = by_manager && minimized;
+    e.reconcile(native).unwrap();
+}
+
+#[test]
+fn floating_focus_minimize_and_column_widths_follow_niri() {
+    let mut e = engine();
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    let t = e
+        .dispatch(Command::FocusWindow {
+            window_id: "4".into(),
+        })
+        .unwrap();
+    assert!(e.snapshot.windows[e.window_index("1").unwrap()].fullscreen);
+    assert!(
+        !placement(&t.actions, "4").2,
+        "floating covers layout fullscreen"
+    );
+    assert!(placement(&t.actions, "2").2);
+
+    let widths: Vec<_> = e.snapshot.monitors[0].pages[0]
+        .columns
+        .iter()
+        .map(|c| c.width)
+        .collect();
+    set_minimized(&mut e, "2", true, false);
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0]
+            .columns
+            .iter()
+            .map(|c| c.width)
+            .collect::<Vec<_>>(),
+        vec![widths[0], widths[2]]
+    );
+    assert!(
+        e.location("2").is_err(),
+        "user minimize leaves the active strip"
+    );
+    assert!(
+        e.snapshot.windows[e.window_index("2").unwrap()]
+            .native
+            .minimized
+    );
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    for command in [
+        Command::FocusDirection {
+            direction: Direction::Right,
+        },
+        Command::SlideColumn {
+            direction: Direction::Right,
+        },
+        Command::Scroll {
+            monitor_id: "a".into(),
+            delta: 300,
+        },
+        Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: 40,
+        },
+    ] {
+        e.dispatch(command).unwrap();
+        assert!(
+            e.snapshot.windows[e.window_index("2").unwrap()]
+                .native
+                .minimized
+        );
+        assert_ne!(e.snapshot.focused_window.as_deref(), Some("2"));
+    }
+    set_minimized(&mut e, "2", false, false);
+    let (m, _, Some((c, row))) = e.location("2").unwrap() else {
+        panic!("restored into a column");
+    };
+    assert_eq!((m, c, row), (0, 1, 0));
+    assert_eq!(e.snapshot.monitors[0].pages[0].columns[1].width, widths[1]);
+
+    set_minimized(&mut e, "3", true, true);
+    assert!(
+        e.location("3").is_ok(),
+        "manager-hidden windows stay in the column"
+    );
+
+    let mut stacked = stacked_engine();
+    stacked
+        .dispatch(Command::AdjustWindowHeight { delta: 80 })
+        .unwrap();
+    let weight = stacked.height_weights.get("1").copied();
+    let page = stacked.snapshot.monitors[0].active_page.clone();
+    for id in ["2", "1", "3"] {
+        set_minimized(&mut stacked, id, true, false);
+    }
+    assert!(
+        stacked.snapshot.monitors[0]
+            .pages
+            .iter()
+            .any(|p| p.id == page)
+    );
+    assert!(
+        stacked.snapshot.monitors[0]
+            .pages
+            .iter()
+            .find(|p| p.id == page)
+            .unwrap()
+            .columns
+            .is_empty()
+    );
+    let tail = stacked.snapshot.monitors[0]
+        .pages
+        .last()
+        .unwrap()
+        .id
+        .clone();
+    stacked
+        .dispatch(Command::SwitchPage {
+            monitor_id: "a".into(),
+            page_id: tail,
+        })
+        .unwrap();
+    stacked
+        .dispatch(Command::SwitchPage {
+            monitor_id: "a".into(),
+            page_id: page.clone(),
+        })
+        .unwrap();
+    for id in ["3", "2", "1"] {
+        set_minimized(&mut stacked, id, false, false);
+    }
+    assert_eq!(
+        stacked.snapshot.monitors[0]
+            .pages
+            .iter()
+            .find(|p| p.id == page)
+            .unwrap()
+            .columns[0]
+            .windows,
+        ["2", "1", "3"]
+    );
+    assert_eq!(stacked.height_weights.get("1").copied(), weight);
+
+    let mut e = engine();
+    e.dispatch(Command::CenterFocused).unwrap();
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, -300);
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::CenterFocused).unwrap();
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 900);
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+    e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+    e.dispatch(Command::SetColumnWidth { width: 600 }).unwrap();
+    assert_eq!(e.snapshot.monitors[0].pages[0].columns[0].width, 600);
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0].viewport_x, 0,
+        "100% to 50% uses minimum scroll, not centering"
+    );
+    e.dispatch(Command::SetColumnWidth { width: 800 }).unwrap();
+    let (_, clip, minimized) = placement(&e.placements().unwrap(), "2");
+    assert!(
+        !minimized && clip.is_some(),
+        "a partial neighbour stays visible"
+    );
+
+    let mut e = engine();
+    let command = Command::DragEdge {
+        monitor_id: "a".into(),
+        edge: 1,
+        delta: 80,
+    };
+    let mut preview = e.clone();
+    preview.dispatch(command.clone()).unwrap();
+    let scene = e.scene(command.clone(), "a", &[]).unwrap();
+    e.dispatch(command).unwrap();
+    assert_eq!(
+        preview.snapshot.monitors[0].pages[0].viewport_x,
+        e.snapshot.monitors[0].pages[0].viewport_x
+    );
+    assert_eq!(
+        preview.snapshot.monitors[0].pages[0]
+            .columns
+            .iter()
+            .map(|c| c.width)
+            .collect::<Vec<_>>(),
+        e.snapshot.monitors[0].pages[0]
+            .columns
+            .iter()
+            .map(|c| c.width)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(scene.tiles.len(), 2);
+}
+
+#[test]
+fn floating_popup_on_fullscreen_page_keeps_tiling_and_viewport() {
+    let mut e = engine();
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    let before = serde_json::to_value(&e.snapshot.monitors[0]).unwrap();
+    let mut native = native_of(&e);
+    let mut popup = native.windows[0].clone();
+    popup.id = "popup".into();
+    popup.resizable = false;
+    native.windows.push(popup);
+    native.focused_window = Some("popup".into());
+    let t = e.reconcile(native).unwrap();
+    assert!(e.snapshot.windows[e.window_index("1").unwrap()].fullscreen);
+    assert_eq!(placement(&t.actions, "1").0.width, 1200);
+    assert!(!placement(&t.actions, "popup").2);
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0].viewport_x,
+        before["pages"][0]["viewportX"].as_i64().unwrap() as i32
+    );
+    assert_eq!(
+        serde_json::to_value(&e.snapshot.monitors[0].pages[0].columns).unwrap(),
+        before["pages"][0]["columns"]
+    );
+}
+
+#[test]
+fn centered_drag_preserves_its_anchor_and_scroll_never_reverses() {
+    let (widths, x) = edges::drag_edge(&[600], 1200, -300, 1, 40, 0);
+    assert_eq!((widths, x), (vec![640], -300));
+    assert_eq!(edges::snap_scroll(&[600], 1200, -300, -20), -300);
+    assert_eq!(edges::snap_scroll(&[600], 1200, 300, 20), 300);
+    let mut e = engine();
+    e.dispatch(Command::CenterFocused).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, -300);
+}
+
+#[test]
+fn minimized_slots_keep_visible_anchor_and_survive_viewport_changes() {
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    let before = placement(&e.placements().unwrap(), "3").0.x;
+    set_minimized(&mut e, "1", true, false);
+    assert_eq!(placement(&e.placements().unwrap(), "3").0.x, before);
+    set_minimized(&mut e, "1", false, false);
+    assert_eq!(placement(&e.placements().unwrap(), "3").0.x, before);
+    // A resize observed together with minimizing the focused window must not query its removed slot.
+    let mut native = native_of(&e);
+    native.monitors[0].work_area.width = 1000;
+    let current = native.windows.iter_mut().find(|w| w.id == "3").unwrap();
+    current.minimized = true;
+    current.minimized_by_manager = false;
+    e.reconcile(native).unwrap();
+    assert!(e.location("3").is_err());
+}
+
+#[test]
+fn minimized_floating_focus_and_disconnected_page_remain_valid() {
+    let mut e = engine();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    set_minimized(&mut e, "1", true, false);
+    assert_ne!(e.snapshot.focused_window.as_deref(), Some("1"));
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert!(
+        e.snapshot.windows[e.window_index("1").unwrap()]
+            .native
+            .minimized
+    );
+
+    let page = e
+        .location("4")
+        .map(|(m, p, _)| e.snapshot.monitors[m].pages[p].id.clone())
+        .unwrap();
+    set_minimized(&mut e, "4", true, false);
+    let mut native = native_of(&e);
+    let unplugged = native.monitors.remove(1);
+    for window in &mut native.windows {
+        window.monitor_id = "a".into();
+    }
+    e.reconcile(native.clone()).unwrap();
+    assert!(e.page_index(&page).is_ok());
+    native.monitors.push(unplugged);
+    e.reconcile(native).unwrap();
+    set_minimized(&mut e, "4", false, false);
+    let (m, p, _) = e.location("4").unwrap();
+    assert_eq!(e.snapshot.monitors[m].monitor.id, "b");
+    assert_eq!(e.snapshot.monitors[m].pages[p].id, page);
+}
+
+#[test]
+fn window_floated_for_a_missing_resize_frame_tiles_once_resizable() {
+    let mut e = engine();
+    let mut native = system();
+    let mut chrome = window("5", "a");
+    chrome.resizable = false; // Discovered while fullscreen.
+    native.windows.push(chrome);
+    e.reconcile(native.clone()).unwrap();
+    assert!(matches!(e.location("5").unwrap(), (0, 0, None)));
+    native.windows[4].resizable = true;
+    e.reconcile(native.clone()).unwrap();
+    assert!(matches!(e.location("5").unwrap(), (0, 0, Some(_))));
+    // A window the user floated stays floating.
+    e.dispatch(Command::FocusWindow {
+        window_id: "5".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    e.reconcile(native).unwrap();
+    assert!(matches!(e.location("5").unwrap(), (0, 0, None)));
+}
+
+#[test]
+fn columns_never_get_narrower_than_their_windows_minimum_width() {
+    let mut e = engine();
+    e.set_gaps(10);
+    // Window 1 refused 600 px and kept 800; its column widens to fit, gaps included.
+    e.set_min_widths(BTreeMap::from([("1".into(), 800)]));
+    let t = e.reconcile(system()).unwrap();
+    let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+        panic!("tiled");
+    };
+    assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 810);
+    assert_eq!(placement(&t.actions, "1").0.width, 800);
+    // A preset below the minimum is clamped; never beyond the screen.
+    e.dispatch(Command::SetColumnWidth { width: 300 }).unwrap();
+    assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 810);
+    e.set_min_widths(BTreeMap::from([("1".into(), 5000)]));
+    e.reconcile(system()).unwrap();
+    assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 1200);
+}
+
+fn page_geom(e: &Engine, m: usize) -> (Vec<u32>, i32) {
+    let monitor = &e.snapshot.monitors[m];
+    let page = monitor
+        .pages
+        .iter()
+        .find(|p| p.id == monitor.active_page)
+        .unwrap();
+    (
+        page.columns.iter().map(|c| c.width).collect(),
+        page.viewport_x,
+    )
+}
+
+#[test]
+fn one_suspended_monitor_freezes_and_the_other_keeps_working() {
+    let mut e = engine();
+    let a = page_geom(&e, 0);
+    let b = page_geom(&e, 1);
+    e.snapshot.suspended_monitors = vec!["a".into()];
+    let t = e.reconcile(system()).unwrap();
+    assert!(!e.outputs_suspended);
+    assert_eq!(page_geom(&e, 0), a);
+    assert_eq!(page_geom(&e, 1), b);
+    assert!(t.actions.iter().all(|action| {
+        !matches!(action, NativeAction::Placement { window_id, .. } if window_id == "1" || window_id == "2" || window_id == "3")
+    }));
+    assert!(t.actions.iter().any(|action| {
+        matches!(action, NativeAction::Placement { window_id, .. } if window_id == "4")
+    }));
+    e.dispatch(Command::DragEdge {
+        monitor_id: "a".into(),
+        edge: 1,
+        delta: -80,
+    })
+    .unwrap();
+    e.dispatch(Command::DropWindow {
+        window_id: "2".into(),
+        x: 10,
+        y: 450,
+    })
+    .unwrap();
+    assert_eq!(page_geom(&e, 0), a, "suspended monitor does not scroll or resize");
+    // The other monitor still takes a drop and an edge drag.
+    e.dispatch(Command::DropWindow {
+        window_id: "4".into(),
+        x: -10,
+        y: 450,
+    })
+    .unwrap();
+    e.dispatch(Command::DragEdge {
+        monitor_id: "b".into(),
+        edge: 1,
+        delta: 40,
+    })
+    .unwrap();
+    assert_ne!(page_geom(&e, 1), b);
+    assert_eq!(page_geom(&e, 0), a);
+    // Layout fullscreen on the live monitor is not this pause.
+    e.dispatch(Command::FocusWindow {
+        window_id: "4".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    assert!(e.snapshot.windows[e.window_index("4").unwrap()].fullscreen);
+    assert_eq!(e.snapshot.suspended_monitors, ["a".to_string()]);
+    assert_eq!(page_geom(&e, 0), a);
+    // Exit: placement of the paused monitor resumes, columns unchanged.
+    e.snapshot.suspended_monitors.clear();
+    let resumed = e.placements().unwrap();
+    assert!(resumed.iter().any(|action| {
+        matches!(action, NativeAction::Placement { window_id, .. } if window_id == "1")
+    }));
+    assert_eq!(page_geom(&e, 0), a);
+}
+
+#[test]
+fn explicit_focus_on_a_live_monitor_still_runs_while_another_is_paused() {
+    let mut e = engine();
+    e.set_suspended_monitors(vec!["b".into()]);
+    let focused = e
+        .dispatch(Command::FocusWindow {
+            window_id: "2".into(),
+        })
+        .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    assert_eq!(e.location("2").unwrap().0, 0);
+    assert!(focused.actions.iter().any(|action| {
+        matches!(action, NativeAction::Focus { window_id } if window_id == "2")
+    }));
+    assert_eq!(e.snapshot.suspended_monitors, ["b".to_string()]);
+}
+
+#[test]
+fn layout_fullscreen_does_not_suspend_a_monitor() {
+    let mut e = engine();
+    e.dispatch(Command::ToggleFullscreen).unwrap();
+    assert!(e.snapshot.windows[e.window_index("1").unwrap()].fullscreen);
+    assert!(e.snapshot.suspended_monitors.is_empty());
+    e.reconcile(system()).unwrap();
+    assert!(e.snapshot.suspended_monitors.is_empty());
+    assert!(!e.outputs_suspended);
+}
+
+#[test]
+fn a_managed_cover_keeps_its_column_and_is_not_pulled_back() {
+    let mut e = engine();
+    let a = page_geom(&e, 0);
+    // Window 1's column stays on A while the detect list says it covers B.
+    e.set_suspended_monitors(vec!["b".into()]);
+    e.set_covering_windows(vec!["1".into()]);
+    let placed = e.reconcile(system()).unwrap();
+    assert!(placed.actions.iter().all(|action| {
+        !matches!(action, NativeAction::Placement { window_id, .. } if window_id == "1")
+            && !matches!(action, NativeAction::Focus { window_id } if window_id == "1")
+    }));
+    assert!(placed.actions.iter().any(|action| {
+        matches!(action, NativeAction::Placement { window_id, .. } if window_id == "2" || window_id == "3")
+    }));
+    assert_eq!(page_geom(&e, 0), a);
+    assert_eq!(e.location("1").unwrap().0, 0);
+    assert_eq!(e.snapshot.suspended_monitors, ["b".to_string()]);
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    let moved = e
+        .dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: 40,
+        })
+        .unwrap();
+    assert!(moved.actions.iter().all(|action| {
+        !matches!(action, NativeAction::Placement { window_id, .. } if window_id == "1")
+    }));
+    assert_eq!(e.location("1").unwrap().0, 0);
+    assert!(!e.snapshot.suspended_monitors.iter().any(|id| id == "a"));
+    assert!(e
+        .scene(
+            Command::DropWindow {
+                window_id: "2".into(),
+                x: -600,
+                y: 100,
+            },
+            "b",
+            &[],
+        )
+        .is_none());
+    assert!(e
+        .scene(
+            Command::DropWindow {
+                window_id: "2".into(),
+                x: 100,
+                y: 100,
+            },
+            "a",
+            &[],
+        )
+        .is_some());
+    assert!(e
+        .scene(
+            Command::DropWindow {
+                window_id: "1".into(),
+                x: 100,
+                y: 100,
+            },
+            "a",
+            &[],
+        )
+        .is_none());
 }

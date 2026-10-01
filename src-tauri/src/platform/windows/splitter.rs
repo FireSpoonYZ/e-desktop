@@ -1,5 +1,6 @@
 //! Pointer drags with a live preview. Invisible topmost strips sit on the boundaries between
-//! columns (and on screen edges with a hidden column behind them) and between stacked
+//! columns (on screen edges with a hidden column behind them, and inset on a column at least
+//! as wide as the view) and between stacked
 //! windows. Dragging a strip, a tiled window with the drag modifier, or a tiled window by its
 //! own title bar covers the target monitor with a preview of the resulting layout: the
 //! engine's result for the very command a release applies. Real windows change only once,
@@ -27,6 +28,7 @@ use crate::{
         edges::edge_position,
         expand_gap, half_gap,
         scene::{Mark, Scene},
+        top_band,
     },
     model::{AppError, Command, ErrorCode, Rect, WindowId},
 };
@@ -57,6 +59,7 @@ enum Request {
         window_id: WindowId,
         /// The window is in the system move loop (title bar drag), not a modifier drag.
         native: Option<usize>,
+        moving: Option<bool>,
     },
     End {
         point: Option<(i32, i32)>,
@@ -117,7 +120,13 @@ pub fn strips(engine: &Engine) -> Vec<Strip> {
                     .iter()
                     .any(|c| c.windows.contains(&w.native.id))
         });
-        if fullscreen || page.columns.is_empty() {
+        if snapshot
+            .suspended_monitors
+            .iter()
+            .any(|id| id == &monitor.monitor.id)
+            || fullscreen
+            || page.columns.is_empty()
+        {
             continue;
         }
         let scale = monitor.monitor.scale_factor;
@@ -134,10 +143,15 @@ pub fn strips(engine: &Engine) -> Vec<Strip> {
         );
         for edge in 0..=widths.len() {
             let pos = edge_position(&widths, x, edge);
-            // Shared boundaries, plus screen edges hiding a column behind them.
+            // Shared boundaries, screen edges hiding a column, and a column at least as wide
+            // as the view (its native resize border sits outside the work area). Clamping the
+            // centered hit into the outer viewport insets that flush edge by `size`.
+            let full = |i: usize| widths.get(i).is_some_and(|&w| i64::from(w) >= view);
             let shown = (pos > 0 && pos < view)
                 || (pos == 0 && edge > 0)
-                || (pos == view && edge < widths.len());
+                || (pos == view && edge < widths.len())
+                || (pos == 0 && edge == 0 && full(0))
+                || (pos == view && edge == widths.len() && edge > 0 && full(edge - 1));
             if !shown {
                 continue;
             }
@@ -193,15 +207,36 @@ pub fn configure(strips: Vec<Strip>) {
     }
 }
 
-/// The layout drags start from and preview against.
+/// Replace preview context and report whether paused monitors/windows changed.
+fn replace_layout(current: &mut Option<Engine>, engine: Engine) -> bool {
+    let changed = current.as_ref().is_none_or(|previous| {
+        previous.snapshot().suspended_monitors != engine.snapshot().suspended_monitors
+            || previous.snapshot().windows.iter().chain(&engine.snapshot().windows).any(|w| {
+                previous.window_protected(&w.native.id) != engine.window_protected(&w.native.id)
+            })
+    });
+    *current = Some(engine);
+    changed
+}
+
+/// Publish before configuring strips; pause changes also wake stationary active previews.
 pub fn publish(engine: Engine) {
-    *lock(&shared().layout) = Some(engine);
+    let mut current = lock(&shared().layout);
+    let changed = replace_layout(&mut current, engine);
+    drop(current);
+    if changed {
+        post(SYNC);
+    }
 }
 
 /// Start previewing a drop of `window_id` under the pointer. `native` is the window's handle
 /// when the system move loop carries it (title bar drag).
-pub fn begin_window(window_id: WindowId, native: Option<usize>) {
-    lock(&shared().requests).push_back(Request::Begin { window_id, native });
+pub fn begin_window(window_id: WindowId, native: Option<usize>, moving: Option<bool>) {
+    lock(&shared().requests).push_back(Request::Begin {
+        window_id,
+        native,
+        moving,
+    });
     post(REQUEST);
 }
 
@@ -222,6 +257,9 @@ enum Kind {
         /// Title bar drag: the window and its rectangle when the loop started.
         native: Option<(HWND, RECT)>,
         moved: bool,
+        /// The pointer has been below the top full-width band. A title bar starts inside it,
+        /// so the band only counts once the pointer left it and came back.
+        top_armed: bool,
     },
 }
 
@@ -274,11 +312,81 @@ fn cursor() -> POINT {
     p
 }
 
-/// Rebuild strips from the published ones (deferred while a drag is running).
+/// Hide a preview that would cover a paused display, or cancel a strip drag that is on one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PreviewHold {
+    Show,
+    Hide,
+    Cancel,
+}
+
+pub(crate) fn preview_hold(strip_monitor_paused: bool, pointer_monitor_paused: bool) -> PreviewHold {
+    if strip_monitor_paused {
+        PreviewHold::Cancel
+    } else if pointer_monitor_paused {
+        PreviewHold::Hide
+    } else {
+        PreviewHold::Show
+    }
+}
+
+fn paused_ids() -> Vec<String> {
+    layout()
+        .map(|engine| engine.snapshot().suspended_monitors.clone())
+        .unwrap_or_default()
+}
+
+fn monitor_paused(ids: &[String], monitor_id: &str) -> bool {
+    ids.iter().any(|id| id == monitor_id)
+}
+
+/// Rebuild strips from the published ones. A running drag still drops paused strips.
 fn sync() {
     let strips = lock(&shared().strips).clone();
+    let latest = layout();
+    let paused = latest.as_ref()
+        .map(|engine| engine.snapshot().suspended_monitors.clone())
+        .unwrap_or_default();
+    let cancel = STATE.with_borrow(|state| {
+        state.session.as_ref().is_some_and(|session| match &session.kind {
+            Kind::Strip(strip) => monitor_paused(&paused, &strip.monitor_id),
+            Kind::Window { id, .. } => latest.as_ref().is_some_and(|engine| engine.window_protected(id)),
+        })
+    });
+    if cancel {
+        finish(false);
+    }
     STATE.with_borrow_mut(|state| {
         if state.session.is_some() {
+            // The session's engine clone is stale. Hide this display's strips anyway.
+            for (index, strip) in state.shown.iter().enumerate() {
+                if monitor_paused(&paused, &strip.monitor_id) {
+                    if let Some(&hwnd) = state.strips.get(index) {
+                        unsafe { ShowWindow(hwnd, SW_HIDE) };
+                    }
+                }
+            }
+            if state.area.as_ref().is_some_and(|area| {
+                layout().is_some_and(|engine| {
+                    engine.snapshot().monitors.iter().any(|monitor| {
+                        let bounds = monitor.monitor.bounds;
+                        let (ax, ay) = (i64::from(area.x), i64::from(area.y));
+                        let (bx, by) = (i64::from(bounds.x), i64::from(bounds.y));
+                        monitor_paused(&paused, &monitor.monitor.id)
+                            && ax < bx + i64::from(bounds.width)
+                            && ax + i64::from(area.width) > bx
+                            && ay < by + i64::from(bounds.height)
+                            && ay + i64::from(area.height) > by
+                    })
+                })
+            }) {
+                state.area = None;
+                if let Some(session) = state.session.as_mut() {
+                    session.scene = None;
+                    session.command = None;
+                }
+                unsafe { ShowWindow(state.overlay, SW_HIDE) };
+            }
             return;
         }
         let class = wide(STRIP_CLASS);
@@ -408,7 +516,10 @@ fn message_point(h: HWND, l: LPARAM) -> POINT {
     p
 }
 
-fn start_window(window_id: WindowId, native: Option<usize>) {
+fn start_window(window_id: WindowId, native: Option<usize>, moving: Option<bool>) {
+    if moving == Some(false) {
+        return;
+    } // Native border resizing is not a window drop.
     let Some(engine) = layout() else { return };
     let native = native.and_then(|h| {
         let h = h as HWND;
@@ -425,7 +536,8 @@ fn start_window(window_id: WindowId, native: Option<usize>) {
             kind: Kind::Window {
                 id: window_id,
                 native,
-                moved: false,
+                moved: moving == Some(true),
+                top_armed: false,
             },
             start: cursor(),
             point: None,
@@ -480,7 +592,12 @@ fn update(point: Option<POINT>) {
                 },
                 strip.monitor_id.clone(),
             ),
-            Kind::Window { id, native, moved } => {
+            Kind::Window {
+                id,
+                native,
+                moved,
+                top_armed,
+            } => {
                 if let Some((h, initial)) = native.as_ref().filter(|_| !*moved) {
                     // The system loop also resizes by the border: only a move is a drop. Decide
                     // on the first change; afterwards the app resizes itself when it crosses
@@ -507,17 +624,39 @@ fn update(point: Option<POINT>) {
                 }) else {
                     return Step::Wait;
                 };
+                let below =
+                    i64::from(monitor.monitor.bounds.y) + top_band(monitor.monitor.scale_factor);
+                *top_armed |= y >= below;
                 (
                     Command::DropWindow {
                         window_id: id.clone(),
                         x: point.x,
-                        y: point.y,
+                        // Not yet armed: drop just below the band.
+                        y: if *top_armed { y } else { y.max(below) } as i32,
                     },
                     monitor.monitor.id.clone(),
                 )
             }
         };
         session.point = Some(point);
+        let paused = paused_ids();
+        let strip_paused = match &session.kind {
+            Kind::Strip(strip) => monitor_paused(&paused, &strip.monitor_id),
+            Kind::Window { .. } => false,
+        };
+        match preview_hold(strip_paused, monitor_paused(&paused, &monitor)) {
+            PreviewHold::Cancel => return Step::Cancel,
+            PreviewHold::Hide => {
+                session.command = None;
+                session.scene = None;
+                return if state.area.take().is_some() {
+                    Step::Show(Some(None))
+                } else {
+                    Step::Wait
+                };
+            }
+            PreviewHold::Show => {}
+        }
         let scene = session
             .engine
             .scene(command.clone(), &monitor, &session.active);
@@ -604,7 +743,11 @@ fn requests() {
             return;
         };
         match request {
-            Request::Begin { window_id, native } => start_window(window_id, native),
+            Request::Begin {
+                window_id,
+                native,
+                moving,
+            } => start_window(window_id, native, moving),
             Request::End { point, commit } => {
                 let window = STATE.with_borrow(|state| {
                     matches!(state.session, Some(Session { kind: Kind::Window { .. }, .. }))
@@ -959,5 +1102,156 @@ impl std::ops::Drop for Splitter {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preview_hold, replace_layout, strips, PreviewHold};
+    use crate::layout::Engine;
+    use crate::model::*;
+
+    fn ready() -> Engine {
+        Engine::new(BackendStatus {
+            kind: BackendKind::Windows,
+            availability: BackendAvailability::Ready,
+            capabilities: Capabilities {
+                enumerate: true,
+                placement: true,
+                minimize: true,
+                clipping: true,
+                focus: true,
+                ..Capabilities::default()
+            },
+            message: String::new(),
+        })
+    }
+
+    fn tile(ids: &[&str]) -> Engine {
+        let mut engine = ready();
+        engine.set_gaps(0);
+        let monitor = Monitor {
+            id: "a".into(),
+            name: "a".into(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 900,
+            },
+            work_area: Rect {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 900,
+            },
+            scale_factor: 1.0,
+            primary: true,
+        };
+        let windows = ids
+            .iter()
+            .map(|id| NativeWindow {
+                id: (*id).into(),
+                title: (*id).into(),
+                app_name: "test".into(),
+                process_id: 1,
+                monitor_id: "a".into(),
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 400,
+                    height: 300,
+                },
+                minimized: false,
+                minimized_by_manager: false,
+                resizable: true,
+            })
+            .collect();
+        engine
+            .reconcile(SystemSnapshot {
+                monitors: vec![monitor],
+                windows,
+                focused_window: Some((*ids.first().unwrap()).into()),
+            })
+            .unwrap();
+        engine.dispatch(Command::Enable).unwrap();
+        engine
+    }
+
+    #[test]
+    fn full_width_column_gets_inset_strips_on_both_screen_edges() {
+        let mut engine = tile(&["1"]);
+        let view = engine.snapshot().monitors[0].viewport.width;
+        // Half the screen: the free right edge is on screen; the flush left edge is not
+        // (nothing hidden, column narrower than the view).
+        let hits = strips(&engine);
+        assert!(hits.iter().all(|s| s.edge != 0));
+        assert_eq!(hits.len(), 1);
+        engine
+            .dispatch(Command::SetColumnWidth { width: view })
+            .unwrap();
+        let hits = strips(&engine);
+        assert_eq!(hits.len(), 2);
+        let size = hits[0].hit.width;
+        assert!(size >= 8);
+        let left = hits.iter().find(|s| s.edge == 0).unwrap();
+        let right = hits.iter().find(|s| s.edge == 1).unwrap();
+        assert!(left.column.is_none() && right.column.is_none());
+        assert_eq!(left.hit.x, 0);
+        assert_eq!(left.hit.width, size);
+        assert_eq!(right.hit.x, view as i32 - size as i32);
+        assert_eq!(right.hit.width, size);
+        assert_eq!(right.hit.x + right.hit.width as i32, view as i32);
+        // A hidden column still gets the screen-edge strip; a narrow flush edge does not.
+        let engine = tile(&["1", "2", "3"]);
+        let view = engine.snapshot().monitors[0].viewport.width;
+        let hits = strips(&engine);
+        assert!(hits.iter().any(|s| s.column.is_none() && s.edge == 2));
+        assert!(hits.iter().all(|s| s.edge != 0));
+        assert!(hits.iter().any(|s| s.hit.x + s.hit.width as i32 == view as i32));
+    }
+
+    #[test]
+    fn a_suspended_monitor_has_no_splitter_strips() {
+        let mut engine = tile(&["1", "2"]);
+        assert!(!strips(&engine).is_empty());
+        engine.set_suspended_monitors(vec!["a".into()]);
+        assert!(strips(&engine).is_empty());
+        engine.set_suspended_monitors(vec![]);
+        assert!(!strips(&engine).is_empty());
+    }
+
+    #[test]
+    fn published_pause_changes_wake_even_when_strips_do_not_change() {
+        let mut engine = tile(&["1"]);
+        let mut published = None;
+        assert!(replace_layout(&mut published, engine.clone()));
+        assert!(!replace_layout(&mut published, engine.clone()));
+        let old_strips = strips(&engine);
+        // A display with no strips changes pause state while another display is dragging.
+        // configure(old_strips) will not notify; publish must do so on its own.
+        engine.set_suspended_monitors(vec!["b".into()]);
+        assert_eq!(strips(&engine), old_strips);
+        assert!(replace_layout(&mut published, engine.clone()));
+        assert_eq!(published.as_ref().unwrap().snapshot().suspended_monitors, ["b"]);
+        assert!(!replace_layout(&mut published, engine.clone()));
+        // A newly detected managed cover must also invalidate its active window preview.
+        engine.set_covering_windows(vec!["1".into()]);
+        assert!(replace_layout(&mut published, engine.clone()));
+        assert!(published.as_ref().unwrap().window_protected("1"));
+        engine.set_suspended_monitors(vec![]);
+        engine.set_covering_windows(vec![]);
+        assert!(replace_layout(&mut published, engine));
+    }
+
+    #[test]
+    fn preview_hides_on_a_paused_monitor_and_cancels_only_that_strip() {
+        // Pointer already on the paused display: hide, do not drop the other drag.
+        assert_eq!(preview_hold(false, true), PreviewHold::Hide);
+        // The grabbed strip's own monitor became paused mid-drag.
+        assert_eq!(preview_hold(true, true), PreviewHold::Cancel);
+        assert_eq!(preview_hold(true, false), PreviewHold::Cancel);
+        // Another display paused; this drag stays.
+        assert_eq!(preview_hold(false, false), PreviewHold::Show);
     }
 }

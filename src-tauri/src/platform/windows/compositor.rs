@@ -146,6 +146,19 @@ impl Backend {
                 areas.push(s.bounds);
             }
         }
+        // A monitor that dropped out of this frame (full-display pause) must not keep a
+        // topmost overlay. Other monitors in `areas` stay up, so their animation does not snap.
+        for &(bounds, h) in &self.compositor.overlays {
+            if !areas.contains(&bounds) {
+                unsafe {
+                    ShowWindow(h as HWND, SW_HIDE);
+                }
+            }
+        }
+        if areas.is_empty() {
+            self.compose_end();
+            return Ok(());
+        }
         for area in areas {
             let h = self.overlay(area)?;
             if unsafe { IsWindowVisible(h) } == 0 {

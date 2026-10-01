@@ -7,16 +7,21 @@ fn contains(rect: Rect, x: i64, y: i64) -> bool {
         && y < rect.y as i64 + rect.height as i64
 }
 
-/// Width of the strips along the left/right screen edges where a dropped window queues off
-/// screen instead of joining the layout on screen.
+/// Width of the strips along the left/right screen edges where a drop scrolls that
+/// column fully on screen (flush left or flush right) instead of inserting under the pointer.
 pub fn queue_band(scale: f64, view: u32) -> i64 {
     ((48.0 * scale).round() as i64).max(i64::from(view) / 24)
+}
+
+/// Height of the strip along a monitor's top edge where a drop makes a full-width column.
+pub fn top_band(scale: f64) -> i64 {
+    (64.0 * scale).round() as i64
 }
 
 impl Engine {
     /// Take `id` out of its column, dropping the column once empty, while the rest of the
     /// screen stays put: columns right of a removed on-screen column close the gap.
-    fn detach(&mut self, id: &str) -> Result<u32, AppError> {
+    pub(super) fn detach(&mut self, id: &str) -> Result<u32, AppError> {
         let (m, p, Some((c, row))) = self.location(id)? else {
             return Err(invalid("Window has no tiled column"));
         };
@@ -36,33 +41,48 @@ impl Engine {
         Ok(width)
     }
 
-    /// Insert `column` just past the left or right screen edge of page `p`, leaving what is
-    /// on screen in place. The columns on screen first widen to fill it if they no longer do,
-    /// so the queued column really is off screen.
+    /// Insert `column` just past the left or right screen edge of page `p`. Widths stay as
+    /// they are. When the other columns already cover the screen, they stay put; when they
+    /// do not, the view scrolls so the queued column is fully off screen, which can shift
+    /// those windows together.
     pub(super) fn queue_column(&mut self, m: usize, p: usize, column: Column, right: bool) {
-        let view = self.snapshot.monitors[m].viewport.width;
+        let view = i64::from(self.snapshot.monitors[m].viewport.width);
         let page = &mut self.snapshot.monitors[m].pages[p];
         page.columns.retain(|c| !c.windows.is_empty());
-        let mut filled = widths(page);
-        edges::fill(&mut filled, view);
-        for (c, w) in page.columns.iter_mut().zip(&filled) {
-            c.width = *w;
-        }
-        let mut x = edges::clamp_x(&filled, view, page.viewport_x.into());
-        let (mut left, mut index) = (0i64, None);
-        for (c, &w) in filled.iter().enumerate() {
-            if right && left < x + i64::from(view) {
-                index = Some(c + 1);
+        let mut x = i64::from(page.viewport_x);
+        let mut index = if right { page.columns.len() } else { 0 };
+        let mut left = 0i64;
+        let mut found_left = false;
+        for (c, existing) in page.columns.iter().enumerate() {
+            let w = i64::from(existing.width);
+            if right && left < x + view {
+                index = c + 1;
             }
-            if !right && index.is_none() && left + i64::from(w) > x {
-                index = Some(c);
+            if !right && !found_left && left + w > x {
+                index = c;
+                found_left = true;
             }
-            left += i64::from(w);
+            left += w;
         }
+        let width = i64::from(column.width);
         if !right && !page.columns.is_empty() {
-            x += i64::from(column.width);
+            x += width;
         }
-        page.columns.insert(index.unwrap_or(0), column);
+        page.columns.insert(index, column);
+        let col_left: i64 = page.columns[..index]
+            .iter()
+            .map(|c| i64::from(c.width))
+            .sum();
+        if page.columns.len() > 1 {
+            if right {
+                let park = col_left - view;
+                if x > park {
+                    x = park;
+                }
+            } else if x < col_left + width {
+                x = col_left + width;
+            }
+        }
         page.viewport_x = coordinate(x);
     }
 
@@ -105,7 +125,7 @@ impl Engine {
 
     /// niri-style interactive move: drop onto a column's middle to stack into it (above or
     /// below the row under the pointer), onto its outer quarters or empty space for a new
-    /// column, onto the strip along a screen edge to queue it just off screen there.
+    /// column, onto the strip along a screen edge to place that column fully on screen there.
     pub(super) fn drop_window(&mut self, id: &str, x: i32, y: i32) -> Result<(), AppError> {
         let w = self.window_index(id)?;
         if self.snapshot.windows[w].floating {
@@ -128,6 +148,13 @@ impl Engine {
             .position(|p| p.id == monitor.active_page)
             .unwrap();
         let page = &monitor.pages[p];
+        let source_view = self.snapshot.monitors[old_m].viewport.width;
+        let source_width = self.snapshot.monitors[old_m].pages[old_p].columns[old_c].width;
+        // Keep the screen share on another display; physical pixels lose it across different sizes.
+        let width = ((u64::from(source_width) * u64::from(viewport.width)
+            + u64::from(source_view) / 2)
+            / u64::from(source_view))
+        .clamp(1, u64::from(viewport.width)) as u32;
         let band = queue_band(monitor.monitor.scale_factor, viewport.width);
         let (vx, vw) = (i64::from(viewport.x), i64::from(viewport.width));
         if x < vx + band || x >= vx + vw - band {
@@ -135,10 +162,44 @@ impl Engine {
                 let page_id = page.id.clone();
                 self.record_hotplug_move(id, &page_id);
             }
-            let width = self.detach(id)?.min(viewport.width);
+            self.detach(id)?;
             let column = self.column(id.into(), width);
+            // Park geometry is what `ensure_visible` already un-hides: a right park at
+            // `col_left - view` scrolls to the column's right edge, a left park at
+            // `col_left + width` scrolls to its left edge. Row-squeeze still parks.
             self.queue_column(m, p, column, x >= vx + vw / 2);
-            return self.keep_focus_on_screen(m, p);
+            return self.set_focus(id, true);
+        }
+        // Top-centre drop creates a standalone full-width column, not layout fullscreen.
+        // Side queue bands take precedence at the corners. Use screen coordinates so a pinned
+        // bar does not make the top edge unreachable; the resulting tile uses the usable viewport.
+        let top = i64::from(monitor.monitor.bounds.y);
+        let top_band = top_band(monitor.monitor.scale_factor);
+        if y >= top && y < (top + top_band).min(i64::from(viewport.y) + i64::from(viewport.height))
+        {
+            let page_id = page.id.clone();
+            if (m, p) != (old_m, old_p) {
+                self.record_hotplug_move(id, &page_id);
+            }
+            self.detach(id)?;
+            let columns = &self.snapshot.monitors[m].pages[p].columns;
+            let mut at = columns.len();
+            let mut left =
+                i64::from(viewport.x) - i64::from(self.snapshot.monitors[m].pages[p].viewport_x);
+            for (c, column) in columns.iter().enumerate() {
+                if x < left + i64::from(column.width) {
+                    at = c;
+                    break;
+                }
+                left += i64::from(column.width);
+            }
+            let column = self.column(id.into(), viewport.width);
+            self.snapshot.monitors[m].pages[p]
+                .columns
+                .insert(at, column);
+            self.snapshot.windows[w].fullscreen = false;
+            self.fullscreen_restore.remove(id);
+            return self.set_focus(id, true);
         }
         // (column index, Some(row) to stack into that column, None for a new column there).
         let mut target = (page.columns.len(), None);
@@ -177,7 +238,6 @@ impl Engine {
         }
         let same_page = (m, p) == (old_m, old_p);
         let source = &self.snapshot.monitors[old_m].pages[old_p].columns[old_c];
-        let width = source.width;
         let alone = source.windows.len() == 1;
         if same_page && target.0 == old_c && (target.1.is_some() && alone) {
             return Ok(()); // Dropped back onto its own single-window column.
@@ -205,7 +265,7 @@ impl Engine {
                     .insert(row, id.into());
             }
             None => {
-                let column = self.column(id.into(), width.min(viewport.width));
+                let column = self.column(id.into(), width);
                 self.snapshot.monitors[m].pages[p].columns.insert(c, column);
             }
         }
@@ -304,14 +364,14 @@ mod tests {
                     .sum::<i32>()
         };
         let top = x(&e, 0) + 300;
-        drop(&mut e, "1", top, 10); // Top half of row 0 in the same column.
+        drop(&mut e, "1", top, 100); // Top half of row 0 in the same column.
         assert_eq!(layout(&e, 0), [vec!["1", "2"], vec!["3"]]);
         let edge = x(&e, 1) + 530;
-        drop(&mut e, "1", edge, 10); // Right quarter of column 3: new column after it.
+        drop(&mut e, "1", edge, 100); // Right quarter of column 3: new column after it.
         assert_eq!(layout(&e, 0), [vec!["2"], vec!["3"], vec!["1"]]);
         let own = x(&e, 2) + 300;
         let before = layout(&e, 0);
-        drop(&mut e, "1", own, 10); // Onto itself: unchanged.
+        drop(&mut e, "1", own, 100); // Onto itself: unchanged.
         assert_eq!(layout(&e, 0), before);
         drop(&mut e, "3", -900, 450); // Monitor b holds window 4.
         assert_eq!(layout(&e, 1), [vec!["4", "3"]]);
@@ -376,6 +436,81 @@ mod tests {
         let planned = plan(&e, "1");
         observe(&mut e, "1", "a", planned);
         assert!(e.adopt_native_move("1", planned).unwrap().is_none());
+    }
+
+    #[test]
+    fn top_drop_detaches_one_window_and_preview_matches_full_width_result() {
+        let mut e = engine();
+        drop(&mut e, "1", 900, 450);
+        assert_eq!(layout(&e, 0)[0], ["2", "1"]);
+        let command = Command::DropWindow {
+            window_id: "1".into(),
+            x: 600,
+            y: 30,
+        };
+        let scene = e.scene(command.clone(), "a", &["1".into()]).unwrap();
+        let preview = scene.tiles.iter().find(|t| t.title == "1").unwrap();
+        assert_eq!(preview.label, "100%");
+        assert_eq!(preview.rect.width, 1200);
+        let t = e.dispatch(command).unwrap();
+        let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+            panic!("tiled");
+        };
+        let column = &e.snapshot.monitors[m].pages[p].columns[c];
+        assert_eq!(column.width, 1200);
+        assert_eq!(column.windows, ["1"]);
+        assert!(!e.snapshot.windows[e.window_index("1").unwrap()].fullscreen);
+        assert!(t.actions.iter().any(|a| matches!(a,
+            NativeAction::Placement { window_id, rect, minimized: false, .. }
+            if window_id == "1" && rect.x == 0 && rect.width == 1200 && rect.height == 900)));
+        // Top corners still queue on the side rather than taking over the screen.
+        let mut e = engine();
+        drop(&mut e, "1", 1190, 10);
+        let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+            panic!("tiled");
+        };
+        assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 600);
+    }
+
+    #[test]
+    fn cross_screen_independent_columns_keep_their_share_and_top_uses_target_dpi() {
+        let mut e = engine();
+        let mut native = SystemSnapshot {
+            monitors: e
+                .snapshot
+                .monitors
+                .iter()
+                .map(|m| m.monitor.clone())
+                .collect(),
+            windows: e
+                .snapshot
+                .windows
+                .iter()
+                .filter(|w| w.native.id != "4")
+                .map(|w| w.native.clone())
+                .collect(),
+            focused_window: Some("1".into()),
+        };
+        native.monitors[1].bounds.width = 600;
+        native.monitors[1].work_area.width = 600;
+        native.monitors[1].scale_factor = 1.5;
+        e.reconcile(native).unwrap();
+        drop(&mut e, "1", -900, 450);
+        let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+            panic!("tiled");
+        };
+        assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 300);
+        drop(&mut e, "1", 80, 450); // Outer quarter creates an independent column.
+        let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+            panic!("tiled");
+        };
+        assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 600);
+        drop(&mut e, "1", -900, 80); // 64 logical px = 96 physical px on this display.
+        let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+            panic!("tiled");
+        };
+        assert_eq!(m, 1);
+        assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 600);
     }
 
     #[test]
