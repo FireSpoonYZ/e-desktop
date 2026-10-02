@@ -1025,11 +1025,22 @@ impl Session {
             self.config.fixture_only_allow_unknown_affinity,
             image,
         )?;
-        if monitor_bounds(self.monitor as HMONITOR)? != self.work
-            || unsafe { GetDpiForWindow(h) } != self.last_drawable.dpi
-            || unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONULL) } as usize != self.monitor
+        let current_work = monitor_bounds(self.monitor as HMONITOR)?;
+        let current_dpi = unsafe { GetDpiForWindow(h) };
+        let current_monitor = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONULL) } as usize;
+        if current_work != self.work
+            || current_dpi != self.last_drawable.dpi
+            || current_monitor != self.monitor
         {
-            return Err("monitor/workarea/DPI changed".into());
+            return Err(format!(
+                "monitor/workarea/DPI changed: {}",
+                json!({
+                    "expectedWork": self.work, "currentWork": current_work,
+                    "expectedDpi": self.last_drawable.dpi, "currentDpi": current_dpi,
+                    "expectedMonitor": self.monitor, "currentMonitor": current_monitor,
+                    "sourceOuter": outer(h).ok(), "iconic": unsafe { IsIconic(h) } != 0
+                })
+            ));
         }
         if unsafe { IsIconic(h) } == 0 && !self.cover_bounds.contains(outer(h)?) {
             return Err("drawable source escaped safe cover".into());
