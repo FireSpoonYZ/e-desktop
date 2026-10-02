@@ -49,10 +49,18 @@ python experiments/window-handoff-probe/test_proxy_interop.py --probe experiment
 
 ## 待执行的实机预检
 
-父级脚本：`target/handoff-recovery/run-pilot.py`。目前仅执行 plan-only 和语法检查，没有运行 `--run`。
+父级脚本：`target/handoff-recovery/run-pilot.py`。已完成 plan-only 和语法检查；首次 `--run` 在隔离检查阶段中止，未启动录像、故障注入或 probe。
 
 预检为 baseline / prehide / staged × 0 / 60 / 300 ms 迟绘，共 9 次独立冷启动，轮换模式顺序。目标 visible geometry 为 `(16,16,1500,2034)`；针对此前的 4K 主屏，记录原生 `1600×2080` 区域的无损 FFV1，不缩放。实际采样 PTS、吞吐和颜色保真还需现场检查。
 
 在独立虚拟桌面执行；每次使用新 fixture PID/HWND/tag，记录原始桌面 GUID，独立核对还原。先做 state-write 故障注入。脚本遇到拒绝、降级、超时或还原异常即停，不将它们作为视觉通过。所有进程退出与原桌面恢复需保留检查结果。
 
 9 次预检仅用于验证执行和判读链路。随后按设计先补足每格 3 次，再对关键格至少 30 次。baseline 必须复现相关缺陷，否则实验没有证明区分能力。阶段 0 确实改善后，仍需正式帧协议、呈现状态机与渲染接入，并回归原五窗口路径。
+
+## 首次桌面准备结果
+
+`target/recordings/handoff-pilot-01/report.json` 记录 0 次 trial。父级脚本将 NVIDIA Overlay 与 NapCatQQ-Desktop 的 4 个分层辅助窗口按普通应用窗口拦截；这不是已证明的产品缺陷或像素遮挡。详细样式与矩形在该目录的 `isolation-details.json`。
+
+所有自建进程已退出，父级通过原始 HWND/GUID 复核原桌面 `current=true`。当时没有强行关闭测试桌面，因此留下一个测试桌面。父级随后修复了 runner 在“拒绝关闭桌面”分支也跳过返回原桌面的缺口。
+
+下轮区分普通应用窗口与带 tool/layered、nonactivating 或 click-through 样式的辅助窗口，并保留后者记录。样式不证明像素不可见；probe 的 cover 检查及实际画面仍须验证其影响。`pilot-02` 尚未执行。说明保存在 `target/handoff-recovery/pilot-01-blocker.md`。
