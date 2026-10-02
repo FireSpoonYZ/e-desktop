@@ -727,6 +727,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
+ "windows",
  "windows-sys 0.61.2",
  "x11rb",
 ]

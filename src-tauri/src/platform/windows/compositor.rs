@@ -3,7 +3,7 @@
 //! Moving real windows frame by frame cannot keep them on their monitor: window regions do
 //! not clip DirectComposition content (Chromium, Electron, Terminal), so a column sliding in
 //! at a screen edge was drawn across the neighbouring monitor. While an animation runs, an
-//! opaque, non-activating overlay covers every animating monitor and shows DWM live
+//! opaque, non-activating overlay reproduces the static shell wallpaper and shows DWM live
 //! thumbnails of its windows at their frame positions, cropped to that monitor. The real
 //! windows move once, underneath, straight to their targets. Mouse messages in the animated
 //! viewport are absorbed until handoff, not passed to HWNDs at different hit positions.
@@ -12,12 +12,30 @@
 use super::preview::Thumbnail;
 use super::*;
 use crate::animation::Sprite;
+use std::sync::Arc;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+#[path = "compositor_wallpaper.rs"]
+mod wallpaper;
+use wallpaper::{Backdrop, Wallpaper};
+
+struct Overlay {
+    bounds: Rect,
+    hwnd: usize,
+    // Box keeps the wndproc pointer stable while the overlay vector grows.
+    backdrop: Box<Backdrop>,
+}
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe { DestroyWindow(self.hwnd as HWND) };
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Compositor {
     /// One overlay per monitor area, kept hidden between animations.
-    overlays: Vec<(Rect, usize)>,
+    overlays: Vec<Overlay>,
+    wallpaper: Option<Arc<Wallpaper>>,
     /// Window id -> (overlay it is drawn in, thumbnail).
     thumbnails: HashMap<String, (usize, Thumbnail)>,
     /// Real windows already moved to their target during this animation.
@@ -27,15 +45,11 @@ pub(super) struct Compositor {
 
 impl Drop for Compositor {
     fn drop(&mut self) {
-        for &(_, h) in &self.overlays {
-            unsafe { ShowWindow(h as HWND, SW_HIDE) };
+        for overlay in &self.overlays {
+            unsafe { ShowWindow(overlay.hwnd as HWND, SW_HIDE) };
         }
         self.thumbnails.clear();
-        for (_, h) in self.overlays.drain(..) {
-            unsafe {
-                DestroyWindow(h as HWND);
-            }
-        }
+        self.overlays.clear();
     }
 }
 
@@ -78,6 +92,20 @@ fn overlay_message(message: u32) -> Option<LRESULT> {
 }
 
 unsafe extern "system" fn overlay_proc(h: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let backdrop = unsafe { GetWindowLongPtrW(h, GWLP_USERDATA) } as *const Backdrop;
+    if !backdrop.is_null() {
+        if message == WM_ERASEBKGND {
+            return 1; // WM_PAINT draws the entire opaque wallpaper; no dark erase frame.
+        }
+        if message == WM_PAINT {
+            let mut paint: PAINTSTRUCT = unsafe { zeroed() };
+            let dc = unsafe { BeginPaint(h, &mut paint) };
+            let backdrop = unsafe { &mut *(backdrop as *mut Backdrop) };
+            backdrop.paint_failed = !backdrop.wallpaper.paint(dc, backdrop.viewport);
+            unsafe { EndPaint(h, &paint) };
+            return 0;
+        }
+    }
     overlay_message(message).unwrap_or_else(|| unsafe { DefWindowProcW(h, message, w, l) })
 }
 
@@ -127,9 +155,11 @@ impl Backend {
     }
 
     fn overlay(&mut self, bounds: Rect) -> Result<HWND, AppError> {
-        if let Some(&(_, h)) = self.compositor.overlays.iter().find(|(b, _)| *b == bounds) {
-            return Ok(h as HWND);
+        if let Some(overlay) = self.compositor.overlays.iter().find(|o| o.bounds == bounds) {
+            return Ok(overlay.hwnd as HWND);
         }
+        let wallpaper = self.compositor.wallpaper.as_ref().unwrap().clone();
+        wallpaper.validate(bounds)?;
         native(bounds)?;
         let class = wide(CLASS);
         let instance = unsafe { GetModuleHandleW(null()) };
@@ -137,7 +167,7 @@ impl Backend {
             lpfnWndProc: Some(overlay_proc),
             hInstance: instance,
             lpszClassName: class.as_ptr(),
-            // Where no window is drawn (never between tiled columns), like niri's backdrop.
+            // Safety brush only; WM_PAINT reproduces the shell's static wallpaper.
             hbrBackground: unsafe { CreateSolidBrush(0x0026_2626) },
             ..unsafe { zeroed() }
         };
@@ -179,7 +209,17 @@ impl Backend {
             unsafe { DestroyWindow(h) };
             return Err(failure);
         }
-        self.compositor.overlays.push((bounds, h as usize));
+        let mut backdrop = Box::new(Backdrop {
+            wallpaper,
+            viewport: bounds,
+            paint_failed: false,
+        });
+        unsafe { SetWindowLongPtrW(h, GWLP_USERDATA, (&mut *backdrop as *mut Backdrop) as isize) };
+        self.compositor.overlays.push(Overlay {
+            bounds,
+            hwnd: h as usize,
+            backdrop,
+        });
         Ok(h)
     }
 
@@ -203,30 +243,50 @@ impl Backend {
         }
         // A monitor that dropped out of this frame (full-display pause) must not keep a
         // topmost overlay. Other monitors in `areas` stay up, so their animation does not snap.
-        for &(bounds, h) in &self.compositor.overlays {
-            if !areas.contains(&bounds) {
-                unsafe {
-                    ShowWindow(h as HWND, SW_HIDE);
-                }
-            }
-        }
+        self.compositor.thumbnails.retain(|_, (hwnd, _)| {
+            self.compositor
+                .overlays
+                .iter()
+                .any(|o| o.hwnd == *hwnd && areas.contains(&o.bounds))
+        });
+        self.compositor
+            .overlays
+            .retain(|o| areas.contains(&o.bounds));
         if areas.is_empty() {
             self.compose_end();
             return Ok(());
+        }
+        if fresh
+            || areas.iter().any(|area| {
+                !self
+                    .compositor
+                    .wallpaper
+                    .as_ref()
+                    .is_some_and(|w| w.covers(*area))
+            })
+        {
+            let wallpaper = Wallpaper::load(self.compositor.wallpaper.as_ref())?;
+            for overlay in &mut self.compositor.overlays {
+                wallpaper.validate(overlay.bounds)?;
+                overlay.backdrop.wallpaper = wallpaper.clone();
+                overlay.backdrop.paint_failed = false;
+                unsafe { InvalidateRect(overlay.hwnd as HWND, null(), 0) };
+            }
+            self.compositor.wallpaper = Some(wallpaper);
         }
         self.compositor.retain(sprites);
         for &area in &areas {
             self.overlay(area)?;
         }
-        // Iconic sources have no live picture. Restore only those early-safe sources before
-        // drawing. They can briefly expose the target until DWM supplies their first picture;
-        // visible sources must instead move only after the old-frame overlay covers them.
-        self.place_sprites(sprites, true)?;
-        self.draw(sprites)?;
+        // Prepare every currently drawable source before showing the cover. Iconic early-safe
+        // sources are omitted here: restoring them before the cover exposes their target.
+        self.draw(sprites, true)?;
         self.compositor.active = true;
+        let mut uncovered = false;
         for area in areas {
             let h = self.overlay(area)?;
             if unsafe { IsWindowVisible(h) } == 0 {
+                uncovered = true;
                 if unsafe {
                     SetWindowPos(
                         h,
@@ -245,8 +305,21 @@ impl Backend {
             }
         }
         pump();
-        if fresh {
-            // The covered picture must be on screen before anything moves underneath.
+        if self
+            .compositor
+            .overlays
+            .iter()
+            .any(|o| o.backdrop.paint_failed)
+        {
+            return Err(error(
+                ErrorCode::OperationDenied,
+                "Static desktop wallpaper painting failed (compositor)",
+                None,
+            ));
+        }
+        if uncovered {
+            // Flush only a newly shown cover (including a monitor joining a retarget), never
+            // every frame. The covered picture must be on screen before sources move.
             let hr = unsafe { DwmFlush() };
             if hr < 0 {
                 return Err(error(
@@ -256,18 +329,16 @@ impl Backend {
                 ));
             }
         }
-        if self.place_sprites(sprites, false)? {
-            self.draw(sprites)?;
+        // The wallpaper and visible-source pictures now cover the monitor. Only now restore
+        // iconic sources and move visible ones. DWM presentation is not client repaint readiness.
+        if self.place_sprites(sprites)? {
+            self.draw(sprites, false)?;
         }
         pump();
         Ok(())
     }
 
-    fn place_sprites(
-        &mut self,
-        sprites: &[Sprite],
-        restoring_only: bool,
-    ) -> Result<bool, AppError> {
+    fn place_sprites(&mut self, sprites: &[Sprite]) -> Result<bool, AppError> {
         let mut moved = false;
         for action in sprites.iter().filter_map(|s| s.early.as_ref()) {
             let NativeAction::Placement { window_id, .. } = action else {
@@ -277,14 +348,11 @@ impl Backend {
                 continue;
             }
             // Source destruction is handled by draw; do not retry placement on a reused HWND.
-            let Ok(entry) = self.entry(window_id) else {
+            let Ok(_) = self.entry(window_id) else {
                 self.compositor.thumbnails.remove(window_id);
                 self.compositor.placed.remove(window_id);
                 continue;
             };
-            if restoring_only && unsafe { IsIconic(entry.hwnd as HWND) } == 0 {
-                continue;
-            }
             // apply restores a refused source. Uncover it rather than hiding that error behind
             // a stale thumbnail until the final frame; the caller can fall back to native frames.
             self.apply(std::slice::from_ref(action))?;
@@ -296,17 +364,17 @@ impl Backend {
         Ok(moved)
     }
 
-    fn draw(&mut self, sprites: &[Sprite]) -> Result<(), AppError> {
+    fn draw(&mut self, sprites: &[Sprite], before_cover: bool) -> Result<(), AppError> {
         for s in sprites {
-            let Some(&(_, overlay)) = self
+            let Some(overlay) = self
                 .compositor
                 .overlays
                 .iter()
-                .find(|(b, _)| *b == s.bounds)
+                .find(|o| o.bounds == s.bounds)
             else {
                 continue;
             };
-            let overlay = overlay as HWND;
+            let overlay = overlay.hwnd as HWND;
             let Ok(entry) = self.entry(&s.window_id) else {
                 self.compositor.thumbnails.remove(&s.window_id);
                 self.compositor.placed.remove(&s.window_id);
@@ -331,7 +399,13 @@ impl Backend {
                 bottom: s.bounds.height as i32,
             };
             let on_screen = intersect(dest, client).is_some();
-            if unsafe { IsIconic(source) != 0 || IsWindowVisible(source) == 0 } {
+            let iconic = unsafe { IsIconic(source) } != 0;
+            if iconic && before_cover && s.early.is_some() {
+                self.compositor.thumbnails.remove(&s.window_id);
+                self.compositor.placed.remove(&s.window_id);
+                continue;
+            }
+            if iconic || unsafe { IsWindowVisible(source) } == 0 {
                 self.compositor.thumbnails.remove(&s.window_id);
                 self.compositor.placed.remove(&s.window_id);
                 if on_screen {
@@ -444,9 +518,9 @@ impl Backend {
         }
         // Cleanup also covers preparation failures before `active` was set.
         // Hide first: an overlay without its pictures would flash the backdrop.
-        for &(_, h) in &self.compositor.overlays {
+        for overlay in &self.compositor.overlays {
             unsafe {
-                ShowWindow(h as HWND, SW_HIDE);
+                ShowWindow(overlay.hwnd as HWND, SW_HIDE);
             }
         }
         self.compositor.clear();
@@ -457,6 +531,28 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_is_presented_before_any_source_restore_or_placement() {
+        // Native-free order regression: Win32 calls cannot run against fixture HWNDs here.
+        // This fails the old restore-before-draw path, without asserting DWM/client readiness.
+        let source = include_str!("compositor.rs");
+        let body = source
+            .split("fn compose_frame(")
+            .nth(1)
+            .unwrap()
+            .split("fn place_sprites(")
+            .next()
+            .unwrap();
+        let draw = body.find("self.draw(").unwrap();
+        let show = body.find("SetWindowPos(").unwrap();
+        let flush = body.find("DwmFlush()").unwrap();
+        let place = body.find("self.place_sprites(").unwrap();
+        assert!(draw < show && show < flush && flush < place);
+        assert_eq!(body.matches("DwmFlush()").count(), 1);
+        assert_eq!(body.matches("self.place_sprites(").count(), 1);
+        assert!(body.contains("if uncovered {"));
+    }
 
     #[test]
     fn overlay_absorbs_mouse_without_activation_or_keyboard_interception() {
