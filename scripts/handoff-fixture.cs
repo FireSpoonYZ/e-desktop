@@ -14,6 +14,7 @@ using System.Windows.Forms;
 // generation uint32 LE, width uint16 LE, height uint16 LE, ASCII role, XOR checksum (seed A7).
 class HandoffFixture {
   public const int Cell = 4, Inset = 8, MarkerWidth = 48, MarkerHeight = 40;
+  const int DWMWA_TRANSITIONS_FORCEDISABLED = 3;
   public static readonly Color Zero = Color.FromArgb(16,16,16), One = Color.FromArgb(240,240,240);
   public static readonly Color[] Borders = {
     Color.FromArgb(0,208,208), Color.FromArgb(208,0,208),
@@ -27,6 +28,7 @@ class HandoffFixture {
   [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd, ref Point point);
   [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
   [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out Rect rect, int size);
+  [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 
   class Options {
     public string Tag, Role, StateFile, Reference;
@@ -128,7 +130,7 @@ class HandoffFixture {
     uint desired = 1, paintedGeneration;
     Size desiredSize;
     long due, nextHeartbeat, stateSequence, publishedAt;
-    bool started;
+    bool started, transitionsForcedDisabled;
     public FixtureForm(Options options) {
       this.options=options;
       Text="e-desktop Handoff " + options.Tag + " " + options.Role;
@@ -141,6 +143,13 @@ class HandoffFixture {
         if (due!=0 && now>=due) Publish();
         if (now>=nextHeartbeat) { WriteState(); nextHeartbeat=now+Stopwatch.Frequency/10; }
       };
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+      base.OnHandleCreated(e);
+      // Fixture-owned initial policy; this set-only attribute is not a readiness signal.
+      int disabled=1;
+      Marshal.ThrowExceptionForHR(DwmSetWindowAttribute(Handle,DWMWA_TRANSITIONS_FORCEDISABLED,ref disabled,sizeof(int)));
+      transitionsForcedDisabled=true;
     }
     protected override void OnShown(EventArgs e) {
       base.OnShown(e);
@@ -208,6 +217,7 @@ class HandoffFixture {
         paintedClientSize=painted==null ? null : new { width=painted.Width,height=painted.Height },
         paintDelayMs=options.Delay, pending=due!=0, paintDueQpcTicks=due, bitmapPublishedQpcTicks=publishedAt,
         initialRequestedVisibleSize=new { width=options.Width,height=options.Height },
+        fixtureInitialPolicy=new { owner="fixture", dwmTransitionsForcedDisabled=transitionsForcedDisabled, semanticReady=(bool?)null },
         marker=new { version=1, cellPixels=Cell, insetPixels=Inset, columns=12, rows=10 }
       };
       string path=options.StateFile, temp=path+".tmp";
