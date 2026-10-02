@@ -876,6 +876,10 @@ impl Controller {
             self.animation.discard_stale_focus();
         }
         let actions = self.animation.frame(now);
+        // Queued input may wake the loop before a frame is due; do not redraw its overlay.
+        if actions.is_empty() {
+            return Ok(());
+        }
         let result = self.present(actions, false);
         if self.animation.deferred_focus_id().is_none() {
             self.ignored_foreground = None;
@@ -953,6 +957,14 @@ impl Controller {
     }
 }
 
+/// Hook events still arrive through an input-blocking overlay. Never interpret parked HWNDs
+/// as the drawn target; releases and lifetime events must keep draining normally.
+#[cfg(target_os = "windows")]
+fn compositor_blocks_native_pointer(composing: bool, raw: &crate::platform::hook::Raw) -> bool {
+    use crate::platform::hook::Raw;
+    composing && matches!(raw, Raw::Grab { .. } | Raw::Move { .. } | Raw::MoveSize { start: true, .. })
+}
+
 #[cfg(target_os = "windows")]
 impl Controller {
     fn refresh_within(&mut self, delay: Duration) {
@@ -966,7 +978,7 @@ impl Controller {
         let suspended = |id: &str| snapshot.suspended_monitors.iter().any(|s| s == id);
         hook::configure(hook::Settings {
             targets: match (&self.backend, config.drag_modifier) {
-                (Some(backend), Some(_)) if enabled => backend
+                (Some(backend), Some(_)) if enabled && !backend.composing() => backend
                     .pointer_targets()
                     .into_iter()
                     .filter(|hwnd| {
@@ -1109,6 +1121,13 @@ impl Controller {
         raw: crate::platform::hook::Raw,
     ) -> Result<Option<Request>, AppError> {
         use crate::platform::hook::Raw;
+        let blocked = compositor_blocks_native_pointer(
+            self.backend.as_ref().is_some_and(Backend::composing),
+            &raw,
+        );
+        if blocked && !matches!(raw, Raw::Move { .. }) {
+            return Ok(None);
+        }
         match raw {
             Raw::Up => {
                 // The hook runs before the dragged window's own loop sees the release.
@@ -1223,7 +1242,10 @@ impl Controller {
                         }));
                     }
                 }
-                if !config.focus_follows_mouse || pressed || !can_focus {
+                if !config.focus_follows_mouse || pressed || !can_focus || blocked {
+                    if blocked {
+                        self.hovered = None;
+                    }
                     return Ok(None);
                 }
                 let Some(backend) = &self.backend else {
@@ -1874,6 +1896,26 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::model::Monitor;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn compositor_pointer_gate_blocks_starts_but_keeps_release_and_cleanup_events() {
+        use crate::platform::hook::Raw;
+        for raw in [
+            Raw::Grab { hwnd: 1, x: 0, y: 0 },
+            Raw::Move { x: 0, y: 0, pressed: false },
+            Raw::MoveSize { hwnd: 1, start: true, moving: Some(true) },
+        ] {
+            assert!(compositor_blocks_native_pointer(true, &raw));
+            assert!(!compositor_blocks_native_pointer(false, &raw));
+        }
+        for raw in [
+            Raw::Release { x: 0, y: 0 }, Raw::Up, Raw::Windows,
+            Raw::MoveSize { hwnd: 1, start: false, moving: None },
+        ] {
+            assert!(!compositor_blocks_native_pointer(true, &raw));
+        }
+    }
 
     #[test]
     fn surface_gate_checks_the_selected_host_before_showing() {

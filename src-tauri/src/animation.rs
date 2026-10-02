@@ -64,6 +64,9 @@ struct Move {
     to: Rect,
     /// The last frame produced.
     current: Rect,
+    /// x, y, width, height velocities in physical pixels/second.
+    initial_velocity: [f64; 4],
+    velocity: [f64; 4],
     /// Monitor viewport expanded by half a gap: the area frames may draw into.
     bounds: Rect,
     /// Minimized (or never shown) since the last frame: mask before restoring it.
@@ -71,11 +74,29 @@ struct Move {
 }
 
 impl Move {
-    fn frame(&mut self, t: f64) -> NativeAction {
+    fn frame(&mut self, elapsed: Duration, duration: Duration) -> NativeAction {
         let NativeAction::Placement { window_id, .. } = &self.action else {
             unreachable!()
         };
-        let rect = lerp_rect(self.from, self.to, t);
+        let from = rect_components(self.from);
+        let to = rect_components(self.to);
+        let values: [f64; 4] = std::array::from_fn(|i| {
+            let (position, velocity) = spring(
+                from[i],
+                to[i],
+                self.initial_velocity[i],
+                elapsed.as_secs_f64(),
+                duration.as_secs_f64(),
+            );
+            self.velocity[i] = velocity;
+            position.round()
+        });
+        let rect = Rect {
+            x: values[0].clamp(i32::MIN.into(), i32::MAX.into()) as i32,
+            y: values[1].clamp(i32::MIN.into(), i32::MAX.into()) as i32,
+            width: values[2].clamp(1.0, u32::MAX.into()) as u32,
+            height: values[3].clamp(1.0, u32::MAX.into()) as u32,
+        };
         self.current = rect;
         let clip = clip_to_viewport(rect, self.bounds);
         let minimized = clip.is_none();
@@ -127,10 +148,8 @@ impl Animation {
             .collect()
     }
 
-    /// Restart the clock from the frame on screen: preparing a compositor overlay can take a
-    /// frame or two, which must not skip the fastest part of the ease-out curve.
-    /// A poll that kept the same plan is not a new ease (niri leaves an unchanged view-offset
-    /// target alone). No velocity is carried; a real retarget eases from the displayed frame.
+    /// Restart the clock from the displayed frame and velocity: preparing an overlay can
+    /// take a frame or two. A poll that kept the same target must not restart its motion.
     pub fn restart(&mut self, now: Instant) {
         if !self.fresh {
             return;
@@ -141,6 +160,7 @@ impl Animation {
         };
         for m in &mut plan.moves {
             m.from = m.current;
+            m.initial_velocity = m.velocity;
         }
         plan.started = now;
         plan.next_frame = now + FRAME_INTERVAL.min(plan.duration);
@@ -309,6 +329,17 @@ impl Animation {
                 })
             })?
         });
+        let velocities: HashMap<_, _> = self.plan.as_ref().map_or_else(HashMap::new, |plan| {
+            plan.moves
+                .iter()
+                .map(|m| {
+                    let NativeAction::Placement { window_id, .. } = &m.action else {
+                        unreachable!()
+                    };
+                    (window_id.clone(), (m.current, m.bounds, m.velocity))
+                })
+                .collect()
+        });
         let carried = self.cancel().into_iter().rev().find(is_focus);
         if let Some(focus) = carried.filter(|_| !actions.iter().any(is_focus)) {
             actions.push(focus);
@@ -330,15 +361,36 @@ impl Animation {
             };
             match planned {
                 Some((from, to, bounds, hidden)) => {
+                    let NativeAction::Placement {
+                        window_id,
+                        minimized,
+                        ..
+                    } = &action
+                    else {
+                        unreachable!()
+                    };
+                    // Carry only the velocity of this displayed frame in the same viewport.
+                    let velocity = velocities
+                        .get(window_id)
+                        .filter(|(current, old_bounds, _)| {
+                            *current == from && *old_bounds == bounds
+                        })
+                        .map_or([0.0; 4], |(_, _, velocity)| *velocity);
+                    if from == to && hidden == *minimized && velocity == [0.0; 4] {
+                        now_actions.push(action);
+                        continue;
+                    }
                     let mut m = Move {
                         action,
                         from,
                         to,
                         current: from,
+                        initial_velocity: velocity,
+                        velocity,
                         bounds,
                         hidden,
                     };
-                    now_actions.push(m.frame(0.0));
+                    now_actions.push(m.frame(Duration::ZERO, duration));
                     moves.push(m);
                 }
                 None => now_actions.push(action),
@@ -390,9 +442,14 @@ impl Animation {
         if elapsed >= plan.duration {
             return self.cancel(); // Exact engine actions, not rounded interpolated endpoints.
         }
-        plan.next_frame = (now + FRAME_INTERVAL).min(plan.started + plan.duration);
-        let t = ease(elapsed.as_secs_f64() / plan.duration.as_secs_f64());
-        plan.moves.iter_mut().map(|m| m.frame(t)).collect()
+        // Stay on the original cadence; skip missed ticks rather than drifting or catching up.
+        let tick = elapsed.as_nanos() / FRAME_INTERVAL.as_nanos() + 1;
+        plan.next_frame =
+            (plan.started + FRAME_INTERVAL * tick as u32).min(plan.started + plan.duration);
+        plan.moves
+            .iter_mut()
+            .map(|m| m.frame(elapsed, plan.duration))
+            .collect()
     }
 }
 
@@ -512,10 +569,7 @@ fn plan_move(
     let shown_after = &page.id == is_active;
     if shown_before && shown_after {
         // Hidden inside the viewport (e.g. behind a fullscreen neighbour) is not a start frame.
-        if (from_hidden && visible(from))
-            || (minimized && visible(rect))
-            || (from == rect && from_hidden == minimized)
-        {
+        if (from_hidden && visible(from)) || (minimized && visible(rect)) {
             return None;
         }
         return Some((from, rect, bounds, from_hidden));
@@ -549,26 +603,39 @@ fn shift(rect: Rect, dy: i64) -> Rect {
     }
 }
 
-/// niri's default ease-out cubic.
-fn ease(t: f64) -> f64 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+fn rect_components(rect: Rect) -> [f64; 4] {
+    [
+        rect.x.into(),
+        rect.y.into(),
+        rect.width.into(),
+        rect.height.into(),
+    ]
 }
 
-fn lerp(from: i64, to: i64, t: f64) -> i64 {
-    // i64 differences: MIN -> MAX spans more than an i32. Exact endpoints at t = 0 and 1.
-    from + ((to - from) as f64 * t).round() as i64
-}
-
-fn lerp_rect(from: Rect, to: Rect, t: f64) -> Rect {
-    let size = |a: u32, b: u32| lerp(a.into(), b.into(), t).clamp(1, u32::MAX.into()) as u32;
-    let pos =
-        |a: i32, b: i32| lerp(a.into(), b.into(), t).clamp(i32::MIN.into(), i32::MAX.into()) as i32;
-    Rect {
-        x: pos(from.x, to.x),
-        y: pos(from.y, to.y),
-        width: size(from.width, to.width),
-        height: size(from.height, to.height),
+/// Analytic critically damped spring, with a small Hermite tail correction so the configured
+/// duration still ends exactly at the target, at rest. No integration step depends on cadence.
+fn spring(from: f64, to: f64, velocity: f64, elapsed: f64, duration: f64) -> (f64, f64) {
+    if elapsed <= 0.0 {
+        return (from, velocity);
     }
+    if elapsed >= duration {
+        return (to, 0.0);
+    }
+    let omega = 6.0 / duration;
+    let displacement = from - to;
+    let coefficient = velocity + omega * displacement;
+    let decay = (-omega * elapsed).exp();
+    let end_decay = (-omega * duration).exp();
+    let residual = (displacement + coefficient * duration) * end_decay;
+    let end_velocity = (velocity - omega * coefficient * duration) * end_decay;
+    let t = elapsed / duration;
+    let position = to + (displacement + coefficient * elapsed) * decay
+        - residual * (3.0 * t * t - 2.0 * t * t * t)
+        - duration * end_velocity * (t * t * t - t * t);
+    let velocity = (velocity - omega * coefficient * elapsed) * decay
+        - residual * (6.0 * t - 6.0 * t * t) / duration
+        - end_velocity * (3.0 * t * t - 2.0 * t);
+    (position, velocity)
 }
 
 fn clip_to_viewport(rect: Rect, viewport: Rect) -> Option<Rect> {
@@ -710,20 +777,191 @@ mod tests {
     };
 
     #[test]
-    fn interpolation_is_monotone_and_exact_at_the_ends() {
-        for (from, to) in [(i64::from(i32::MIN), i64::from(i32::MAX)), (5, -3)] {
+    fn spring_is_monotone_from_rest_and_stops_exactly() {
+        for (from, to) in [(f64::from(i32::MIN), f64::from(i32::MAX)), (5.0, -3.0)] {
             let mut previous = from;
             for step in 0..=100 {
-                let x = lerp(from, to, ease(f64::from(step) / 100.0));
+                let (x, velocity) = spring(from, to, 0.0, f64::from(step) / 100.0, 1.0);
                 assert!(if from <= to {
                     x >= previous
                 } else {
                     x <= previous
                 });
+                assert!(x.is_finite() && velocity.is_finite());
                 previous = x;
             }
             assert_eq!(previous, to);
-            assert_eq!(lerp(from, to, ease(0.0)), from);
+            assert_eq!(spring(from, to, 0.0, 0.0, 1.0), (from, 0.0));
+            assert_eq!(spring(from, to, 0.0, 1.0, 1.0), (to, 0.0));
+            let (near_end, speed) = spring(from, to, 0.0, 1.0 - 1e-8, 1.0);
+            assert!((near_end - to).abs() < 1e-5);
+            assert!(speed.abs() < (to - from).abs() * 1e-6);
+        }
+    }
+
+    #[test]
+    fn retarget_carries_displayed_velocity_even_on_reversal_and_restart() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        run(&mut engine, &mut animation, &mut applied, scroll(400), now);
+        remember(&mut applied, &animation.frame(now + MS(48)));
+        let old = &animation.plan.as_ref().unwrap().moves[0];
+        let displayed = old.current;
+        let velocity = old.velocity;
+        assert!(velocity[0].abs() > 1.0);
+        run(
+            &mut engine,
+            &mut animation,
+            &mut applied,
+            scroll(-300),
+            now + MS(55),
+        );
+        let retarget = &animation.plan.as_ref().unwrap().moves[0];
+        assert_eq!(retarget.current, displayed);
+        assert_eq!(retarget.velocity, velocity);
+        assert_eq!(retarget.initial_velocity, velocity);
+        // Even preparation delays preserve the displayed frame's tangent, not extrapolated time.
+        animation.restart(now + MS(70));
+        let retarget = &animation.plan.as_ref().unwrap().moves[0];
+        assert_eq!(retarget.from, displayed);
+        assert_eq!(retarget.initial_velocity, velocity);
+        let epsilon = 1e-7;
+        for (i, (&from, &to)) in rect_components(retarget.from)
+            .iter()
+            .zip(&rect_components(retarget.to))
+            .enumerate()
+        {
+            let (position, speed) = spring(from, to, velocity[i], epsilon, 0.160);
+            assert!(((position - from) / epsilon - velocity[i]).abs() < 0.1);
+            assert!((speed - velocity[i]).abs() < 0.1);
+        }
+        remember(&mut applied, &animation.frame(now + MS(230)));
+        assert!(animation.deadline().is_none());
+        run(
+            &mut engine,
+            &mut animation,
+            &mut applied,
+            scroll(100),
+            now + MS(240),
+        );
+        assert!(
+            animation
+                .plan
+                .as_ref()
+                .unwrap()
+                .moves
+                .iter()
+                .all(|m| m.velocity == [0.0; 4])
+        );
+    }
+
+    #[test]
+    fn retarget_at_displayed_position_still_brakes_existing_motion() {
+        let (mut engine, mut applied) = fixture();
+        let mut animation = Animation::default();
+        let now = Instant::now();
+        run(&mut engine, &mut animation, &mut applied, scroll(400), now);
+        remember(&mut applied, &animation.frame(now + MS(48)));
+        let old = animation.plan.as_ref().unwrap().moves.iter()
+            .find(|m| matches!(&m.action, NativeAction::Placement { window_id, .. } if window_id == "0"))
+            .unwrap();
+        let velocity = old.velocity;
+        let displayed = old.current;
+        let target = NativeAction::Placement {
+            window_id: "0".into(),
+            rect: displayed,
+            clip: None,
+            minimized: false,
+        };
+        let snapshot = engine.snapshot();
+        animation.start(
+            snapshot,
+            snapshot,
+            &applied,
+            vec![target.clone()],
+            MS(160),
+            now + MS(48),
+        );
+        let movement = &animation.plan.as_ref().unwrap().moves[0];
+        assert_eq!(movement.from, movement.to);
+        assert_eq!(movement.velocity, velocity);
+        assert!(velocity[0].abs() > 1.0);
+        assert_eq!(animation.frame(now + MS(208)), vec![target]);
+    }
+
+    #[test]
+    fn irregular_frames_use_elapsed_time_skip_ticks_and_finish_after_a_long_gap() {
+        let (mut engine, mut applied) = fixture();
+        let prev = engine.snapshot().clone();
+        let target = engine.dispatch(scroll(400)).unwrap().actions;
+        let now = Instant::now();
+        let mut regular = Animation::default();
+        let mut sparse = Animation::default();
+        for animation in [&mut regular, &mut sparse] {
+            animation.start(
+                &prev,
+                engine.snapshot(),
+                &applied,
+                target.clone(),
+                MS(160),
+                now,
+            );
+        }
+        for at in [16, 32, 48, 64, 80] {
+            regular.frame(now + MS(at));
+        }
+        sparse.frame(now + MS(37));
+        assert_eq!(sparse.deadline(), Some(now + MS(48)));
+        assert!(sparse.frame(now + MS(40)).is_empty());
+        assert_eq!(
+            json(regular.frame(now + MS(97))),
+            json(sparse.frame(now + MS(97)))
+        );
+        assert_eq!(sparse.deadline(), Some(now + MS(112)));
+        remember(&mut applied, &sparse.frame(now + Duration::from_secs(30)));
+        assert_eq!(
+            json(sparse.frame(now + Duration::from_secs(31))),
+            json(Vec::<NativeAction>::new())
+        );
+        assert!(sparse.deadline().is_none());
+        for action in target {
+            if let NativeAction::Placement {
+                window_id,
+                rect,
+                clip,
+                minimized,
+            } = action
+            {
+                assert_eq!(applied[&window_id], (rect, clip, minimized));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_duration_and_disabled_retarget_drop_momentum_and_pending_frames() {
+        for disabled in [false, true] {
+            let (mut engine, mut applied) = fixture();
+            let mut animation = Animation::default();
+            let now = Instant::now();
+            run(&mut engine, &mut animation, &mut applied, scroll(400), now);
+            remember(&mut applied, &animation.frame(now + MS(48)));
+            let prev = engine.snapshot().clone();
+            let target = engine.dispatch(scroll(-300)).unwrap().actions;
+            let mut next = engine.snapshot().clone();
+            next.enabled = !disabled;
+            let duration = if disabled { MS(160) } else { Duration::ZERO };
+            let actions = animation.start(
+                &prev,
+                &next,
+                &applied,
+                target.clone(),
+                duration,
+                now + MS(48),
+            );
+            assert_eq!(json(actions), json(target));
+            assert!(animation.deadline().is_none());
+            assert!(animation.frame(now + MS(1000)).is_empty());
         }
     }
 
