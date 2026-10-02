@@ -90,6 +90,8 @@ export type Command =
   | { type: 'switchPage'; monitorId: MonitorId; pageId: PageId }
   | { type: 'addPage'; monitorId: MonitorId }
   | { type: 'moveWindowToPage'; windowId: WindowId; pageId: PageId }
+  /** viewportX overrides hit geometry for a page-targeted overview drop only. */
+  | { type: 'dropWindow'; windowId: WindowId; x: number; y: number; pageId?: PageId; viewportX?: number }
   | { type: 'moveWindow'; direction: Direction }
   | { type: 'cycleWidth' }
   | { type: 'setColumnWidth'; width: number }
@@ -112,7 +114,7 @@ export type NativeAction =
 export interface Transition { snapshot: Snapshot; actions: NativeAction[] }
 
 export type OnCommand = (command: Command) => void | Promise<void>;
-export interface ControlProps { snapshot: Snapshot; onCommand: OnCommand; busy?: boolean }
+export interface ControlProps { snapshot: Snapshot; onCommand: OnCommand; busy?: boolean; busyCommand?: Command['type'] }
 export interface TopBarProps extends ControlProps {
   onOpenOverview: () => void;
   onOpenCommands: () => void;
