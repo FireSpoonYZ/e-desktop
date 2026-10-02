@@ -2,7 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { OverviewProps, Page, WindowId } from '../model';
 import { useCommand, useSurface } from '../commands/surface';
-import { canInteract, moveCommand, overviewScale, pageGeometry, sizingTarget, trackDrag, trackResize, widthCommand } from './pointer';
+import { canInteract, dropCommand, moveCommand, overviewScale, pageGeometry, sizingTarget, trackDrag, trackResize, widthCommand } from './pointer';
 import { WindowPreview, usePreviewFeed, usePreviewSlots } from './previews';
 import type { PreviewRequest } from './previews';
 import { useOverviewZoom } from './zoom';
@@ -32,8 +32,12 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
   const previewsAvailable = previewSession !== null && !!syncPreviews;
   const { statuses, publish } = usePreviewFeed(previewSession, syncPreviews);
   const zoom = useOverviewZoom({ snapshot, monitor: selected, previewsAvailable, publish, onDismiss });
-  closeRef.current = zoom.requestClose;
-  usePreviewSlots(root, { available: previewsAvailable, active: !dropPreview && !preview, onSlotsChange: zoom.onSlots });
+  const requestClose = () => {
+    dragging.current?.cancel(); resizing.current?.cancel();
+    zoom.requestClose();
+  };
+  closeRef.current = requestClose;
+  usePreviewSlots(root, { available: previewsAvailable, onSlotsChange: zoom.onSlots });
   useLayoutEffect(() => {
     const element = root.current;
     if (!element) return;
@@ -53,8 +57,18 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
   useLayoutEffect(() => {
     root.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'center' });
   }, [root, selected?.monitor.id]);
-  const pageAt = (event: PointerEvent) => document.elementFromPoint(event.clientX, event.clientY)
-    ?.closest<HTMLElement>('[data-overview-page]')?.dataset.overviewPage ?? null;
+  const dropAt = (windowId: WindowId, event: PointerEvent) => {
+    const page = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-overview-page]');
+    const pageId = page?.dataset.overviewPage;
+    const scroll = page?.querySelector<HTMLElement>('[data-overview-scroll]');
+    if (!pageId || !scroll) return null;
+    const bounds = scroll.getBoundingClientRect();
+    const state = latest.current;
+    const command = dropCommand(state.snapshot, state.blocked, windowId, pageId,
+      event.clientX - bounds.left - scroll.clientLeft, event.clientY - bounds.top - scroll.clientTop,
+      scroll.scrollLeft, state.scale);
+    return command ? { pageId, command } : null;
+  };
   useEffect(() => {
     if (resizing.current && !resizing.current.valid()) resizing.current.cancel();
     if (dragging.current && (!canInteract(snapshot, blocked)
@@ -95,17 +109,17 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
           const handle = event.currentTarget, pointerId = event.pointerId;
           handle.setPointerCapture(pointerId);
           const cancel = trackDrag(globalThis.window, pointerId, event.clientX, event.clientY,
-            (event) => { suppressClick.current = true; setDropPreview({ windowId, pageId: pageAt(event) }); },
+            (event) => { suppressClick.current = true; setDropPreview({ windowId, pageId: dropAt(windowId, event)?.pageId ?? null }); },
             (event) => {
               dragging.current = null; setDropPreview(null);
               if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
-              if (event) { const pageId = pageAt(event); if (pageId) move(windowId, pageId); }
+              if (event) { const drop = dropAt(windowId, event); if (drop) void latest.current.run(drop.command); }
             });
           dragging.current = { windowId, cancel };
         }}
         onClick={(event) => {
           if (suppressClick.current && event?.detail !== 0) { event?.preventDefault(); return; }
-          if (!blocked && ready) void run({ type: 'focusWindow', windowId }, zoom.requestClose);
+          if (!blocked && ready) void run({ type: 'focusWindow', windowId }, requestClose);
         }}>
         <WindowPreview windowId={windowId} available={previewsAvailable} status={statuses[windowId]} />
         <span className="overview-caption"><strong>{native.title || '无标题窗口'}</strong><span>{native.appName || '未知应用'}{window.fullscreen ? ' · 全屏' : window.floating ? ' · 浮动' : ''}</span></span>
@@ -139,7 +153,7 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
           aria-pressed={monitor.id === selected?.monitor.id} disabled={!!dropPreview || !!preview || zoom.phase !== null}
           onClick={() => setMonitorId(monitor.id)}>显示器 {index + 1}</button>)}
       </nav>
-      <button data-initial-focus className="overview-close" onClick={zoom.requestClose}>关闭 <kbd>Esc</kbd></button></header>
+      <button data-initial-focus className="overview-close" onClick={requestClose}>关闭 <kbd>Esc</kbd></button></header>
     <div className="overview-notices">
       {!snapshot.enabled && <p role="status">管理已暂停。启用后可进入工作区、聚焦和移动窗口。</p>}
       {snapshot.backend.availability !== 'ready' && <p role="status">{snapshot.backend.message || '原生后端不可用'}</p>}
@@ -159,12 +173,14 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
         {selected.pages.map((page, position) => {
           const { monitor, viewport, activePage } = selected;
           const geometry = pageGeometry(page, viewport, scale);
+          const dropReady = !!dropPreview && !!dropCommand(snapshot, blocked, dropPreview.windowId, page.id,
+            geometry.width / 2, geometry.height / 2, 0, scale);
           return <section key={page.id} className="overview-page" aria-label={page.name} data-active={page.id === activePage}
             style={{ width: geometry.width }} data-overview-page={page.id}
-            data-drop-ready={!!dropPreview && !!moveCommand(snapshot, blocked, dropPreview.windowId, page.id)}
-            data-drop-target={dropPreview?.pageId === page.id && !!moveCommand(snapshot, blocked, dropPreview.windowId, page.id)}>
+            data-drop-ready={dropReady}
+            data-drop-target={dropPreview?.pageId === page.id && dropReady}>
             <header><button aria-current={page.id === activePage ? 'page' : undefined} disabled={blocked || !ready}
-              onClick={() => void run({ type: 'switchPage', monitorId: monitor.id, pageId: page.id }, onDismiss)}>
+              onClick={() => void run({ type: 'switchPage', monitorId: monitor.id, pageId: page.id }, requestClose)}>
               <span className="overview-page-number">{String(position + 1).padStart(2, '0')}</span>{page.name}
             </button></header>
             <div className="overview-scroll" data-overview-scroll={page.id} style={{ height: geometry.height }}
