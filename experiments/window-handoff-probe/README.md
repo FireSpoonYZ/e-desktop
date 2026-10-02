@@ -18,7 +18,7 @@ $probe = "experiments/window-handoff-probe/target/debug/window-handoff-probe.exe
 ```
 
 Own workspace/lock/target; no root workspace changes. Official windows-sys and serde
-only. All eight Rust tests are pure logic or memory-DC: no HWND or screen DC. Self-test also
+only. All nine Rust tests are pure logic or memory-DC: no HWND or screen DC. Self-test also
 uses only logic/memory DCs. **Without --run there are no source-window preflight calls, window creation, capture or
 desktop mutations. The explicit --offline-proxy branch uses memory DCs and files only;
 otherwise no output directory is created.** No args prints help.
@@ -106,7 +106,20 @@ Controller validates generation/identity/current geometry/deadline. All-black ca
 are conservatively rejected, including genuinely black applications.
 Controller owns the HWND, pumps bounded message batches and waits with
 MsgWaitForMultipleObjectsEx. Source placement is requested asynchronously; geometric
-settling waits pump, not client-ready waits. Completion sends pixels/result on a bounded
+settling waits pump, not client-ready waits.
+
+Only after this controller successfully requests restoration of an iconic source, place
+passes a local restore scope bounded by the existing absolute deadline. It may temporarily
+exempt the source's null monitor/cover containment only when MonitorFromWindow is null
+AND MonitorFromRect of its actual outer rect proves no intersection with any monitor.
+No coordinate sentinel is assumed. Submitted/visible/opaque cover (including current alpha),
+cover geometry/DPI/occlusion, source identity/affinity, actual work area and source DPI
+remain required. A mapped source on another monitor or drawable outside cover still fails.
+The scope is a local argument, never Session/worker state: every exit discards it, normal
+and capture guards stay strict, and successful place returns recheck strict same-monitor/DPI
+and target geometry. No deadline extension, fixed sleep or semantic-ready claim.
+
+Completion sends pixels/result on a bounded
 private channel and signals an event, without placement callbacks. Reset-and-recheck
 closes the lost-wake race. Cancellation/deadline invalidates generation; late results
 can only be logged/released, never reposition or replace pinned pixels.

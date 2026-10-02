@@ -724,6 +724,7 @@ struct Cover {
     bounds: Rect,
     backdrop: Box<Backdrop>,
     thumbnail: Option<isize>,
+    opaque_submitted: bool,
 }
 impl Cover {
     fn new(bounds: Rect) -> Result<Self, String> {
@@ -773,6 +774,7 @@ impl Cover {
             bounds,
             backdrop,
             thumbnail: None,
+            opaque_submitted: false,
         };
         win(
             unsafe { SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA) },
@@ -866,7 +868,19 @@ impl Cover {
             unsafe { SetLayeredWindowAttributes(self.h(), 0, 255, LWA_ALPHA) },
             "opaque cover",
         )?;
-        hr(unsafe { DwmFlush() }, "cover submission DwmFlush")
+        hr(unsafe { DwmFlush() }, "cover submission DwmFlush")?;
+        self.opaque_submitted = true;
+        Ok(())
+    }
+    fn is_opaque_submitted(&self) -> bool {
+        let (mut key, mut alpha, mut flags) = (0, 0, 0);
+        self.opaque_submitted
+            && !self.backdrop.paint_failed
+            && unsafe { IsWindowVisible(self.h()) } != 0
+            && unsafe { GetLayeredWindowAttributes(self.h(), &mut key, &mut alpha, &mut flags) }
+                != 0
+            && alpha == 255
+            && flags == LWA_ALPHA
     }
     fn proxy(&mut self, source: &Dib, r: Rect) -> Result<(), String> {
         let local = self.local(r);
@@ -1006,6 +1020,9 @@ impl Session {
             || self.config.cancel_file.as_ref().is_some_and(|p| p.exists())
     }
     fn guard(&self) -> Result<(), String> {
+        self.guard_in(SourceGeometryScope::Strict)
+    }
+    fn guard_in(&self, scope: SourceGeometryScope) -> Result<(), String> {
         if self.cancelled() {
             return Err("cancelled".into());
         }
@@ -1028,9 +1045,23 @@ impl Session {
         let current_work = monitor_bounds(self.monitor as HMONITOR)?;
         let current_dpi = unsafe { GetDpiForWindow(h) };
         let current_monitor = unsafe { MonitorFromWindow(h, MONITOR_DEFAULTTONULL) } as usize;
+        let restoring = matches!(scope, SourceGeometryScope::ControllerRestoreUntil(_));
+        let cover_ready = restoring && self.cover.as_ref().is_some_and(Cover::is_opaque_submitted);
+        if restoring && !cover_ready {
+            return Err("restore requires an already submitted opaque cover".into());
+        }
+        // MonitorFromWindow can still report an iconic window's historical monitor.
+        // A null monitor AND no intersection of the actual outer rect prove this narrow unmapped case.
+        let outer_monitor = if restoring && current_monitor == 0 {
+            (unsafe { MonitorFromRect(&native(outer(h)?), MONITOR_DEFAULTTONULL) }) as usize
+        } else {
+            current_monitor
+        };
+        let unmapped_restore =
+            scope.permits_unmapped(Instant::now(), current_monitor, outer_monitor, cover_ready);
         if current_work != self.work
             || current_dpi != self.last_drawable.dpi
-            || current_monitor != self.monitor
+            || (current_monitor != self.monitor && !unmapped_restore)
         {
             return Err(format!(
                 "monitor/workarea/DPI changed: {}",
@@ -1042,7 +1073,10 @@ impl Session {
                 })
             ));
         }
-        if unsafe { IsIconic(h) } == 0 && !self.cover_bounds.contains(outer(h)?) {
+        if !unmapped_restore
+            && unsafe { IsIconic(h) } == 0
+            && !self.cover_bounds.contains(outer(h)?)
+        {
             return Err("drawable source escaped safe cover".into());
         }
         if let Some(cover) = self
@@ -1130,6 +1164,13 @@ impl Session {
         }
     }
     fn wait_step(&mut self, deadline: Instant) -> Result<(), String> {
+        self.wait_step_in(deadline, SourceGeometryScope::Strict)
+    }
+    fn wait_step_in(
+        &mut self,
+        deadline: Instant,
+        scope: SourceGeometryScope,
+    ) -> Result<(), String> {
         let mut message: MSG = unsafe { zeroed() };
         for _ in 0..32 {
             if unsafe { PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) } == 0 {
@@ -1146,7 +1187,7 @@ impl Session {
                 break;
             }
         }
-        self.guard()?;
+        self.guard_in(scope)?;
         self.poll_result();
         self.wake.reset()?;
         self.poll_result(); // Reset-and-recheck closes the enqueue/reset lost-wake race.
@@ -1340,9 +1381,10 @@ impl Session {
     fn place(&mut self, target: Rect, deadline: Instant) -> Result<(), String> {
         self.guard()?;
         let cover = self.cover.as_ref().ok_or("no cover")?;
-        if unsafe { IsWindowVisible(cover.h()) } == 0 {
-            return Err("placement requires presented cover".into());
+        if !cover.is_opaque_submitted() {
+            return Err("placement requires a submitted opaque cover".into());
         }
+        let mut source_scope = SourceGeometryScope::Strict;
         if unsafe { IsIconic(self.identity.h()) } != 0 {
             let mut placement = self.saved.placement;
             placement.showCmd = SW_SHOWNOACTIVATE as u32;
@@ -1363,14 +1405,15 @@ impl Session {
                 unsafe { SetWindowPlacement(self.identity.h(), &placement) },
                 "restore directly at requested geometry async",
             )?;
+            source_scope = SourceGeometryScope::ControllerRestoreUntil(deadline);
             while unsafe { IsIconic(self.identity.h()) } != 0 {
                 if Instant::now() >= deadline {
                     return Err("restore geometric deadline".into());
                 }
-                self.wait_step(deadline)?;
+                self.wait_step_in(deadline, source_scope)?;
             }
         }
-        self.guard()?;
+        self.guard_in(source_scope)?;
         win(
             unsafe {
                 SetWindowPos(
@@ -1389,8 +1432,9 @@ impl Session {
             if Instant::now() >= deadline {
                 return Err("target refused/geometric deadline".into());
             }
-            self.wait_step(deadline)?;
+            self.wait_step_in(deadline, source_scope)?;
         }
+        // The local restore scope cannot escape place; every successful return passes strict checks.
         self.guard()
     }
     fn execute(&mut self, log: &mut Log) -> Result<(), String> {

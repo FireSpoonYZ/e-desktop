@@ -322,6 +322,27 @@ pub fn affinity_admission(
     }
 }
 
+/// Passed by place only after its iconic-source restore request succeeds; never stored in Session.
+#[derive(Clone, Copy, Debug)]
+pub enum SourceGeometryScope {
+    Strict,
+    ControllerRestoreUntil(std::time::Instant),
+}
+impl SourceGeometryScope {
+    pub fn permits_unmapped(
+        self,
+        now: std::time::Instant,
+        window_monitor: usize,
+        outer_monitor: usize,
+        opaque_cover_submitted: bool,
+    ) -> bool {
+        matches!(self, Self::ControllerRestoreUntil(deadline) if now < deadline)
+            && window_monitor == 0
+            && outer_monitor == 0
+            && opaque_cover_submitted
+    }
+}
+
 /// Consumer protocol: one native call per trial; timeout/cancel never opens a second slot.
 #[derive(Debug)]
 pub struct CaptureGate {
@@ -400,6 +421,24 @@ mod tests {
     fn args() -> Vec<String> {
         "--pid 42 --hwnd 0x123 --tag trial-1 --role C --mode staged --output out --target -800,20,700,490"
             .split_whitespace().map(String::from).collect()
+    }
+    #[test]
+    fn unmapped_source_permission_is_restore_local_bounded_and_fail_closed() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(150);
+        let restore = SourceGeometryScope::ControllerRestoreUntil(deadline);
+        let strict = SourceGeometryScope::Strict;
+        assert!(restore.permits_unmapped(now, 0, 0, true));
+        assert!(!strict.permits_unmapped(now, 0, 0, true)); // Ordinary/capture scopes stay strict.
+        assert!(!restore.permits_unmapped(deadline, 0, 0, true));
+        assert!(!restore.permits_unmapped(deadline + Duration::from_millis(1), 0, 0, true));
+        assert!(!restore.permits_unmapped(now, 0, 0, false)); // Hidden/unsubmitted/nonopaque cover.
+        for (window, outer) in [(1, 1), (2, 2), (0, 2), (2, 0), (0, 1)] {
+            assert!(!restore.permits_unmapped(now, window, outer, true)); // Mapped, other monitor or conflicting observations.
+        }
+        // No permission state is retained after the local restore value is used.
+        assert!(!strict.permits_unmapped(now, 0, 0, true));
     }
     #[test]
     fn offline_proxy_is_separate_from_run_and_plan() {
