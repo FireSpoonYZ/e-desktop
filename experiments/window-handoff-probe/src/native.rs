@@ -1054,7 +1054,37 @@ impl Session {
                         && r.y < self.cover_bounds.bottom()
                         && r.bottom() > self.cover_bounds.y
                     {
-                        return Err("another visible window is above safe cover".into());
+                        let mut pid = 0;
+                        let mut class = [0u16; 256];
+                        let mut cloaked = 0u32;
+                        let mut key = 0;
+                        let mut alpha = 0;
+                        let mut flags = 0;
+                        let (length, cloak_hr, layered, ex_style) = unsafe {
+                            GetWindowThreadProcessId(above, &mut pid);
+                            (
+                                GetClassNameW(above, class.as_mut_ptr(), class.len() as i32),
+                                DwmGetWindowAttribute(
+                                    above,
+                                    DWMWA_CLOAKED as u32,
+                                    &mut cloaked as *mut _ as _,
+                                    size_of::<u32>() as u32,
+                                ),
+                                GetLayeredWindowAttributes(above, &mut key, &mut alpha, &mut flags),
+                                GetWindowLongPtrW(above, GWL_EXSTYLE),
+                            )
+                        };
+                        return Err(format!(
+                            "another visible window is above safe cover: {}",
+                            json!({
+                                "hwnd": hwnd_string(above), "pid": pid, "rect": r,
+                                "windowClass": String::from_utf16_lossy(&class[..length.max(0) as usize]),
+                                "exStyle": format!("0x{ex_style:x}"), "cloakedQueryHr": cloak_hr,
+                                "cloaked": cloaked, "layeredQuerySucceeded": layered != 0,
+                                "alpha": alpha, "layeredFlags": flags,
+                                "coverHwnd": hwnd_string(cover.h())
+                            })
+                        ));
                     }
                 }
                 above = unsafe { GetWindow(above, GW_HWNDPREV) };
