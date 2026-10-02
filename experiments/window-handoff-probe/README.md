@@ -43,6 +43,14 @@ product spring. This is an independent baseline, not exact product timing.
 The cover is a neutral opaque #262626 union of old/target outer rectangles, not a desktop
 capture, wallpaper reconstruction or multi-window compositor.
 
+The controlled fixture owner explicitly sets DWMWA_TRANSITIONS_FORCEDISABLED=true on
+its own GUI window at startup, identically for all modes. The probe does **not** query,
+set or restore that source attribute: its documented public contract is setter-only,
+so no original value is inferred or saved. Events/trial record
+transitionPolicy=unchanged-by-probe and transitionOriginalQueried=false. The probe does
+not read fixture state to verify this policy or decide readiness. This fixture initial
+policy is an experiment precondition, not exact equivalence to product timing.
+
 **Parent MUST independently bound total real-machine trial/process time.** Consumer
 deadlines DO NOT cancel native PrintWindow or other synchronous Win32/DWM calls.
 There is exactly one detached capture worker and at most one request per trial. A hung
@@ -163,9 +171,9 @@ frame-store ceiling. No LRU/cache/cross-trial reuse. Raw worker capture is separ
 Runtime, JSON/file IO, OS/DWM/window backing allocations are NOT these memory ceilings.
 
 Before first mutation save original normal WINDOWPLACEMENT/show/visibility/null-region
-and DWM transition flag separately from last drawable geometry. Cleanup invalidates
+separately from last drawable geometry. Cleanup invalidates
 presentation, removes cover/input gate, attempts original normal placement without
-activation (two passes for WinForms restore), region and transition flag; checks original
+activation (two passes for WinForms restore) and region; checks original
 physical outer/native normal/visibility. Only matching live identity may be restored;
 destroyed/reused HWNDs are never mutated. Failed restoration is logged and returns
 nonzero; parent owns fixture recovery. Forced termination/native hangs are not cleanup

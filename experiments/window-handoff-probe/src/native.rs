@@ -174,6 +174,7 @@ impl Log {
             "foregroundHwnd": hwnd_string(unsafe { GetForegroundWindow() }),
             "sourceVisible": unsafe { IsWindowVisible(self.config.hwnd as HWND) } != 0,
             "sourceIconic": unsafe { IsIconic(self.config.hwnd as HWND) } != 0,
+            "transitionPolicy": "unchanged-by-probe", "transitionOriginalQueried": false,
             "data": data,
         });
         serde_json::to_writer(&mut self.file, &value).map_err(|e| e.to_string())?;
@@ -483,7 +484,6 @@ struct Saved {
     placement: WINDOWPLACEMENT,
     outer: Rect,
     visible: bool,
-    transitions: i32,
     // Admission rejects custom regions; saved original region is therefore explicitly None.
 }
 fn saved(h: HWND) -> Result<Saved, String> {
@@ -504,23 +504,10 @@ fn saved(h: HWND) -> Result<Saved, String> {
     if kind != ERROR {
         return Err("custom source region unsupported; no mutation".into());
     }
-    let mut transitions = 0i32;
-    hr(
-        unsafe {
-            DwmGetWindowAttribute(
-                h,
-                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                &mut transitions as *mut _ as _,
-                size_of::<i32>() as u32,
-            )
-        },
-        "get transitions",
-    )?;
     Ok(Saved {
         placement,
         outer: outer(h)?,
         visible: unsafe { IsWindowVisible(h) } != 0,
-        transitions,
     })
 }
 fn monitor_bounds(m: HMONITOR) -> Result<Rect, String> {
@@ -1358,23 +1345,10 @@ impl Session {
             "lifetimeCookie": format!("0x{:x}", self.identity.cookie),
             "targetOuter": self.target, "targetVisible": self.config.target,
             "coverBounds": self.cover_bounds, "workArea": self.work,
-            "dwmTransitionsForcedDisabledOriginal": self.saved.transitions,
             "sourceImagePath": self.admission.image, "admission": self.admission.name,
             "protectionMetadata": if self.admission.affinity.is_ok() {"public-api-wda-none"} else {"unavailable"},
             "affinityQuery": self.admission.affinity, "geometryIsNotSemanticReady": true}))?;
         self.guard()?;
-        let disabled = 1i32;
-        hr(
-            unsafe {
-                DwmSetWindowAttribute(
-                    self.identity.h(),
-                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                    &disabled as *const _ as _,
-                    size_of::<i32>() as u32,
-                )
-            },
-            "disable transitions",
-        )?;
         let mut cover = Cover::new(self.cover_bounds)?;
         if self.config.mode == Mode::Baseline {
             cover.live(self.identity.h(), self.last_drawable.outer)?;
@@ -1617,19 +1591,6 @@ impl Session {
             ) {
                 failures.push(e);
             }
-            if let Err(e) = hr(
-                unsafe {
-                    DwmSetWindowAttribute(
-                        h,
-                        DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                        &self.saved.transitions as *const _ as _,
-                        size_of::<i32>() as u32,
-                    )
-                },
-                "restore transitions",
-            ) {
-                failures.push(e);
-            }
             if !self.saved.visible {
                 unsafe {
                     ShowWindow(h, SW_HIDE);
@@ -1786,6 +1747,7 @@ fn write_trial(log: &Log, result: Value) -> Result<(), String> {
     let value = json!({"schemaVersion": 1, "trialId": log.trial_id, "mode": log.config.mode,
         "pid": log.config.pid, "hwnd": format!("0x{:x}", log.config.hwnd), "parameters": log.config,
         "durationUs": log.start.elapsed().as_micros(),
+        "transitionPolicy": "unchanged-by-probe", "transitionOriginalQueried": false,
         "sampling": {"captureReduction": "per-capture-metadata",
             "frozenProxy": "GDI-COLORONCOLOR", "composition": "single-proxy-only-if-capture-identity;otherwise-unknown",
             "liveBaseline": "DWM-managed-unknown",
