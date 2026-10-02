@@ -8,21 +8,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::Threading::{ResetEvent, SetEvent},
+    System::Threading::{CreateEventW, ResetEvent, SetEvent},
     UI::WindowsAndMessaging::*,
 };
-
-// Only null security attributes are used. windows-sys gates this declaration on
-// Win32_Security, which the desktop's existing dependency does not enable.
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CreateEventW(
-        attributes: *const std::ffi::c_void,
-        manual: i32,
-        initial: i32,
-        name: *const u16,
-    ) -> HANDLE;
-}
 
 struct WakeEvent(usize);
 impl WakeEvent {
