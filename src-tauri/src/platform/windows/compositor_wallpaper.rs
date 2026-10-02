@@ -61,6 +61,31 @@ struct MonitorWallpaper {
     length: u64,
 }
 
+impl MonitorWallpaper {
+    fn from_configured_path(
+        bounds: Rect,
+        mut path: String,
+        status: DESKTOP_SLIDESHOW_STATE,
+    ) -> Result<Self, AppError> {
+        // SDK ShObjIdl_core.idl: DSS_ENABLED is normally true unless Enable is used,
+        // independently of whether a slideshow is configured.
+        if (status & DSS_ENABLED).0 == 0 {
+            path.clear();
+        }
+        let metadata = if path.is_empty() {
+            None
+        } else {
+            Some(std::fs::metadata(&path).map_err(wallpaper_error)?)
+        };
+        Ok(Self {
+            bounds,
+            path,
+            modified: metadata.as_ref().and_then(|m| m.modified().ok()),
+            length: metadata.map_or(0, |m| m.len()),
+        })
+    }
+}
+
 #[derive(PartialEq)]
 struct Settings {
     monitors: Vec<MonitorWallpaper>,
@@ -73,6 +98,7 @@ impl Settings {
         let shell: IDesktopWallpaper =
             unsafe { CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL) }
                 .map_err(wallpaper_error)?;
+        let status = unsafe { shell.GetStatus() }.map_err(wallpaper_error)?;
         let count = unsafe { shell.GetMonitorDevicePathCount() }.map_err(wallpaper_error)?;
         if count == 0 || count > MAX_MONITORS {
             return Err(wallpaper_error("monitor count outside 1..=32"));
@@ -97,17 +123,9 @@ impl Settings {
             let path =
                 TaskString(unsafe { shell.GetWallpaper(PCWSTR(id.0.0)) }.map_err(wallpaper_error)?)
                     .text()?;
-            let metadata = if path.is_empty() {
-                None
-            } else {
-                Some(std::fs::metadata(&path).map_err(wallpaper_error)?)
-            };
-            monitors.push(MonitorWallpaper {
-                bounds,
-                path,
-                modified: metadata.as_ref().and_then(|m| m.modified().ok()),
-                length: metadata.map_or(0, |m| m.len()),
-            });
+            monitors.push(MonitorWallpaper::from_configured_path(
+                bounds, path, status,
+            )?);
         }
         if monitors.is_empty() {
             return Err(wallpaper_error("no attached wallpaper monitors"));
@@ -530,7 +548,20 @@ mod tests {
         unsafe { GdiFlush() };
         assert_eq!(pixels()[0] & 0xffffff, 0); // Full monitor offset (1,1): bottom-right tile.
         assert_eq!(pixels()[5] & 0xffffff, 0xff0000);
-        wallpaper.settings.monitors[0].path.clear();
+        let configured = wallpaper.settings.monitors[0].path.clone();
+        assert!(!configured.is_empty());
+        let disabled = MonitorWallpaper::from_configured_path(
+            wallpaper.settings.monitors[0].bounds,
+            configured.clone(),
+            DESKTOP_SLIDESHOW_STATE(0),
+        )
+        .unwrap();
+        assert!(disabled.path.is_empty());
+        assert!(disabled.modified.is_none());
+        assert_eq!(disabled.length, 0);
+        assert!(wallpaper.images.contains_key(&configured)); // Even an old decoded image must stay hidden.
+        assert!(disabled != wallpaper.settings.monitors[0]); // Existing settings cache comparison changes.
+        wallpaper.settings.monitors[0] = disabled;
         assert!(wallpaper.paint(canvas.dc, viewport));
         unsafe { GdiFlush() };
         assert!(pixels().iter().all(|p| p & 0xffffff == 0x00ff00));
