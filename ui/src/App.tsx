@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { desktopAvailable, dismissSurface, execute, getSnapshot, onSnapshot, onSurfaceOpened, openSurface, quit, setBarPinned, syncPreviews } from './bridge';
 import type { Surface } from './bridge';
 import { emptySnapshot } from './model';
-import type { OnCommand } from './model';
+import type { Command, OnCommand } from './model';
 import { TopBar } from './shell';
 import { Overview } from './overview';
 import { CommandPalette } from './commands';
@@ -16,7 +16,8 @@ const errorMessage = (cause: unknown) => typeof cause === 'object' && cause !== 
 export default function App() {
   const [snapshot, setSnapshot] = useState(emptySnapshot);
   const [localError, setLocalError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busyCommand, setBusyCommand] = useState<Command['type'] | null>(null);
+  const busy = busyCommand !== null;
   const [opening, setOpening] = useState(0);
   const [overlayMonitor, setOverlayMonitor] = useState<string | null>(null);
   const [previewSession, setPreviewSession] = useState<number | null>(null);
@@ -52,7 +53,7 @@ export default function App() {
   const onCommand: OnCommand = useCallback(async (command) => {
     if (executing.current) throw new Error('上一项操作尚未完成。');
     executing.current = true;
-    setBusy(true);
+    setBusyCommand(command.type);
     try {
       // The snapshot event is authoritative after startup; no local layout reducer.
       await execute(command);
@@ -62,7 +63,7 @@ export default function App() {
       throw cause;
     } finally {
       executing.current = false;
-      setBusy(false);
+      setBusyCommand(null);
     }
   }, []);
 
@@ -84,7 +85,7 @@ export default function App() {
   const monitor = snapshot.monitors[monitorIndex];
   const selectedMonitor = surface === 'topbar' ? monitor?.monitor.id : overlayMonitor;
   const localSnapshot = { ...displaySnapshot, activeMonitor: selectedMonitor ?? null };
-  const props = { snapshot: localSnapshot, onCommand, busy };
+  const props = { snapshot: localSnapshot, onCommand, busy, busyCommand: busyCommand ?? undefined };
 
   return <main className={`desktop-surface desktop-surface--${surface}`}>
     {surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />

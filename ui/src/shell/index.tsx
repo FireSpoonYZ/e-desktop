@@ -31,7 +31,7 @@ function backendNotice(snapshot: Snapshot) {
   }
 }
 
-export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOpenCommands, onQuit, onTogglePin }: TopBarProps) {
+export function TopBar({ snapshot, onCommand, busy = false, busyCommand, onOpenOverview, onOpenCommands, onQuit, onTogglePin }: TopBarProps) {
   const monitor = selectedMonitor(snapshot);
   const page = monitor?.pages.find(({ id }) => id === monitor.activePage);
   const error = snapshot.errors.at(-1);
@@ -57,7 +57,7 @@ export function TopBar({ snapshot, onCommand, busy = false, onOpenOverview, onOp
     </button>
     <button type="button" onClick={onOpenOverview}>概览</button>
     <button type="button" onClick={onOpenCommands}>命令</button>
-    <ScrollControls snapshot={snapshot} onCommand={onCommand} busy={busy} />
+    <ScrollControls snapshot={snapshot} onCommand={onCommand} busy={busy} busyCommand={busyCommand} />
     <button type="button" disabled={busy} onClick={() => runCommand(onCommand, { type: 'refresh' })}
       title="重新读取后端状态与真实窗口">刷新</button>
     {onTogglePin && <button type="button" className="shell-pin" onClick={onTogglePin} aria-pressed={pinned}

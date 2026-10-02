@@ -2,20 +2,31 @@ import { useEffect, useRef } from 'react';
 import type { ControlProps } from '../model';
 import { createScrollDispatcher, scrollTarget, selectedMonitor, wheelPixels } from './scroll';
 
-export function ScrollControls({ snapshot, onCommand, busy = false }: ControlProps) {
+export function ScrollControls({ snapshot, onCommand, busy = false, busyCommand }: ControlProps) {
   const region = useRef<HTMLDivElement>(null);
-  const current = useRef({ snapshot, onCommand, busy });
-  current.current = { snapshot, onCommand, busy };
+  const current = useRef({ snapshot, onCommand, busy, busyCommand });
+  current.current = { snapshot, onCommand, busy, busyCommand };
   const dispatcher = useRef<ReturnType<typeof createScrollDispatcher> | null>(null);
+  const scrolling = useRef({ pending: false, busy: false });
+  // Retain ownership until completion renders, but never across another command's busy.
+  scrolling.current.busy = busy && busyCommand === 'scroll'
+    && (scrolling.current.pending || scrolling.current.busy);
   const monitor = selectedMonitor(snapshot);
   const page = monitor?.pages.find(({ id }) => id === monitor.activePage);
-  const disabled = !scrollTarget(snapshot, busy);
+  const disabled = !scrollTarget(snapshot, busy && !(busyCommand === 'scroll'
+    && (scrolling.current.busy || scrolling.current.pending)));
 
   useEffect(() => {
     const element = region.current;
     if (!element) return;
-    const target = () => scrollTarget(current.current.snapshot, current.current.busy);
-    const scroll = createScrollDispatcher(target, (command) => current.current.onCommand(command));
+    const target = () => scrollTarget(current.current.snapshot,
+      current.current.busy && !(current.current.busyCommand === 'scroll'
+        && (scrolling.current.busy || scrolling.current.pending)));
+    const scroll = createScrollDispatcher(target, async (command) => {
+      scrolling.current.pending = true;
+      try { await current.current.onCommand(command); }
+      finally { scrolling.current.pending = false; }
+    });
     dispatcher.current = scroll;
     const onWheel = (event: WheelEvent) => {
       const monitor = target();
