@@ -70,3 +70,123 @@ test('preview IPC serializes, coalesces geometry, drops stale replies and clears
   feed.dispose(); feed.refresh();
   assert.equal(calls.length, 4);
 });
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+// Exercise layout-effect cleanup/setup without a DOM or native window operations.
+let harnessId = 0;
+async function previewFeedHarness() {
+  const hooksUrl = `data:text/javascript;base64,${Buffer.from(`
+    export const effects = [], refs = [], updates = [];
+    let cursor = 0;
+    export const render = () => { cursor = 0; effects.length = 0; };
+    export const useRef = (value) => refs[cursor++] ??= { current: value };
+    export const useState = (value) => [value, (next) => updates.push(next)];
+    export const useCallback = (callback) => callback;
+    export const useLayoutEffect = (setup) => effects.push(setup);
+    // Isolate the module's hook storage for each test.
+    export const id = ${harnessId++};
+  `).toString('base64')}`;
+  const hooks = await import(hooksUrl);
+  const feedModule = compiled.replace(import.meta.resolve('react'), hooksUrl);
+  assert.notEqual(feedModule, compiled, 'replace only the React hook import');
+  const { usePreviewFeed } = await import(`data:text/javascript;base64,${Buffer.from(feedModule).toString('base64')}`);
+  return { ...hooks, usePreviewFeed };
+}
+
+const previewSlot = (windowId, x = 0) => {
+  const rect = { x, y: 0, width: 100, height: 100 };
+  return { windowId, rect, clip: rect };
+};
+
+const deferredPreviews = () => {
+  const calls = [], native = new Map();
+  const request = (session, slots) => new Promise((resolve, reject) => calls.push({ session, slots, reject,
+    finish() {
+      native.clear();
+      slots.forEach((slot) => native.set(slot.windowId, slot));
+      resolve(slots.map(({ windowId }) => ({ windowId, state: 'ready', message: '' })));
+    },
+  }));
+  return { calls, native, request };
+};
+
+test('preview feed effect replay waits for old same-session release before creating replacement slots', async (t) => {
+  const hooks = await previewFeedHarness();
+  const { calls, native, request } = deferredPreviews();
+  const feed = hooks.usePreviewFeed(7, request);
+  const setup = hooks.effects[0];
+  const oldCleanup = setup();
+  const first = [previewSlot('a')], latest = [previewSlot('a', 20)];
+  feed.publish(first);
+  oldCleanup();
+  const cleanup = setup();
+  t.after(cleanup);
+  feed.publish(latest);
+  await settle();
+  assert.equal(calls.length, 1, 'replacement cannot race the old create/clear');
+  calls[0].finish(); await settle();
+  assert.deepEqual(calls[1].slots, []);
+  assert.equal(calls.length, 2);
+  assert.equal(hooks.updates.length, 2, 'old reply did not publish a ready status');
+  calls[1].finish(); await settle();
+  assert.deepEqual(calls[2].slots, latest);
+  calls[2].finish(); await settle();
+  assert.deepEqual([...native.values()], latest);
+  assert.equal(hooks.updates.at(-1).a.state, 'ready');
+  cleanup();
+  await settle();
+  assert.deepEqual(calls[3].slots, []);
+  calls[3].finish(); await settle();
+  assert.equal(native.size, 0);
+  assert.equal(calls.length, 4);
+});
+
+test('preview feed new native session does not wait for an obsolete pending request', async (t) => {
+  const hooks = await previewFeedHarness();
+  const { calls, request } = deferredPreviews();
+  const oldFeed = hooks.usePreviewFeed(7, request);
+  const oldCleanup = hooks.effects[0]();
+  oldFeed.publish([previewSlot('old')]);
+  oldCleanup();
+  hooks.render();
+  const nextFeed = hooks.usePreviewFeed(8, request);
+  const cleanup = hooks.effects[0]();
+  t.after(cleanup);
+  nextFeed.publish([previewSlot('new')]);
+  assert.deepEqual(calls.map(({ session }) => session), [7, 8]);
+  calls[1].finish(); await settle();
+  assert.equal(hooks.updates.at(-1).new.state, 'ready');
+  calls[0].reject(new Error('old source gone')); await settle();
+  assert.deepEqual(calls[2].slots, []);
+  calls[2].finish(); await settle();
+  assert.equal(hooks.updates.at(-1).new.state, 'ready');
+  cleanup();
+  calls[3].finish(); await settle();
+});
+
+test('preview geometry updates and source removal never send an intermediate clear', async () => {
+  const { calls, native, request } = deferredPreviews();
+  const received = [];
+  const feed = previewQueue(7, request, (statuses) => received.push(statuses));
+  feed.push([previewSlot('a'), previewSlot('b')]);
+  calls[0].finish(); await settle();
+  feed.push([previewSlot('a', 5), previewSlot('b')]);
+  feed.push([previewSlot('a', 10)]);
+  calls[1].finish(); await settle();
+  assert.equal(received.length, 1, 'reply with removed source is stale');
+  calls[2].finish(); await settle();
+  assert.deepEqual([...native.values()], [previewSlot('a', 10)]);
+  assert.deepEqual(received.at(-1).map(({ windowId }) => windowId), ['a']);
+  assert.ok(calls.every(({ slots }) => slots.length > 0));
+  const released = feed.dispose();
+  let done = false;
+  void released.then(() => { done = true; });
+  await settle();
+  assert.equal(done, false, 'release promise waits for native clear');
+  calls[3].reject(new Error('host already dismissed'));
+  await released;
+  assert.equal(feed.dispose(), released);
+  assert.equal(calls.length, 4);
+  assert.equal(received.length, 2, 'failed disposal never restores statuses');
+});

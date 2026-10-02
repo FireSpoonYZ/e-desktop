@@ -19,6 +19,8 @@ type Bounds = Pick<DOMRectReadOnly, 'left' | 'top' | 'right' | 'bottom'>;
 /** Coalesce geometry updates; only the latest reply may update this opening. */
 export function previewQueue(session: number, request: PreviewRequest, receive: (statuses: PreviewStatus[]) => void) {
   let slots: PreviewSlot[] = [], revision = 0, pending = false, disposed = false;
+  let release: (() => void) | undefined;
+  const released = new Promise<void>((resolve) => { release = resolve; });
   const push = (next: PreviewSlot[]) => {
     if (disposed) return;
     slots = next; revision++;
@@ -37,23 +39,32 @@ export function previewQueue(session: number, request: PreviewRequest, receive: 
     } finally {
       pending = false;
       if (current !== revision) void drain();
+      else if (disposed) release?.();
     }
   };
   return { push, refresh: () => { if (!pending && !disposed && slots.length) push(slots); },
-    dispose: () => { if (!disposed) { push([]); disposed = true; } } };
+    dispose: () => {
+      if (!disposed) { disposed = true; slots = []; revision++; void drain(); }
+      return released;
+    } };
 }
 
 export function usePreviewFeed(session: number | null, request?: PreviewRequest) {
   const [statuses, setStatuses] = useState<Record<string, PreviewStatus>>({});
   const queue = useRef<ReturnType<typeof previewQueue> | null>(null);
+  const released = useRef<{ session: number; done: Promise<void> } | null>(null);
   useLayoutEffect(() => {
     setStatuses({});
     if (session === null || !request) return;
-    const feed = previewQueue(session, request, (next) => setStatuses(Object.fromEntries(next.map((item) => [item.windowId, item]))));
+    // StrictMode replays effects with the same native session. Its old clear must finish first.
+    const previous = released.current;
+    const send: PreviewRequest = previous?.session === session
+      ? async (...args) => { await previous.done; return request(...args); } : request;
+    const feed = previewQueue(session, send, (next) => setStatuses(Object.fromEntries(next.map((item) => [item.windowId, item]))));
     queue.current = feed;
     // DWM updates pixels itself. This only refreshes source availability/registration.
     const timer = setInterval(feed.refresh, 500);
-    return () => { clearInterval(timer); feed.dispose(); queue.current = null; };
+    return () => { clearInterval(timer); released.current = { session, done: feed.dispose() }; queue.current = null; };
   }, [session, request]);
   const publish = useCallback((slots: PreviewSlot[]) => queue.current?.push(slots), []);
   return { statuses, publish };
