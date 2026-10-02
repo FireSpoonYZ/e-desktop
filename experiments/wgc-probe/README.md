@@ -111,3 +111,14 @@ Compiled/checked on `x86_64-pc-windows-msvc`; four focused unit tests passed.
 **Capture was not executed. Frames obtained during development: none.**
 All live capture, resize, source-close, occlusion, minimize, driver and visual
 behavior above remains for the parent/operator to test and accept.
+
+## Parent integration smoke (2026-10-02)
+
+On Windows build 26200 (x64), the parent created a disposable WinForms fixture,
+verified its HWND/PID, and ran a 3000 ms capture with a separate 10-second process
+ceiling. Result: exit 0, **17 frames**, content and texture **622 × 431**, format
+**87 (BGRA8 UNORM)**. First/last system-relative timestamps were
+6030206084001 / 6030234251686 (100 ns units). Fixture and probe were closed afterward.
+This verifies actual texture delivery, not pixel fidelity, display composition,
+resize/minimized behavior or other application compatibility. See
+[the integration record](../../docs/validation/windows-2026-10-02.md).

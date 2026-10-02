@@ -85,6 +85,56 @@ pub fn preview_checks(
         backend.sync_previews(destination.0 as usize, &[slot.clone()])?[0].state,
         PreviewState::Ready
     );
+    // Only the explicitly managed fixture is eligible for snapshot prewarming.
+    let source = &original.windows[0];
+    let placed = NativeAction::Placement {
+        window_id: source.id.clone(),
+        rect: source.rect,
+        clip: None,
+        minimized: false,
+    };
+    backend.apply(&[placed.clone()])?;
+    // Bound the asynchronous capture opportunity; no waiting inside the management call.
+    for _ in 0..20 {
+        backend.enumerate()?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    backend.apply(&[NativeAction::Placement {
+        window_id: source.id.clone(),
+        rect: source.rect,
+        clip: None,
+        minimized: true,
+    }])?;
+    let cached = backend.sync_previews(destination.0 as usize, &[slot.clone()])?;
+    assert_eq!(
+        cached[0].state,
+        PreviewState::Ready,
+        "prewarmed hidden fixture needs static fallback: {cached:?}"
+    );
+    assert!(cached[0].message.contains("Static snapshot"));
+    let minimized = observe(backend, source.process_id)?;
+    assert!(
+        minimized
+            .windows
+            .iter()
+            .find(|w| w.id == source.id)
+            .unwrap()
+            .minimized
+    );
+    backend.clear_previews();
+    assert_eq!(
+        backend.sync_previews(destination.0 as usize, &[slot.clone()])?[0].state,
+        PreviewState::Ready
+    );
+    backend.apply(&[placed])?;
+    let live = backend.sync_previews(destination.0 as usize, &[slot.clone()])?;
+    assert_eq!(live[0].state, PreviewState::Ready);
+    assert!(!live[0].message.contains("Static snapshot"));
+    evidence.push(serde_json::json!({"cachedPreview": {
+        "prewarmedManagedFixture": true, "minimizedSourceStaticReady": true,
+        "clearAndReopen": true, "restoredSourceReturnsToLive": true,
+        "message": cached[0].message, "visualPixelsVerified": false
+    }}));
     backend.restore()?;
     let pid = original.windows[0].process_id;
     for initial in &original.windows {
@@ -253,5 +303,95 @@ pub fn animation_checks(
         "redirectAndEntry": true, "disableRestored": true, "targetedColumnWidth": 650,
         "realTimeCadenceMeasured": false }}),
     );
+    Ok(())
+}
+
+/// Exercise the real DWM overlay handoff, not just the native-frame fallback above.
+pub fn compositor_checks(
+    backend: &mut Backend,
+    original: &SystemSnapshot,
+    evidence: &mut Vec<serde_json::Value>,
+) -> Result<()> {
+    use e_desktop::animation::Sprite;
+    let source = &original.windows[0];
+    let area = original
+        .monitors
+        .iter()
+        .find(|m| m.id == source.monitor_id)
+        .unwrap()
+        .work_area;
+    let target = Rect {
+        x: area.x + 80,
+        y: area.y + 100,
+        ..source.rect
+    };
+    let action = NativeAction::Placement {
+        window_id: source.id.clone(),
+        rect: target,
+        clip: None,
+        minimized: false,
+    };
+    let sprite = Sprite {
+        window_id: source.id.clone(),
+        rect: source.rect,
+        bounds: area,
+        early: Some(action),
+    };
+    backend.compose(&[sprite.clone()])?;
+    assert!(backend.composing());
+    let class: Vec<_> = "e-desktop-compositor ".encode_utf16().collect();
+    let overlay = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+    assert!(!overlay.is_null());
+    assert_ne!(unsafe { IsWindowVisible(overlay) }, 0);
+    let style = unsafe { GetWindowLongPtrW(overlay, GWL_EXSTYLE) } as u32;
+    assert_eq!(
+        style & WS_EX_TRANSPARENT,
+        0,
+        "animated pictures must not pass clicks to parked HWNDs"
+    );
+    assert_ne!(style & WS_EX_NOACTIVATE, 0);
+    assert_eq!(
+        unsafe { SendMessageW(overlay, WM_NCHITTEST, 0, 0) },
+        HTCLIENT as isize
+    );
+    assert_eq!(
+        unsafe { SendMessageW(overlay, WM_MOUSEACTIVATE, 0, 0) },
+        MA_NOACTIVATEANDEAT as isize
+    );
+    let actual = observe(backend, source.process_id)?;
+    assert_eq!(
+        actual
+            .windows
+            .iter()
+            .find(|w| w.id == source.id)
+            .unwrap()
+            .rect,
+        target
+    );
+    backend.compose(&[Sprite {
+        rect: target,
+        ..sprite
+    }])?;
+    backend.compose_end();
+    backend.compose_end();
+    assert!(!backend.composing());
+    assert_eq!(unsafe { IsWindowVisible(overlay) }, 0);
+    backend.restore()?;
+    let restored = observe(backend, source.process_id)?;
+    assert_eq!(
+        restored
+            .windows
+            .iter()
+            .find(|w| w.id == source.id)
+            .unwrap()
+            .rect,
+        source.rect
+    );
+    evidence.push(serde_json::json!({"dwmCompositor": {
+        "preparedAndRetargeted": true, "realSourceTakesFinalPlacement": true,
+        "mouseHitPolicyVerified": true, "endIsIdempotent": true,
+        "overlayHiddenAndSourceRestored": true, "visualPixelsVerified": false,
+        "physicalMouseDeliveryVerified": false
+    }}));
     Ok(())
 }

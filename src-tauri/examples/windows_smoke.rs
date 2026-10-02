@@ -62,6 +62,7 @@ fn checks(backend: &mut Backend, pid: u32, evidence: &mut Vec<serde_json::Value>
     {
         interaction::preview_checks(backend, &original, evidence)?;
         interaction::animation_checks(backend, &original, evidence)?;
+        interaction::compositor_checks(backend, &original, evidence)?;
     }
     let ids: Vec<_> = original.windows.iter().map(|w| w.id.clone()).collect();
     let monitor_id = original.windows[0].monitor_id.clone();
