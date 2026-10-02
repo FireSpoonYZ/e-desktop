@@ -28,6 +28,40 @@ use crate::{
 
 #[cfg(target_os = "windows")]
 use crate::platform::splitter;
+#[cfg(target_os = "windows")]
+mod controller_queue;
+#[cfg(target_os = "windows")]
+use controller_queue::{Receiver as RequestReceiver, Sender as RequestSender};
+#[cfg(not(target_os = "windows"))]
+type RequestSender = mpsc::SyncSender<Request>;
+#[cfg(not(target_os = "windows"))]
+type RequestReceiver = mpsc::Receiver<Request>;
+
+enum ReceiveError {
+    Timeout,
+    Disconnected,
+    #[cfg(target_os = "windows")]
+    Failed(AppError),
+}
+
+fn request_queue() -> Result<(RequestSender, RequestReceiver), AppError> {
+    #[cfg(target_os = "windows")]
+    return controller_queue::bounded(64);
+    #[cfg(not(target_os = "windows"))]
+    Ok(mpsc::sync_channel(64))
+}
+
+fn receive_request(receiver: &RequestReceiver, deadline: Instant) -> Result<Request, ReceiveError> {
+    #[cfg(target_os = "windows")]
+    return receiver.recv_until(deadline);
+    #[cfg(not(target_os = "windows"))]
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|issue| match issue {
+            mpsc::RecvTimeoutError::Timeout => ReceiveError::Timeout,
+            mpsc::RecvTimeoutError::Disconnected => ReceiveError::Disconnected,
+        })
+}
 
 const BAR_HEIGHT: f64 = 36.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -166,7 +200,7 @@ enum Request {
 }
 
 struct AppState {
-    sender: mpsc::SyncSender<Request>,
+    sender: RequestSender,
     snapshot: Arc<Mutex<Snapshot>>,
     can_exit: AtomicBool,
 }
@@ -180,6 +214,9 @@ fn error(code: ErrorCode, message: impl Into<String>) -> AppError {
 }
 
 fn send(state: &AppState, request: Request) -> Result<(), AppError> {
+    #[cfg(target_os = "windows")]
+    return state.sender.try_send(request);
+    #[cfg(not(target_os = "windows"))]
     state.sender.try_send(request).map_err(|_| {
         error(
             ErrorCode::BackendUnavailable,
@@ -1593,7 +1630,7 @@ fn show_surface(
 
 fn set_shortcut(
     app: &tauri::AppHandle,
-    sender: &mpsc::SyncSender<Request>,
+    sender: &RequestSender,
     key: &str,
     enabled: bool,
 ) -> Result<(), String> {
@@ -1618,7 +1655,7 @@ fn set_shortcut(
 
 fn reload_config(
     app: &tauri::AppHandle,
-    sender: &mpsc::SyncSender<Request>,
+    sender: &RequestSender,
     file: &mut ConfigFile,
     shortcuts: &mut Shortcuts,
     controller: &mut Controller,
@@ -1655,9 +1692,9 @@ fn reload_config(
 
 fn run_controller(
     app: tauri::AppHandle,
-    receiver: mpsc::Receiver<Request>,
+    receiver: RequestReceiver,
     shared: Arc<Mutex<Snapshot>>,
-    sender: mpsc::SyncSender<Request>,
+    sender: RequestSender,
     config_path: std::path::PathBuf,
 ) {
     let mut controller = Controller::new();
@@ -1781,9 +1818,7 @@ fn run_controller(
             .animation
             .deadline()
             .map_or(next_refresh, |frame| frame.min(next_refresh));
-        let request = match receiver
-            .recv_timeout(next_deadline.saturating_duration_since(Instant::now()))
-        {
+        let request = match receive_request(&receiver, next_deadline) {
             Ok(Request::Shortcut(key)) => {
                 let Some(action) = shortcuts.action(&key).cloned() else {
                     continue;
@@ -1977,19 +2012,30 @@ fn run_controller(
                     let _ = window.show().and_then(|_| window.set_focus());
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ReceiveError::Disconnected) => {
                 if let Err(issue) = controller.stop() {
                     eprintln!("窗口控制器停止时还原失败：{}", issue.message);
                 }
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(ReceiveError::Timeout) => {}
+            #[cfg(target_os = "windows")]
+            Err(ReceiveError::Failed(issue)) => {
+                controller.record(issue);
+                if let Err(issue) = controller.stop() {
+                    eprintln!("控制器消息等待失败后还原失败：{}", issue.message);
+                }
+                let current = controller.snapshot(shortcuts.available());
+                *shared.lock().unwrap_or_else(|e| e.into_inner()) = current.clone();
+                let _ = app.emit("snapshot", &current);
+                break;
+            }
         }
     }
 }
 
 pub fn run() {
-    let (sender, receiver) = mpsc::sync_channel(64);
+    let (sender, receiver) = request_queue().expect("failed to create desktop controller queue");
     let shared = Arc::new(Mutex::new(Snapshot::default()));
     let state = AppState {
         sender: sender.clone(),
@@ -2082,13 +2128,15 @@ mod tests {
         let trace = IpcTrace::with_diagnostics("execute.dropWindow", Some(diagnostics));
         let next = IpcTrace::with_diagnostics("get_snapshot", Some(diagnostics));
         assert_eq!(next.id, trace.id + 1);
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = request_queue().unwrap();
         let state = AppState {
             sender, snapshot: Arc::new(Mutex::new(Snapshot::default())),
             can_exit: AtomicBool::new(false),
         };
         send(&state, Request::Command(Command::Refresh, None, trace)).unwrap();
-        let Request::Command(Command::Refresh, None, received) = receiver.try_recv().unwrap() else {
+        let request = receive_request(&receiver, Instant::now())
+            .unwrap_or_else(|_| panic!("request missing"));
+        let Request::Command(Command::Refresh, None, received) = request else {
             panic!("unexpected request");
         };
         assert_eq!(received.id, trace.id);
