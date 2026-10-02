@@ -24,6 +24,10 @@ use windows_sys::Win32::{
     UI::{HiDpi::*, WindowsAndMessaging::*},
 };
 
+#[path = "offline.rs"]
+mod offline;
+pub use offline::offline_proxy;
+
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 unsafe extern "system" fn console_cancel(kind: u32) -> i32 {
     if kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT {
@@ -335,6 +339,10 @@ impl Dib {
     fn render(&mut self, source: &Dib, destination: Rect) -> Result<(), String> {
         self.background(); // Entire offscreen surface is rebuilt; visible DC is never cleared.
         win(
+            unsafe { SetStretchBltMode(self.dc, COLORONCOLOR) },
+            "proxy COLORONCOLOR",
+        )?;
+        win(
             unsafe {
                 StretchBlt(
                     self.dc,
@@ -636,6 +644,10 @@ fn capture_frame(
     }
     let (w, h) = reduced_size(full.w, full.h);
     let mut reduced = Dib::new(w, h, FRAME_BYTES)?;
+    win(
+        unsafe { SetStretchBltMode(reduced.dc, COLORONCOLOR) },
+        "capture reduction COLORONCOLOR",
+    )?;
     win(
         unsafe {
             StretchBlt(
@@ -1244,7 +1256,9 @@ impl Session {
             "strideBytes": frame.w * 4, "format": "BGRA8-top-down-opaque", "captureQpc": frame.capture_qpc,
             "completedQpc": frame.completed_qpc, "qpcFrequency": log.qpc_frequency,
             "semanticReady": null, "pixelsFile": "capture-1.bgra",
-            "sampling": "GDI-default-BLACKONWHITE-not-explicit-nearest"});
+            "sampling": if frame.w == frame.geometry.outer.width && frame.h == frame.geometry.outer.height {
+                "identity"
+            } else { "GDI-COLORONCOLOR-reduction-composed-proxy-unknown" }});
         fs::write(self.config.output.join("capture-1.bgra"), &frame.pixels)
             .map_err(|e| format!("frame output: {e}"))?;
         fs::write(
@@ -1760,8 +1774,9 @@ fn write_trial(log: &Log, result: Value) -> Result<(), String> {
     let value = json!({"schemaVersion": 1, "trialId": log.trial_id, "mode": log.config.mode,
         "pid": log.config.pid, "hwnd": format!("0x{:x}", log.config.hwnd), "parameters": log.config,
         "durationUs": log.start.elapsed().as_micros(),
-        "sampling": {"captureReduction": "GDI-default-BLACKONWHITE-not-explicit-nearest",
-            "frozenProxy": "GDI-default-BLACKONWHITE-not-explicit-nearest", "liveBaseline": "DWM-managed-unknown",
+        "sampling": {"captureReduction": "per-capture-metadata",
+            "frozenProxy": "GDI-COLORONCOLOR", "composition": "single-proxy-only-if-capture-identity;otherwise-unknown",
+            "liveBaseline": "DWM-managed-unknown",
             "sceneCommit": "BitBlt-no-resampling"}, "clockCalibration": {
             "qpcStart": log.qpc_start, "qpcFrequency": log.qpc_frequency, "unixStartUs": log.unix_start_us},
         "result": result});

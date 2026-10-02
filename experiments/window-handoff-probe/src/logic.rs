@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub const HELP: &str = r#"window-handoff-probe (stage 0; exit 0 is NOT visual acceptance)
   --help                         no native calls
   --self-test                    pure logic / memory DC only; no HWND
+  --offline-proxy SPEC.json       one raw BGRA -> memory-DC proxy -> file; no HWND
   [--run] --pid PID --hwnd HEX --tag TOKEN --role A..E
     --mode baseline|prehide|staged --output NEW_DIRECTORY
     --target x,y,width,height    physical VISIBLE frame in screen pixels
@@ -25,7 +26,7 @@ pub enum Mode {
     Staged,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rect {
     pub x: i32,
@@ -160,6 +161,7 @@ pub fn identity_matches(
 pub enum Action {
     Help,
     SelfTest,
+    OfflineProxy(PathBuf),
     Plan(Config),
     Run(Config),
 }
@@ -169,6 +171,9 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
     }
     if args == ["--self-test"] {
         return Ok(Action::SelfTest);
+    }
+    if args.len() == 2 && args[0] == "--offline-proxy" && !args[1].is_empty() {
+        return Ok(Action::OfflineProxy(args[1].clone().into()));
     }
     let mut opts = BTreeMap::new();
     let mut run = false;

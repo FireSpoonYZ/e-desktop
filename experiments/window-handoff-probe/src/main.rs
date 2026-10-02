@@ -21,6 +21,15 @@ fn entry() -> Result<(), String> {
                 "Pure logic / memory-DC checks passed; no HWND created; not visual validation."
             );
         }
+        logic::Action::OfflineProxy(path) => {
+            #[cfg(windows)]
+            return native::offline_proxy(&path);
+            #[cfg(not(windows))]
+            {
+                let _ = path;
+                return Err("--offline-proxy requires Windows memory DCs".into());
+            }
+        }
         logic::Action::Plan(config) => {
             println!(
                 "{}",
