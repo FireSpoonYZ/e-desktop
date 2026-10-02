@@ -145,7 +145,14 @@ Neither offline analyzer results nor fixture markers/state feed the native readi
 
 Events cover original state, minimize, cover, capture request/complete/reject, staged
 restore, target request/observed placement, pin/proxy presentation, handoff/input unblock,
-observation, degradation/cancel, restore and finish. Trial reports capture wait,
+observation, degradation/cancel, restore and finish. Each successful animation proxy/live
+update also emits **presentation_submitted** with physical outerPose, submittedQpc,
+and (for frozen frames) captureId=1, fixedSourceRecord=capture-1.json and pixelSize.
+The referenced record supplies fixed source geometry. Live DWM has null fixed-source
+fields. submittedQpc is sampled after the API submission returns, **not DWM actual
+presentation/display confirmation**; common QPC frequency calibrates it for parent PTS
+mapping. No flush, sleep, acknowledgement or semantic-ready condition is added.
+Trial reports capture wait,
 extra prepare latency, target-apply-to-handoff/input-unblock time, restore outcome.
 Completed-unverified exit 0 is procedural only. Refused/degraded/cancelled/failed returns
 nonzero; pre-ownership refusal needs no geometry restore.

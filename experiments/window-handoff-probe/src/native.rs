@@ -1497,6 +1497,18 @@ impl Session {
             } else {
                 cover.live_rect(pose)?;
             }
+            self.emit(
+                log,
+                "presentation_submitted",
+                json!({
+                    "outerPose": pose, "submittedQpc": qpc(),
+                    "captureId": self.proxy.as_ref().map(|_| 1),
+                    "fixedSourceRecord": self.proxy.as_ref().map(|_| "capture-1.json"),
+                    "pixelSize": self.proxy.as_ref().map(|p| json!({"width": p.w, "height": p.h})),
+                    "timingMeaning": "API submission returned; NOT DWM display confirmation",
+                    "displayConfirmed": false
+                }),
+            )?;
             if now >= handoff_deadline && t < 1.0 {
                 self.degrade(log, "absolute handoff deadline during animation".into())?;
                 break;
