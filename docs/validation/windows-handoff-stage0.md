@@ -64,3 +64,15 @@ python experiments/window-handoff-probe/test_proxy_interop.py --probe experiment
 所有自建进程已退出，父级通过原始 HWND/GUID 复核原桌面 `current=true`。当时没有强行关闭测试桌面，因此留下一个测试桌面。父级随后修复了 runner 在“拒绝关闭桌面”分支也跳过返回原桌面的缺口。
 
 下轮区分普通应用窗口与带 tool/layered、nonactivating 或 click-through 样式的辅助窗口，并保留后者记录。样式不证明像素不可见；probe 的 cover 检查及实际画面仍须验证其影响。`pilot-02` 尚未执行。说明保存在 `target/handoff-recovery/pilot-01-blocker.md`。
+
+## 后续预检与原生 API 修复
+
+- `pilot-02` 在读取原子替换中的 fixture JSON 时遇到 PermissionError，仍未录制或调用 probe。父级读者现改用共享 read/write/delete 的文件句柄与有界重试，避免妨碍生产者替换。此轮自建进程退出、原桌面经单独复核恢复，测试桌面留开。
+- `pilot-03` 通过隔离和故障注入，但 FFmpeg 拒绝 `stats_period=.1`，未调用 probe。参数已改为 `0.1`。此轮测试桌面关闭、原桌面恢复、进程退出均通过。
+- `pilot-04` 能录制，但首个 baseline 在变更源窗口前拒绝：`get transitions: HRESULT 0x80070057`，`targetModified=false`。此轮还原/退出核对通过。
+
+`pilot-03` 和 `pilot-04` 的 state-write 故障注入均在父级 5 秒上限内以 exit 1 结束，没有人工输入；没有单独检查短暂弹窗。
+
+官方 `DWMWINDOWATTRIBUTE` 文档将 `DWMWA_TRANSITIONS_FORCEDISABLED` 列为供 setter 使用，不能用失败的 getter 猜测原值。修复 `3c758f4` 删除 probe 的该属性读取、设置及恢复，明确记录 unchanged-by-probe / originalQueried=false；`27dd108` 由 fixture 在自己的 OnHandleCreated 中明确设置初始禁用过渡策略并检查 HRESULT。全部模式初始条件相同，这仍不是正式程序时序等价证明。父级审查、重建、8 项 Rust 测试及 fixture 离屏自检通过，新的 GUI 路径尚未复验。官方摘录：`target/handoff-recovery/dwm-transition-contract.txt`。
+
+录像预检 `pilot-04/r0-baseline-d0/screen.mkv` 为 FFV1 / bgr0、1600×2080，实际 11 帧，PTS 间隔为 33/34 ms，保留 wall-clock PTS。它仅录到正常窗口和拒绝过程，没有冷恢复动画。父级检查了第 5 帧的窗口局部图。四角均为 G1 / 698×444 / C；完整客户区比较仍为 unknown：309912 个像素中 62 个不匹配，均在底部两角最后 10 行，与图中圆角裁剪位置一致。没有把四角一致或其余像素匹配当作完整画面通过，原始差异保存在 `pixel-mismatch-detail.json`。
