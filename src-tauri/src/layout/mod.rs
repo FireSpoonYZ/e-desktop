@@ -36,6 +36,8 @@ pub struct Engine {
     next_id: u64,
     viewports: BTreeMap<MonitorId, Rect>,
     page_focus: BTreeMap<PageId, WindowId>,
+    /// Session-only focus history keyed by stable column and window identities.
+    column_focus: BTreeMap<ColumnId, WindowId>,
     fullscreen_restore: BTreeMap<WindowId, Rect>,
     /// Relative shares of space above each tiled window's one-pixel minimum.
     height_weights: BTreeMap<WindowId, u32>,
@@ -200,6 +202,7 @@ impl Engine {
             next_id: 0,
             viewports: BTreeMap::new(),
             page_focus: BTreeMap::new(),
+            column_focus: BTreeMap::new(),
             fullscreen_restore: BTreeMap::new(),
             height_weights: BTreeMap::new(),
             minimized_slots: vec![],
@@ -274,7 +277,9 @@ impl Engine {
             | Command::SwitchPage { monitor_id, .. }
             | Command::AddPage { monitor_id } => mon(monitor_id),
             Command::SlideColumn { .. } => self.snapshot.active_monitor.as_deref().is_some_and(mon),
-            Command::DropWindow { window_id, x, y } => point(*x, *y) || win(window_id),
+            Command::DropWindow {
+                window_id, x, y, ..
+            } => point(*x, *y) || win(window_id),
             Command::MoveWindowToPage { window_id, page_id } => {
                 win(window_id)
                     || self.snapshot.monitors.iter().any(|m| {
@@ -929,6 +934,40 @@ impl Engine {
             .retain(|page, window| valid.get(page).is_some_and(|ids| ids.contains(window)));
         self.height_weights
             .retain(|id, _| self.snapshot.windows.iter().any(|w| &w.native.id == id));
+        let snapshot = &self.snapshot;
+        self.column_focus.retain(|column, window| {
+            snapshot
+                .monitors
+                .iter()
+                .flat_map(|m| &m.pages)
+                .flat_map(|p| &p.columns)
+                .any(|c| &c.id == column && c.windows.contains(window))
+                && snapshot.windows.iter().any(|w| {
+                    &w.native.id == window && (!w.native.minimized || w.native.minimized_by_manager)
+                })
+        });
+        if let Some(id) = self.snapshot.focused_window.clone() {
+            self.remember_column_focus(&id);
+        }
+    }
+
+    fn remember_column_focus(&mut self, id: &str) {
+        if self.navigable(id) {
+            if let Ok((m, p, Some((c, _)))) = self.location(id) {
+                self.column_focus.insert(
+                    self.snapshot.monitors[m].pages[p].columns[c].id.clone(),
+                    id.into(),
+                );
+            }
+        }
+    }
+
+    fn column_focus_target(&self, column: &Column) -> Option<WindowId> {
+        self.column_focus
+            .get(&column.id)
+            .filter(|id| column.windows.contains(id) && self.navigable(id))
+            .or_else(|| column.windows.iter().find(|id| self.navigable(id)))
+            .cloned()
     }
 
     fn set_focus(&mut self, id: &str, ensure_visible: bool) -> Result<(), AppError> {
@@ -936,6 +975,7 @@ impl Engine {
         self.snapshot.monitors[m].active_page = self.snapshot.monitors[m].pages[p].id.clone();
         self.snapshot.active_monitor = Some(self.snapshot.monitors[m].monitor.id.clone());
         self.snapshot.focused_window = Some(id.into());
+        self.remember_column_focus(id);
         self.page_focus
             .insert(self.snapshot.monitors[m].active_page.clone(), id.into());
         // Floating focus leaves a tiled layout fullscreen in place; the floating window covers it.
@@ -973,8 +1013,9 @@ impl Engine {
             .cloned()
             .collect();
         for c in (c + 1..page.columns.len()).chain((0..c).rev()) {
-            let windows = &page.columns[c].windows;
-            out.push(windows[r.min(windows.len() - 1)].clone());
+            if let Some(id) = self.column_focus_target(&page.columns[c]) {
+                out.push(id);
+            }
         }
         Ok(out)
     }
@@ -1139,7 +1180,7 @@ impl Engine {
                                 Some(c + 1)
                             };
                             c.and_then(|c| page.columns.get(c))
-                                .map(|c| c.windows[w.min(c.windows.len() - 1)].clone())
+                                .and_then(|c| self.column_focus_target(c))
                         }
                     }
                 } else {
@@ -1414,9 +1455,17 @@ impl Engine {
                 // Keep membership until enumeration confirms native destruction (close can be cancelled).
                 return Ok(vec![NativeAction::Close { window_id }]);
             }
-            Command::DropWindow { window_id, x, y } => {
-                self.drop_window(&window_id, x, y)?;
-                focus_action = true;
+            Command::DropWindow {
+                window_id,
+                x,
+                y,
+                page_id,
+                viewport_x,
+            } => {
+                let before = self.snapshot.focused_window.clone();
+                self.drop_window(&window_id, x, y, page_id.as_deref(), viewport_x)?;
+                focus_action = self.snapshot.focused_window.as_deref() == Some(&window_id)
+                    || self.snapshot.focused_window != before;
             }
             Command::SetFloatingRect { window_id, rect } => {
                 self.set_floating_rect(&window_id, rect)?;
@@ -1439,7 +1488,7 @@ impl Engine {
     }
 
     /// Scroll the active page until the next column toward `direction` is fully visible and
-    /// focus it (same row as the focused window). False when every column there is visible.
+    /// focus its last focused window. False when every column there is visible.
     fn slide_column(&mut self, direction: Direction) -> Result<bool, AppError> {
         let right = match direction {
             Direction::Left => false,
@@ -1476,20 +1525,10 @@ impl Engine {
         let Some((c, scroll)) = target else {
             return Ok(false);
         };
-        let row = match self.snapshot.focused_window.as_ref().map(|id| self.location(id)) {
-            Some(Ok((fm, fp, Some((_, row))))) if (fm, fp) == (m, p) => row,
-            _ => 0,
-        };
+        let id = self.column_focus_target(&page.columns[c]);
         let page = &mut self.snapshot.monitors[m].pages[p];
         page.viewport_x = clamp_scroll(page, view as u32, scroll);
-        let windows = page.columns[c].windows.clone();
-        let preferred = row.min(windows.len() - 1);
-        let Some(id) = windows
-            .get(preferred)
-            .filter(|id| self.navigable(id))
-            .cloned()
-            .or_else(|| windows.into_iter().find(|id| self.navigable(id)))
-        else {
+        let Some(id) = id else {
             return Ok(true);
         };
         let w = self.window_index(&id)?;

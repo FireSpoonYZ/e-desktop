@@ -150,6 +150,8 @@ mod tests {
         let scene = e
             .scene(
                 Command::DropWindow {
+                    page_id: None,
+                    viewport_x: None,
                     window_id: "2".into(),
                     x: 1190,
                     y: 450,
@@ -201,6 +203,8 @@ mod tests {
         assert!(
             e.scene(
                 Command::DropWindow {
+                    page_id: None,
+                    viewport_x: None,
                     window_id: "2".into(),
                     x: 99_999,
                     y: 0,

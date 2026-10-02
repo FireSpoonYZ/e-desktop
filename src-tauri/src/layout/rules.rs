@@ -84,7 +84,24 @@ impl Engine {
                 target.y as i64 + target.height.saturating_sub(rect.height) as i64,
             ));
         }
-        self.insert_window(m, p, id, matched.column_width)
+        let page = &self.snapshot.monitors[m].pages[p];
+        let at = self
+            .page_focus
+            .get(&page.id)
+            .and_then(|focused| {
+                page.columns
+                    .iter()
+                    .position(|c| c.windows.contains(focused))
+            })
+            .map(|c| c + 1)
+            .unwrap_or(page.columns.len());
+        self.insert_window(m, p, id, matched.column_width)?;
+        if !self.snapshot.windows[w].floating {
+            let page = &mut self.snapshot.monitors[m].pages[p];
+            let column = page.columns.pop().unwrap();
+            page.columns.insert(at, column);
+        }
+        Ok(())
     }
 }
 

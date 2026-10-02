@@ -243,6 +243,13 @@ pub enum Command {
         window_id: WindowId,
         x: i32,
         y: i32,
+        /// Explicit overview target; absent uses the page active under the screen point.
+        /// A background target does not activate that page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_id: Option<PageId>,
+        /// Overview hit-test scroll, only with page_id; bypasses desktop edge/top drop bands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_x: Option<i32>,
     },
     /// Drag the boundary left of column `edge` on the monitor's active page by `delta`
     /// physical pixels (`edge` = column count is the right end). Neighbours give or take the

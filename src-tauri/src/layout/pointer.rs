@@ -92,7 +92,7 @@ impl Engine {
         let Some(id) = self.snapshot.focused_window.clone() else {
             return Ok(());
         };
-        let Ok((fm, fp, Some((fc, row)))) = self.location(&id) else {
+        let Ok((fm, fp, Some((fc, _)))) = self.location(&id) else {
             return Ok(());
         };
         if (fm, fp) != (m, p) {
@@ -118,15 +118,26 @@ impl Engine {
         let Some(c) = nearest else {
             return Ok(());
         };
-        let windows = &page.columns[c].windows;
-        let target = windows[row.min(windows.len() - 1)].clone();
-        self.set_focus(&target, false)
+        if let Some(target) = self.column_focus_target(&page.columns[c]) {
+            self.set_focus(&target, false)?;
+        }
+        Ok(())
     }
 
     /// niri-style interactive move: drop onto a column's middle to stack into it (above or
     /// below the row under the pointer), onto its outer quarters or empty space for a new
     /// column, onto the strip along a screen edge to place that column fully on screen there.
-    pub(super) fn drop_window(&mut self, id: &str, x: i32, y: i32) -> Result<(), AppError> {
+    pub(super) fn drop_window(
+        &mut self,
+        id: &str,
+        x: i32,
+        y: i32,
+        page_id: Option<&str>,
+        viewport_x: Option<i32>,
+    ) -> Result<(), AppError> {
+        if viewport_x.is_some() && page_id.is_none() {
+            return Err(invalid("Drop viewport requires an explicit target page"));
+        }
         let w = self.window_index(id)?;
         if self.snapshot.windows[w].floating {
             return Err(invalid("Floating windows move with setFloatingRect"));
@@ -142,12 +153,25 @@ impl Engine {
         let (old_c, old_row) = location.ok_or_else(|| invalid("Window has no tiled column"))?;
         let monitor = &self.snapshot.monitors[m];
         let viewport = monitor.viewport;
-        let p = monitor
-            .pages
-            .iter()
-            .position(|p| p.id == monitor.active_page)
-            .unwrap();
+        let p = if let Some(page_id) = page_id {
+            let (target_m, p) = self.page_index(page_id)?;
+            if target_m != m {
+                return Err(invalid("Drop point is outside the target page's monitor"));
+            }
+            p
+        } else {
+            monitor
+                .pages
+                .iter()
+                .position(|p| p.id == monitor.active_page)
+                .unwrap()
+        };
         let page = &monitor.pages[p];
+        if viewport_x.is_some() && !contains(viewport, x, y) {
+            return Err(invalid(
+                "Overview drop point is outside the target viewport",
+            ));
+        }
         let source_view = self.snapshot.monitors[old_m].viewport.width;
         let source_width = self.snapshot.monitors[old_m].pages[old_p].columns[old_c].width;
         // Keep the screen share on another display; physical pixels lose it across different sizes.
@@ -157,7 +181,7 @@ impl Engine {
         .clamp(1, u64::from(viewport.width)) as u32;
         let band = queue_band(monitor.monitor.scale_factor, viewport.width);
         let (vx, vw) = (i64::from(viewport.x), i64::from(viewport.width));
-        if x < vx + band || x >= vx + vw - band {
+        if viewport_x.is_none() && (x < vx + band || x >= vx + vw - band) {
             if (m, p) != (old_m, old_p) {
                 let page_id = page.id.clone();
                 self.record_hotplug_move(id, &page_id);
@@ -168,14 +192,16 @@ impl Engine {
             // `col_left - view` scrolls to the column's right edge, a left park at
             // `col_left + width` scrolls to its left edge. Row-squeeze still parks.
             self.queue_column(m, p, column, x >= vx + vw / 2);
-            return self.set_focus(id, true);
+            return self.finish_drop_focus(id, m, p);
         }
         // Top-centre drop creates a standalone full-width column, not layout fullscreen.
         // Side queue bands take precedence at the corners. Use screen coordinates so a pinned
         // bar does not make the top edge unreachable; the resulting tile uses the usable viewport.
         let top = i64::from(monitor.monitor.bounds.y);
         let top_band = top_band(monitor.monitor.scale_factor);
-        if y >= top && y < (top + top_band).min(i64::from(viewport.y) + i64::from(viewport.height))
+        if viewport_x.is_none()
+            && y >= top
+            && y < (top + top_band).min(i64::from(viewport.y) + i64::from(viewport.height))
         {
             let page_id = page.id.clone();
             if (m, p) != (old_m, old_p) {
@@ -199,11 +225,11 @@ impl Engine {
                 .insert(at, column);
             self.snapshot.windows[w].fullscreen = false;
             self.fullscreen_restore.remove(id);
-            return self.set_focus(id, true);
+            return self.finish_drop_focus(id, m, p);
         }
         // (column index, Some(row) to stack into that column, None for a new column there).
         let mut target = (page.columns.len(), None);
-        let mut left = viewport.x as i64 - page.viewport_x as i64;
+        let mut left = i64::from(viewport.x) - i64::from(viewport_x.unwrap_or(page.viewport_x));
         for (c, column) in page.columns.iter().enumerate() {
             let right = left + column.width as i64;
             if x < left {
@@ -269,7 +295,21 @@ impl Engine {
                 self.snapshot.monitors[m].pages[p].columns.insert(c, column);
             }
         }
-        self.set_focus(id, true)
+        self.finish_drop_focus(id, m, p)
+    }
+
+    fn finish_drop_focus(&mut self, id: &str, m: usize, p: usize) -> Result<(), AppError> {
+        let page_id = self.snapshot.monitors[m].pages[p].id.clone();
+        if self.snapshot.monitors[m].active_page == page_id {
+            return self.set_focus(id, true);
+        }
+        self.ensure_visible(id, false)?;
+        self.page_focus.insert(page_id, id.into());
+        self.remember_column_focus(id);
+        if self.snapshot.focused_window.as_deref() == Some(id) {
+            self.focus_active_page();
+        }
+        Ok(())
     }
 
     /// A tiled window the user dragged by its own title bar (the system move loop): once the
@@ -301,6 +341,8 @@ impl Engine {
         let clamp = |v: i64| v.clamp(i32::MIN.into(), i32::MAX.into()) as i32;
         Ok(self
             .dispatch(Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
                 window_id: id.into(),
                 x: clamp(x),
                 y: clamp(y),
@@ -331,6 +373,8 @@ mod tests {
 
     fn drop(e: &mut Engine, id: &str, x: i32, y: i32) {
         e.dispatch(Command::DropWindow {
+            page_id: None,
+            viewport_x: None,
             window_id: id.into(),
             x,
             y,
@@ -378,6 +422,8 @@ mod tests {
         assert_eq!(e.snapshot.active_monitor.as_deref(), Some("b"));
         let error = e
             .dispatch(Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
                 window_id: "3".into(),
                 x: 99_999,
                 y: 0,
@@ -444,6 +490,8 @@ mod tests {
         drop(&mut e, "1", 900, 450);
         assert_eq!(layout(&e, 0)[0], ["2", "1"]);
         let command = Command::DropWindow {
+            page_id: None,
+            viewport_x: None,
             window_id: "1".into(),
             x: 600,
             y: 30,

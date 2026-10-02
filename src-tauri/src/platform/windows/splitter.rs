@@ -629,6 +629,8 @@ fn update(point: Option<POINT>) {
                 *top_armed |= y >= below;
                 (
                     Command::DropWindow {
+                        page_id: None,
+                        viewport_x: None,
                         window_id: id.clone(),
                         x: point.x,
                         // Not yet armed: drop just below the band.

@@ -1571,6 +1571,8 @@ fn drops_on_a_screen_edge_reveal_the_window_on_that_side() {
     let mut e = engine();
     let drop = |e: &mut Engine, id: &str, x: i32| {
         e.dispatch(Command::DropWindow {
+    page_id: None,
+    viewport_x: None,
             window_id: id.into(),
             x,
             y: 450,
@@ -2142,6 +2144,8 @@ fn one_suspended_monitor_freezes_and_the_other_keeps_working() {
     })
     .unwrap();
     e.dispatch(Command::DropWindow {
+    page_id: None,
+    viewport_x: None,
         window_id: "2".into(),
         x: 10,
         y: 450,
@@ -2150,6 +2154,8 @@ fn one_suspended_monitor_freezes_and_the_other_keeps_working() {
     assert_eq!(page_geom(&e, 0), a, "suspended monitor does not scroll or resize");
     // The other monitor still takes a drop and an edge drag.
     e.dispatch(Command::DropWindow {
+    page_id: None,
+    viewport_x: None,
         window_id: "4".into(),
         x: -10,
         y: 450,
@@ -2247,6 +2253,8 @@ fn a_managed_cover_keeps_its_column_and_is_not_pulled_back() {
     assert!(e
         .scene(
             Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
                 window_id: "2".into(),
                 x: -600,
                 y: 100,
@@ -2258,6 +2266,8 @@ fn a_managed_cover_keeps_its_column_and_is_not_pulled_back() {
     assert!(e
         .scene(
             Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
                 window_id: "2".into(),
                 x: 100,
                 y: 100,
@@ -2269,6 +2279,8 @@ fn a_managed_cover_keeps_its_column_and_is_not_pulled_back() {
     assert!(e
         .scene(
             Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
                 window_id: "1".into(),
                 x: 100,
                 y: 100,
@@ -2277,4 +2289,452 @@ fn a_managed_cover_keeps_its_column_and_is_not_pulled_back() {
             &[],
         )
         .is_none());
+}
+
+fn focus_memory_engine() -> Engine {
+    let mut e = engine();
+    let mut native = system();
+    native.windows.push(window("5", "a"));
+    native.focused_window = None;
+    e.reconcile(native).unwrap();
+    for (id, direction) in [("5", Direction::Left), ("3", Direction::Left)] {
+        e.dispatch(Command::FocusWindow {
+            window_id: id.into(),
+        })
+        .unwrap();
+        e.dispatch(Command::MoveWindow { direction }).unwrap();
+    }
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0]
+            .columns
+            .iter()
+            .map(|c| c.windows.clone())
+            .collect::<Vec<_>>(),
+        [vec!["1", "5"], vec!["2", "3"]]
+    );
+    e
+}
+
+#[test]
+fn new_tiled_windows_follow_target_page_focus_and_keep_rule_width() {
+    let mut e = engine();
+    let page = e.snapshot.monitors[0].active_page.clone();
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::AddPage {
+        monitor_id: "a".into(),
+    })
+    .unwrap();
+    e.set_window_rules(vec![WindowRule {
+        title: Some("new".into()),
+        monitor_id: Some("a".into()),
+        page_index: Some(1),
+        column_width: Some(333),
+        ..WindowRule::default()
+    }])
+    .unwrap();
+    let mut native = system();
+    native.windows.push(window("new", "b"));
+    native.focused_window = None;
+    e.reconcile(native).unwrap();
+    let (m, p, Some((c, _))) = e.location("new").unwrap() else {
+        panic!("tiled")
+    };
+    assert_eq!((m, c), (0, 2));
+    assert_eq!(e.snapshot.monitors[m].pages[p].id, page);
+    assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 333);
+    assert_eq!(
+        e.snapshot.monitors[m].pages[p].columns[c + 1].windows,
+        ["3"]
+    );
+    assert_ne!(e.snapshot.monitors[m].active_page, page);
+}
+
+#[test]
+fn new_window_floating_focus_falls_back_to_tail_and_explicit_move_stays_at_tail() {
+    let mut e = engine();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    let mut native = system();
+    native.windows.push(window("new", "a"));
+    e.reconcile(native).unwrap();
+    assert_eq!(e.location("new").unwrap().2.unwrap().0, 2);
+    let target = e.snapshot.monitors[0].active_page.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "4".into(),
+        page_id: target,
+    })
+    .unwrap();
+    assert_eq!(e.location("4").unwrap().2.unwrap().0, 3);
+}
+
+#[test]
+fn horizontal_focus_remembers_window_identity_not_row_index() {
+    let mut e = focus_memory_engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "5".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Up,
+    })
+    .unwrap();
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Up,
+    })
+    .unwrap();
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("5"));
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    // Native focus passes through the same memory path.
+    let mut native = SystemSnapshot {
+        monitors: system().monitors,
+        windows: e
+            .snapshot
+            .windows
+            .iter()
+            .map(|w| w.native.clone())
+            .collect(),
+        focused_window: Some("3".into()),
+    };
+    e.reconcile(native.clone()).unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    native.focused_window = None;
+    e.reconcile(native).unwrap();
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+}
+
+#[test]
+fn sliding_columns_restores_their_last_focused_window() {
+    let mut e = focus_memory_engine();
+    for column in &mut e.snapshot.monitors[0].pages[0].columns {
+        column.width = 800;
+    }
+    e.dispatch(Command::FocusWindow {
+        window_id: "5".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::SlideColumn {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+    e.dispatch(Command::SlideColumn {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("5"));
+}
+
+#[test]
+fn focus_memory_cleans_up_moved_removed_minimized_and_floating_members() {
+    for event in ["move", "close", "minimize", "float"] {
+        let mut e = focus_memory_engine();
+        let column = e.snapshot.monitors[0].pages[0].columns[1].id.clone();
+        match event {
+            "move" => {
+                e.dispatch(Command::MoveWindow {
+                    direction: Direction::Left,
+                })
+                .unwrap();
+            }
+            "float" => {
+                e.dispatch(Command::ToggleFloating).unwrap();
+            }
+            _ => {
+                let mut native = SystemSnapshot {
+                    monitors: system().monitors,
+                    windows: e
+                        .snapshot
+                        .windows
+                        .iter()
+                        .map(|w| w.native.clone())
+                        .collect(),
+                    focused_window: None,
+                };
+                if event == "close" {
+                    native.windows.retain(|w| w.id != "3");
+                } else {
+                    native
+                        .windows
+                        .iter_mut()
+                        .find(|w| w.id == "3")
+                        .unwrap()
+                        .minimized = true;
+                }
+                e.reconcile(native).unwrap();
+            }
+        }
+        assert_ne!(
+            e.column_focus.get(&column).map(String::as_str),
+            Some("3"),
+            "{event}"
+        );
+        e.dispatch(Command::FocusWindow {
+            window_id: "1".into(),
+        })
+        .unwrap();
+        e.dispatch(Command::FocusDirection {
+            direction: Direction::Right,
+        })
+        .unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"), "{event}");
+    }
+    let mut e = focus_memory_engine();
+    let stale = e.snapshot.monitors[0].pages[0].columns[1].id.clone();
+    e.column_focus.insert(stale.clone(), "gone".into());
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::FocusDirection {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    assert_eq!(e.column_focus[&stale], "2");
+}
+
+#[test]
+fn removed_column_memory_is_not_reused_by_new_columns() {
+    let mut e = engine();
+    let column = e.snapshot.monitors[0].pages[0].columns[0].id.clone();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Right,
+    })
+    .unwrap();
+    assert!(!e.column_focus.contains_key(&column));
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+        panic!("tiled")
+    };
+    let created = &e.snapshot.monitors[m].pages[p].columns[c].id;
+    assert_ne!(created, &column);
+    assert_eq!(e.column_focus[created], "1");
+}
+
+#[test]
+fn overview_background_drop_uses_its_scroll_and_preserves_source_focus() {
+    let mut e = engine();
+    let source = e.snapshot.monitors[0].active_page.clone();
+    let target = e.snapshot.monitors[0].pages[1].id.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "3".into(),
+        page_id: target.clone(),
+    })
+    .unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    let t = e
+        .dispatch(Command::DropWindow {
+            window_id: "1".into(),
+            x: 300,
+            y: 450,
+            page_id: Some(target.clone()),
+            viewport_x: Some(0),
+        })
+        .unwrap();
+    assert_eq!(e.snapshot.monitors[0].active_page, source);
+    assert_eq!(e.snapshot.active_monitor.as_deref(), Some("a"));
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+    let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+        panic!("tiled")
+    };
+    assert_eq!(e.snapshot.monitors[m].pages[p].id, target);
+    assert_eq!(
+        e.snapshot.monitors[m].pages[p].columns[c].windows,
+        ["3", "1"]
+    );
+    assert_eq!(e.page_focus[&target], "1");
+    assert!(placement(&t.actions, "1").2);
+    assert!(
+        t.actions
+            .iter()
+            .any(|a| matches!(a, NativeAction::Focus {window_id} if window_id == "2"))
+    );
+}
+
+#[test]
+fn overview_drop_scroll_override_hits_offscreen_columns_without_edge_hotzones() {
+    let mut e = engine();
+    let target = e.snapshot.monitors[0].active_page.clone();
+    e.dispatch(Command::DropWindow {
+        window_id: "4".into(),
+        x: 300,
+        y: 450,
+        page_id: Some(target.clone()),
+        viewport_x: Some(1200),
+    })
+    .unwrap();
+    assert_eq!(
+        e.snapshot.monitors[0].pages[0].columns[2].windows,
+        ["3", "4"]
+    );
+    // Screen-top/side point is a normal column-middle hit under the override, not full-width/queue.
+    e.dispatch(Command::DropWindow {
+        window_id: "1".into(),
+        x: 10,
+        y: 10,
+        page_id: Some(target),
+        viewport_x: Some(1490),
+    })
+    .unwrap();
+    let (m, p, Some((c, _))) = e.location("1").unwrap() else {
+        panic!("tiled")
+    };
+    assert_eq!(
+        e.snapshot.monitors[m].pages[p].columns[c].windows,
+        ["1", "3", "4"]
+    );
+    assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 600);
+}
+
+#[test]
+fn overview_drop_rejects_invalid_target_or_override_atomically() {
+    let mut e = engine();
+    let target = e.snapshot.monitors[1].active_page.clone();
+    for (page_id, viewport_x, x, y) in [
+        (Some("gone".into()), Some(0), 300, 450),
+        (Some(target.clone()), Some(0), 300, 450),
+        (None, Some(0), 300, 450),
+        (Some(target.clone()), Some(i32::MAX), -900, 900),
+    ] {
+        let memory = e.column_focus.clone();
+        assert_rejected_unchanged(
+            &mut e,
+            Command::DropWindow {
+                window_id: "1".into(),
+                x,
+                y,
+                page_id,
+                viewport_x,
+            },
+        );
+        assert_eq!(e.column_focus, memory);
+    }
+}
+
+#[test]
+fn legacy_drop_ipc_and_snapshot_need_no_focus_memory_fields() {
+    let json = serde_json::json!({"type":"dropWindow", "windowId":"1", "x":10, "y":20});
+    let command: Command = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(
+        command,
+        Command::DropWindow {
+            window_id: "1".into(),
+            x: 10,
+            y: 20,
+            page_id: None,
+            viewport_x: None
+        }
+    );
+    assert_eq!(serde_json::to_value(command).unwrap(), json);
+    let action = serde_json::json!({"type":"command", "command":json});
+    let shortcut: crate::config::ShortcutAction = serde_json::from_value(action.clone()).unwrap();
+    assert_eq!(serde_json::to_value(shortcut).unwrap(), action);
+    let json = serde_json::json!({"type":"dropWindow", "windowId":"1", "x":10, "y":20, "pageId":"p", "viewportX":-10});
+    assert_eq!(
+        serde_json::to_value(serde_json::from_value::<Command>(json.clone()).unwrap()).unwrap(),
+        json
+    );
+    let action = serde_json::json!({"type":"command", "command":json});
+    let shortcut: crate::config::ShortcutAction = serde_json::from_value(action.clone()).unwrap();
+    assert_eq!(serde_json::to_value(shortcut).unwrap(), action);
+    let e = focus_memory_engine();
+    let saved = serde_json::to_value(e.snapshot()).unwrap();
+    let restored: Snapshot = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+    assert!(
+        saved["monitors"][0]["pages"][0]["columns"][0]
+            .get("focusedWindow")
+            .is_none()
+    );
+}
+
+#[test]
+fn background_cross_monitor_drop_uses_saved_scroll_without_changing_active_pages() {
+    let mut e = engine();
+    let source = e.snapshot.monitors[0].active_page.clone();
+    let other = e.snapshot.monitors[1].active_page.clone();
+    let target = e.snapshot.monitors[1].pages[1].id.clone();
+    for id in ["2", "3"] {
+        e.dispatch(Command::MoveWindowToPage {
+            window_id: id.into(),
+            page_id: target.clone(),
+        })
+        .unwrap();
+    }
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::SwitchPage {
+        monitor_id: "b".into(),
+        page_id: other.clone(),
+    })
+    .unwrap();
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    let (_, p) = e.page_index(&target).unwrap();
+    e.snapshot.monitors[1].pages[p].viewport_x = 600;
+    e.dispatch(Command::DropWindow {
+        window_id: "4".into(),
+        x: -900,
+        y: 450,
+        page_id: Some(target),
+        viewport_x: None,
+    })
+    .unwrap();
+    assert_eq!(
+        e.snapshot.monitors[1].pages[p].columns[1].windows,
+        ["3", "4"]
+    );
+    assert_eq!(e.snapshot.monitors[0].active_page, source);
+    assert_eq!(e.snapshot.monitors[1].active_page, other);
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+    assert_eq!(e.snapshot.active_monitor.as_deref(), Some("a"));
+}
+
+#[test]
+fn overview_drop_handles_extreme_scroll_overrides_in_wide_arithmetic() {
+    for (scroll, expected) in [(i32::MIN, 0), (i32::MAX, 3)] {
+        let mut e = engine();
+        let page = e.snapshot.monitors[0].active_page.clone();
+        e.dispatch(Command::DropWindow {
+            window_id: "4".into(),
+            x: 300,
+            y: 450,
+            page_id: Some(page),
+            viewport_x: Some(scroll),
+        })
+        .unwrap();
+        assert_eq!(e.location("4").unwrap().2.unwrap().0, expected);
+    }
 }

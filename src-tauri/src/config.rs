@@ -163,6 +163,10 @@ enum StrictCommand {
         window_id: String,
         x: i32,
         y: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_x: Option<i32>,
     },
     DragEdge {
         monitor_id: String,
