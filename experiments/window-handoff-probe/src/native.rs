@@ -1048,6 +1048,21 @@ impl Session {
             let mut above = unsafe { GetWindow(cover.h(), GW_HWNDPREV) };
             while !above.is_null() {
                 if unsafe { IsWindowVisible(above) } != 0 && unsafe { IsIconic(above) } == 0 {
+                    // WS_VISIBLE can remain set on DWM-cloaked shell/other-desktop helpers.
+                    // Only a successful query proving cloaking excludes it; errors stay conservative.
+                    let mut cloak_flags = 0u32;
+                    let cloak_hr = unsafe {
+                        DwmGetWindowAttribute(
+                            above,
+                            DWMWA_CLOAKED as u32,
+                            &mut cloak_flags as *mut _ as _,
+                            size_of::<u32>() as u32,
+                        )
+                    };
+                    if cloak_hr >= 0 && cloak_flags != 0 {
+                        above = unsafe { GetWindow(above, GW_HWNDPREV) };
+                        continue;
+                    }
                     let r = outer(above)?;
                     if r.x < self.cover_bounds.right()
                         && r.right() > self.cover_bounds.x
