@@ -17,7 +17,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 #[path = "compositor_wallpaper.rs"]
 mod wallpaper;
-use wallpaper::{Backdrop, Wallpaper};
+use wallpaper::{BACKGROUND_CACHE_BYTES, Backdrop, Background, Wallpaper};
 
 struct Overlay {
     bounds: Rect,
@@ -101,7 +101,7 @@ unsafe extern "system" fn overlay_proc(h: HWND, message: u32, w: WPARAM, l: LPAR
             let mut paint: PAINTSTRUCT = unsafe { zeroed() };
             let dc = unsafe { BeginPaint(h, &mut paint) };
             let backdrop = unsafe { &mut *(backdrop as *mut Backdrop) };
-            backdrop.paint_failed = !backdrop.wallpaper.paint(dc, backdrop.viewport);
+            backdrop.paint_failed = !backdrop.background.paint(dc);
             unsafe { EndPaint(h, &paint) };
             return 0;
         }
@@ -159,7 +159,17 @@ impl Backend {
             return Ok(overlay.hwnd as HWND);
         }
         let wallpaper = self.compositor.wallpaper.as_ref().unwrap().clone();
-        wallpaper.validate(bounds)?;
+        let cached_bytes: usize = self
+            .compositor
+            .overlays
+            .iter()
+            .map(|o| o.backdrop.background.bytes())
+            .sum();
+        let background = Background::prepare(
+            &wallpaper,
+            bounds,
+            BACKGROUND_CACHE_BYTES.saturating_sub(cached_bytes),
+        )?;
         native(bounds)?;
         let class = wide(CLASS);
         let instance = unsafe { GetModuleHandleW(null()) };
@@ -204,15 +214,14 @@ impl Backend {
         if h.is_null() {
             return Err(failed("CreateWindowExW (compositor overlay)", None));
         }
-        if unsafe { SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA) } == 0 {
+        if unsafe { SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA) } == 0 {
             let failure = failed("SetLayeredWindowAttributes (compositor overlay)", None);
             unsafe { DestroyWindow(h) };
             return Err(failure);
         }
         let mut backdrop = Box::new(Backdrop {
-            wallpaper,
-            viewport: bounds,
-            paint_failed: false,
+            background,
+            paint_failed: true,
         });
         unsafe { SetWindowLongPtrW(h, GWLP_USERDATA, (&mut *backdrop as *mut Backdrop) as isize) };
         self.compositor.overlays.push(Overlay {
@@ -266,11 +275,30 @@ impl Backend {
             })
         {
             let wallpaper = Wallpaper::load(self.compositor.wallpaper.as_ref())?;
-            for overlay in &mut self.compositor.overlays {
-                wallpaper.validate(overlay.bounds)?;
-                overlay.backdrop.wallpaper = wallpaper.clone();
-                overlay.backdrop.paint_failed = false;
-                unsafe { InvalidateRect(overlay.hwnd as HWND, null(), 0) };
+            if !self
+                .compositor
+                .wallpaper
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(old, &wallpaper))
+            {
+                let mut cached_bytes: usize = self
+                    .compositor
+                    .overlays
+                    .iter()
+                    .map(|o| o.backdrop.background.bytes())
+                    .sum();
+                for overlay in &mut self.compositor.overlays {
+                    let old_bytes = overlay.backdrop.background.bytes();
+                    let background = Background::prepare(
+                        &wallpaper,
+                        overlay.bounds,
+                        BACKGROUND_CACHE_BYTES.saturating_sub(cached_bytes - old_bytes),
+                    )?;
+                    cached_bytes = cached_bytes - old_bytes + background.bytes();
+                    overlay.backdrop.background = background;
+                    overlay.backdrop.paint_failed = true;
+                    unsafe { InvalidateRect(overlay.hwnd as HWND, null(), 0) };
+                }
             }
             self.compositor.wallpaper = Some(wallpaper);
         }
@@ -287,6 +315,14 @@ impl Backend {
             let h = self.overlay(area)?;
             if unsafe { IsWindowVisible(h) } == 0 {
                 uncovered = true;
+                // Only a new show is transparent during preparation, while real sources still
+                // hold their previous placements. Never clear an already covering surface.
+                if unsafe { SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA) } == 0 {
+                    return Err(failed(
+                        "SetLayeredWindowAttributes (compositor prepare)",
+                        None,
+                    ));
+                }
                 if unsafe {
                     SetWindowPos(
                         h,
@@ -301,7 +337,38 @@ impl Backend {
                 {
                     return Err(failed("SetWindowPos (compositor overlay)", None));
                 }
+                self.compositor
+                    .overlays
+                    .iter_mut()
+                    .find(|o| o.hwnd == h as usize)
+                    .unwrap()
+                    .backdrop
+                    .paint_failed = true;
+                if unsafe { InvalidateRect(h, null(), 0) } == 0 {
+                    return Err(failed("InvalidateRect (compositor prepare)", None));
+                }
                 unsafe { UpdateWindow(h) };
+                if self
+                    .compositor
+                    .overlays
+                    .iter()
+                    .find(|o| o.hwnd == h as usize)
+                    .unwrap()
+                    .backdrop
+                    .paint_failed
+                {
+                    return Err(error(
+                        ErrorCode::OperationDenied,
+                        "Compositor cover has no painted background",
+                        None,
+                    ));
+                }
+                if unsafe { SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA) } == 0 {
+                    return Err(failed(
+                        "SetLayeredWindowAttributes (compositor publish)",
+                        None,
+                    ));
+                }
             }
         }
         pump();
@@ -552,6 +619,56 @@ mod tests {
         assert_eq!(body.matches("DwmFlush()").count(), 1);
         assert_eq!(body.matches("self.place_sprites(").count(), 1);
         assert!(body.contains("if uncovered {"));
+    }
+
+    #[test]
+    fn new_cover_is_painted_before_becoming_opaque_and_never_clears_its_dc() {
+        let source = include_str!("compositor.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let proc = source
+            .split("fn overlay_proc(")
+            .nth(1)
+            .unwrap()
+            .split("fn pump(")
+            .next()
+            .unwrap();
+        assert!(proc.contains("backdrop.background.paint(dc)"));
+        assert!(!proc.contains("wallpaper.paint") && !proc.contains("FillRect"));
+        let frame = source
+            .split("fn compose_frame(")
+            .nth(1)
+            .unwrap()
+            .split("fn place_sprites(")
+            .next()
+            .unwrap();
+        let hidden = frame
+            .find("if unsafe { IsWindowVisible(h) } == 0 {")
+            .unwrap();
+        let prepare = frame
+            .find("SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA)")
+            .unwrap();
+        let show = frame.find("SetWindowPos(").unwrap();
+        let paint = frame.find("UpdateWindow(h)").unwrap();
+        let checked = frame
+            .find("Compositor cover has no painted background")
+            .unwrap();
+        let publish = frame
+            .find("SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA)")
+            .unwrap();
+        let flush = frame.find("DwmFlush()").unwrap();
+        let place = frame.find("self.place_sprites(").unwrap();
+        assert!(
+            hidden < prepare
+                && prepare < show
+                && show < paint
+                && paint < checked
+                && checked < publish
+                && publish < flush
+                && flush < place
+        );
+        assert_eq!(frame.matches("DwmFlush()").count(), 1);
     }
 
     #[test]

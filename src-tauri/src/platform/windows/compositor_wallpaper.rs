@@ -1,4 +1,5 @@
 //! Static shell wallpaper only: no desktop capture, icons, or dynamic-wallpaper surfaces.
+use super::super::snapshot::{Dib, bitmap_info};
 use super::*;
 use std::{sync::Arc, time::SystemTime};
 use windows::{
@@ -13,6 +14,10 @@ use windows::{
 
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MONITORS: u32 = 32;
+// Separate from decoded source images: at most 128 MiB retained viewport pixels. Preparing
+// one replacement briefly adds <=64 MiB new pixels plus <=64 MiB thread-local GDI DIB.
+pub(super) const BACKGROUND_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const BACKGROUND_SURFACE_BYTES: usize = 64 * 1024 * 1024;
 
 struct Apartment(bool);
 impl Apartment {
@@ -325,7 +330,8 @@ impl Wallpaper {
         }
     }
 
-    pub(super) fn paint(&self, hdc: HDC, viewport: Rect) -> bool {
+    // Only render into a private memory DC, never clear a visible overlay in stages.
+    fn paint(&self, hdc: HDC, viewport: Rect) -> bool {
         let client = RECT {
             left: 0,
             top: 0,
@@ -441,15 +447,132 @@ fn destination(
     Ok(r)
 }
 
+/// Completed viewport pixels. GDI resources stay on the preparing controller thread and are
+/// dropped before publication; the cached Vec remains Send like the enclosing Backend.
+pub(super) struct Background {
+    size: SIZE,
+    pixels: Vec<u8>,
+}
+impl Background {
+    pub(super) fn prepare(
+        wallpaper: &Wallpaper,
+        viewport: Rect,
+        budget: usize,
+    ) -> Result<Self, AppError> {
+        wallpaper.validate(viewport)?;
+        native(viewport)?;
+        let size = SIZE {
+            cx: viewport.width as i32,
+            cy: viewport.height as i32,
+        };
+        let mut dib = Dib::new(size, budget.min(BACKGROUND_SURFACE_BYTES))
+            .ok_or_else(|| wallpaper_error("background bitmap allocation/budget failed"))?;
+        if !wallpaper.paint(dib.dc, viewport) || unsafe { GdiFlush() } == 0 {
+            return Err(wallpaper_error("offscreen background rendering failed"));
+        }
+        Ok(Self {
+            size,
+            pixels: dib.pixels().to_vec(),
+        })
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.pixels.len()
+    }
+
+    /// Publish only a completed image, with no intervening clear on the destination DC.
+    pub(super) fn paint(&self, dc: HDC) -> bool {
+        let copied = unsafe {
+            SetDIBitsToDevice(
+                dc,
+                0,
+                0,
+                self.size.cx as u32,
+                self.size.cy as u32,
+                0,
+                0,
+                0,
+                self.size.cy as u32,
+                self.pixels.as_ptr().cast(),
+                &bitmap_info(self.size),
+                DIB_RGB_COLORS,
+            )
+        };
+        // Complete the GDI copy before a newly shown cover becomes opaque. This is not a
+        // DWM wait and only runs on background paint, not on thumbnail animation ticks.
+        copied == self.size.cy && unsafe { GdiFlush() } != 0
+    }
+}
+
 pub(super) struct Backdrop {
-    pub(super) wallpaper: Arc<Wallpaper>,
-    pub(super) viewport: Rect,
+    pub(super) background: Background,
     pub(super) paint_failed: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_prepares_offscreen_commits_complete_pixels_and_preserves_them_on_failure() {
+        let viewport = Rect {
+            x: -6,
+            y: -3,
+            width: 4,
+            height: 4,
+        };
+        let size = SIZE { cx: 4, cy: 4 };
+        let mut target = Dib::new(size, 64).unwrap();
+        target.pixels().fill(0x5a);
+        let untouched = target.pixels().to_vec();
+        let header = bitmap_info(SIZE { cx: 2, cy: 2 }).bmiHeader;
+        let mut dib = vec![0u32; size_of::<BITMAPINFOHEADER>() / 4 + 4];
+        unsafe { std::ptr::write(dib.as_mut_ptr().cast::<BITMAPINFOHEADER>(), header) };
+        dib[size_of::<BITMAPINFOHEADER>() / 4..].fill(0x0000ff); // Blue image over black clear.
+        let mut wallpaper = Wallpaper {
+            settings: Settings {
+                monitors: vec![MonitorWallpaper {
+                    bounds: viewport,
+                    path: "memory".into(),
+                    modified: None,
+                    length: 0,
+                }],
+                color: 0,
+                position: DWPOS_FILL,
+            },
+            images: HashMap::from([(
+                "memory".into(),
+                Image {
+                    dib,
+                    width: 2,
+                    height: 2,
+                    tile_brush: 0,
+                },
+            )]),
+            background_brush: unsafe { CreateSolidBrush(0) } as usize,
+        };
+        let background = Background::prepare(&wallpaper, viewport, 64).unwrap();
+        assert_eq!(background.bytes(), 64);
+        assert_eq!(target.pixels(), untouched); // Preparation never touches the destination.
+        assert!(background.paint(target.dc));
+        assert!(
+            target
+                .pixels()
+                .chunks_exact(4)
+                .all(|p| p[..3] == [255, 0, 0])
+        );
+        let committed = target.pixels().to_vec();
+        assert!(Background::prepare(&wallpaper, viewport, 63).is_err());
+        assert_eq!(target.pixels(), committed);
+        assert!(background.paint(target.dc)); // A refused new buffer never replaces the old one.
+        assert_eq!(target.pixels(), committed);
+
+        wallpaper.settings.monitors[0].path.clear();
+        let color_only = Background::prepare(&wallpaper, viewport, 64).unwrap();
+        assert_eq!(target.pixels(), committed);
+        assert!(color_only.paint(target.dc));
+        assert!(target.pixels().chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+    }
 
     #[test]
     fn static_wallpaper_paints_color_and_image_without_a_desktop_capture() {
