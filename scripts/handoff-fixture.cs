@@ -272,6 +272,8 @@ class HandoffFixture {
         Console.WriteLine("Offline reference written; no window created");
         return 0;
       }
+      // Route UI callback failures to the Main catch (stderr/exit 1), not ThreadException handling.
+      Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
       if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) throw new InvalidOperationException("PMv2 DPI awareness required");
       Application.EnableVisualStyles();
       using (var form=new FixtureForm(options)) Application.Run(form);
