@@ -1822,4 +1822,38 @@ mod tests {
     fn complete_offscreen_scene_and_commit_memory_dc_only() {
         super::memory_check().unwrap();
     }
+    #[test]
+    fn coloroncolor_pixel_centers_with_padding_and_fractional_ratios() {
+        use super::*;
+        let mut source = Dib::new(7, 5, FRAME_BYTES).unwrap();
+        for y in 0..5usize {
+            for x in 0..7usize {
+                source.pixels()[(y * 7 + x) * 4..(y * 7 + x) * 4 + 4]
+                    .copy_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+        for (dw, dh) in [(7, 5), (11, 8), (5, 3), (9, 7)] {
+            let mut scene = Dib::new(dw + 5, dh + 6, SCENE_BYTES).unwrap();
+            scene
+                .render(&source, Rect::new(2, 3, dw, dh).unwrap())
+                .unwrap();
+            let pixels = scene.pixels();
+            assert_eq!(&pixels[..3], &[38, 38, 38]);
+            for y in 0..dh {
+                for x in 0..dw {
+                    let offset = (((y + 3) * (dw + 5) + x + 2) * 4) as usize;
+                    let expected = [
+                        ((2 * x + 1) * 7 / (2 * dw)) as u8,
+                        ((2 * y + 1) * 5 / (2 * dh)) as u8,
+                        0,
+                    ];
+                    assert_eq!(
+                        &pixels[offset..offset + 3],
+                        &expected,
+                        "{dw}x{dh} at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -15,8 +15,12 @@ struct Spec {
 }
 
 pub fn offline_proxy(path: &Path) -> Result<(), String> {
-    let spec: Spec = serde_json::from_reader(File::open(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let spec_file = File::open(path).map_err(|e| e.to_string())?;
+    let info = spec_file.metadata().map_err(|e| e.to_string())?;
+    if !info.is_file() || info.len() > 65536 {
+        return Err("offline spec must be a regular JSON file <=64 KiB".into());
+    }
+    let spec: Spec = serde_json::from_reader(spec_file.take(65537)).map_err(|e| e.to_string())?;
     let bytes = pixel_bytes(spec.source_width, spec.source_height, FRAME_BYTES)?;
     pixel_bytes(spec.canvas_width, spec.canvas_height, SCENE_BYTES)?;
     let destination = Rect::new(

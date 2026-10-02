@@ -18,9 +18,10 @@ $probe = "experiments/window-handoff-probe/target/debug/window-handoff-probe.exe
 ```
 
 Own workspace/lock/target; no root workspace changes. Official windows-sys and serde
-only. All six tests are pure logic or memory-DC: no HWND or screen DC. Self-test also
-uses only logic/memory DCs. **Without --run there are no native preflight calls, window
-creation, capture, output-directory creation or desktop mutations.** No args prints help.
+only. All eight Rust tests are pure logic or memory-DC: no HWND or screen DC. Self-test also
+uses only logic/memory DCs. **Without --run there are no source-window preflight calls, window creation, capture or
+desktop mutations. The explicit --offline-proxy branch uses memory DCs and files only;
+otherwise no output directory is created.** No args prints help.
 
 ## Parent-only visual invocation (NOT executed by worker)
 
@@ -133,12 +134,14 @@ native capture start/completion QPC. Common fields: schemaVersion=1, trialId, mo
 hex HWND, relative monotonicUs, QPC/frequency, intent generation. Clock calibration
 includes Unix microseconds; use cross-process QPC for alignment, not readiness.
 
-Sampling is reported in trial/capture metadata: capture reduction and frozen proxy
-StretchBlt use the new memory DC's GDI default BLACKONWHITE, **not an explicitly selected
-nearest mode**. Whole-scene BitBlt does not resample; baseline DWM sampling is unknown.
-The fixture analyzer only supports its explicit nearest mapping and lossless pixels;
-do not label these scaled captures/proxies or lossy recordings as automatic pixel
-passes. They may be unknown; this probe does not run or consume analyzer results.
+Sampling is reported in trial/capture metadata. Both capture reduction and frozen proxy
+StretchBlt now explicitly select **COLORONCOLOR**. An unshrunk capture records **identity**.
+Identity capture followed by one proxy transform was checked against the analyzer's
+pixel-center nearest mapping using actual GDI memory-DC output (see below).
+Capture reduction followed by proxy scaling remains **composition unknown**: two nearest
+transforms are NOT treated as one affine nearest mapping. Whole-scene BitBlt does not
+resample; baseline live DWM sampling remains unknown. Lossy videos may remain unknown.
+Neither offline analyzer results nor fixture markers/state feed the native readiness path.
 
 Events cover original state, minimize, cover, capture request/complete/reject, staged
 restore, target request/observed placement, pin/proxy presentation, handoff/input unblock,
@@ -165,3 +168,76 @@ Parent review and isolated cold-C recordings for all modes, restoration, focus/i
 delayed repaint, cancel/hang/unsupported source and resource/latency observation remain.
 The probe neither proves improvement nor aggregates P50/P95/P99. Do not promote to
 product integration until the design's real-machine gate passes.
+
+## Offline single-proxy interop (P2 follow-up)
+
+No GUI/desktop evidence. This seam uses **the same Dib::render/StretchBlt function**
+as the frozen runtime proxy, not a Python substitute. It selects COLORONCOLOR in the
+destination memory DC. No HWND, PrintWindow, DPI/context changes, window identity query,
+source capture or system settings. It reads bounded raw files and writes new files.
+No image framework or BMP decoder was added to Rust.
+
+## Reproduce
+
+Build the standalone probe. Supply the approved fixture exe and analyzer paths; only the
+fixture's no-window --self-test and --render-reference branches are called:
+
+```powershell
+cargo build --manifest-path experiments/window-handoff-probe/Cargo.toml --locked --offline
+python experiments/window-handoff-probe/test_proxy_interop.py --probe experiments/window-handoff-probe/target/debug/window-handoff-probe.exe --fixture D:/project/worktrees/e-desktop/pi-worktree-969221b0-7369-4d19-baa1-0a3acaf53552-s0-0/target/handoff-fixture/handoff-fixture.exe --analyzer D:/project/worktrees/e-desktop/pi-worktree-969221b0-7369-4d19-baa1-0a3acaf53552-s0-0/scripts/analyze-handoff.py --output experiments/window-handoff-probe/target/interop-new
+```
+
+Output directory must not exist. No fixture/analyzer files are modified. Python imports
+the existing analyzer's BMP reader to load the real C# same-renderer reference, embeds
+that **unscaled** client inside a larger outer BGRA buffer, calls the Rust memory-only
+proxy entry, then invokes the existing analyzer CLI on lossless output.
+
+Test client 700x467 is inside source outer 716x506, at client offset (8,31) with
+right/bottom padding (8,8). These are explicitly constructed physical rectangles for
+offline padding proof, NOT desktop-measured bounds or real nonclient chrome pixels.
+Source origin (-900,50), client origin (-892,81); output destination origin (17,13).
+This tests the full outer-to-destination transform with client offsets, not a shortcut
+where client=outer. Live trials must substitute actual captured outer/client geometry.
+
+Identity capture (long edge <1024) plus one proxy transform:
+- 716x506 -> 716x506: 326,900 projected client pixels;
+- 716x506 -> 537x379: 183,750 pixels;
+- 716x506 -> 895x633: 511,000 pixels;
+- 716x506 -> 633x457: 261,218 pixels.
+
+Each case requires four markers AND exact comparison of **every projected client RGB
+pixel** to the real fixture reference. Three negatives per case corrupt a TL corner,
+corrupt client interior, or misrecord client padding; all must be non-pass (unknown).
+Intermediate BGRA/JSON/manifests/analysis files and results.json are kept under the
+requested ignored target directory. Rust tests also encode unique source pixel
+coordinates and check 7x5 -> 7x5/11x8/5x3/9x7 with destination padding against the
+integer pixel-center formula. No GDI/analyzer phase difference was observed in these
+cases; this is not a claim of every possible scale/driver/device or desktop delivery.
+
+## Memory-only entry
+
+`window-handoff-probe --offline-proxy SPEC.json` (cannot be combined with --run):
+
+```json
+{
+  "input": "D:/path/outer.bgra",
+  "sourceWidth": 716,
+  "sourceHeight": 506,
+  "canvasWidth": 929,
+  "canvasHeight": 659,
+  "destination": {"x": 17, "y": 13, "width": 895, "height": 633},
+  "output": "D:/path/new-output-directory"
+}
+```
+
+Input must be a regular, exact-size, tightly packed top-down BGRA file <=4 MiB;
+canvas <=64 MiB, positive destination wholly inside it. No capture reduction here:
+captureSampling=identity, proxySampling=GDI-COLORONCOLOR, transformCount=1.
+Output proxy.bgra and proxy.json describe the full canvas/destination.
+The parent/analyzer manifest must separately carry the true source outer/client
+rectangles; the memory tool never guesses client padding or consumes markers.
+
+Double reduction+proxy composition and live DWM are intentionally **unknown**.
+Offline pass covers only producer fixture-client pixels, not PrintWindow fidelity,
+nonclient chrome, DWM delivery, cold-C, client readiness, focus/input, restoration,
+native call deadlines or any product visual acceptance.

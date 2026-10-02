@@ -13,7 +13,8 @@ pub const HELP: &str = r#"window-handoff-probe (stage 0; exit 0 is NOT visual ac
     [--minimized-hold-ms 200] [--observe-ms 300]
     [--cancel-file PATH]         create file to cancel; Ctrl+C also requests cleanup
     [--fixture-only-allow-unknown-affinity]  explicitly owned fixture exception; see README
-No --run: parse only, with NO desktop side effects. One target, one trial, one capture.
+No --run: NO desktop side effects. --offline-proxy explicitly uses memory DCs/files only;
+otherwise parse only. One target, one trial, one capture.
 Hold/observe times are experiment observation, NOT readiness conditions.
 Parent MUST independently bound total process time; native APIs are not cancellable.
 "#;
@@ -399,6 +400,20 @@ mod tests {
     fn args() -> Vec<String> {
         "--pid 42 --hwnd 0x123 --tag trial-1 --role C --mode staged --output out --target -800,20,700,490"
             .split_whitespace().map(String::from).collect()
+    }
+    #[test]
+    fn offline_proxy_is_separate_from_run_and_plan() {
+        assert!(matches!(
+            parse(&["--offline-proxy".into(), "spec.json".into()]).unwrap(),
+            Action::OfflineProxy(_)
+        ));
+        for args in [
+            vec!["--offline-proxy"],
+            vec!["--offline-proxy", "spec.json", "--run"],
+            vec!["--offline-proxy", ""],
+        ] {
+            assert!(parse(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        }
     }
     #[test]
     fn parameters_and_no_run_are_strict() {
