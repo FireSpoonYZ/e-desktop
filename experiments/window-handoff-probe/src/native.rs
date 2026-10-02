@@ -1243,7 +1243,8 @@ impl Session {
             "sourceGeometry": frame.geometry, "pixelSize": {"width": frame.w, "height": frame.h},
             "strideBytes": frame.w * 4, "format": "BGRA8-top-down-opaque", "captureQpc": frame.capture_qpc,
             "completedQpc": frame.completed_qpc, "qpcFrequency": log.qpc_frequency,
-            "semanticReady": null, "pixelsFile": "capture-1.bgra"});
+            "semanticReady": null, "pixelsFile": "capture-1.bgra",
+            "sampling": "GDI-default-BLACKONWHITE-not-explicit-nearest"});
         fs::write(self.config.output.join("capture-1.bgra"), &frame.pixels)
             .map_err(|e| format!("frame output: {e}"))?;
         fs::write(
@@ -1758,7 +1759,10 @@ pub fn run(config: Config) -> Result<(), String> {
 fn write_trial(log: &Log, result: Value) -> Result<(), String> {
     let value = json!({"schemaVersion": 1, "trialId": log.trial_id, "mode": log.config.mode,
         "pid": log.config.pid, "hwnd": format!("0x{:x}", log.config.hwnd), "parameters": log.config,
-        "durationUs": log.start.elapsed().as_micros(), "clockCalibration": {
+        "durationUs": log.start.elapsed().as_micros(),
+        "sampling": {"captureReduction": "GDI-default-BLACKONWHITE-not-explicit-nearest",
+            "frozenProxy": "GDI-default-BLACKONWHITE-not-explicit-nearest", "liveBaseline": "DWM-managed-unknown",
+            "sceneCommit": "BitBlt-no-resampling"}, "clockCalibration": {
             "qpcStart": log.qpc_start, "qpcFrequency": log.qpc_frequency, "unixStartUs": log.unix_start_us},
         "result": result});
     fs::write(

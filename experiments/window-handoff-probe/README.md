@@ -133,6 +133,13 @@ native capture start/completion QPC. Common fields: schemaVersion=1, trialId, mo
 hex HWND, relative monotonicUs, QPC/frequency, intent generation. Clock calibration
 includes Unix microseconds; use cross-process QPC for alignment, not readiness.
 
+Sampling is reported in trial/capture metadata: capture reduction and frozen proxy
+StretchBlt use the new memory DC's GDI default BLACKONWHITE, **not an explicitly selected
+nearest mode**. Whole-scene BitBlt does not resample; baseline DWM sampling is unknown.
+The fixture analyzer only supports its explicit nearest mapping and lossless pixels;
+do not label these scaled captures/proxies or lossy recordings as automatic pixel
+passes. They may be unknown; this probe does not run or consume analyzer results.
+
 Events cover original state, minimize, cover, capture request/complete/reject, staged
 restore, target request/observed placement, pin/proxy presentation, handoff/input unblock,
 observation, degradation/cancel, restore and finish. Trial reports capture wait,
