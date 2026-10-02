@@ -1,7 +1,9 @@
-//! DWM resources only: never save, move, restore, or activate a source window.
+//! Live DWM thumbnails and click-through static fallback surfaces. Never mutate a source.
+use super::snapshot::{Dib, Frame, Identity, bitmap_info};
 use super::*;
 pub use crate::preview::{PreviewSlot, PreviewState, PreviewStatus};
 use std::collections::HashSet;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 pub(super) struct Thumbnail {
     pub(super) handle: isize,
@@ -21,6 +23,172 @@ impl Drop for Thumbnail {
 pub(super) struct Previews {
     destination: Option<Entry>,
     thumbnails: HashMap<String, Thumbnail>,
+    snapshots: HashMap<String, SnapshotOverlay>,
+}
+
+const OVERLAY_BYTES: usize = 32 * 1024 * 1024;
+const SURFACE_BYTES: usize = 4 * 1024 * 1024;
+
+/// UpdateLayeredWindow copies the pixels; only the HWND (controller-thread owned) persists.
+struct SnapshotOverlay {
+    hwnd: usize,
+    bytes: usize,
+}
+unsafe extern "system" fn snapshot_proc(h: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match message {
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        _ => unsafe { DefWindowProcW(h, message, w, l) },
+    }
+}
+fn overlay_bytes(dest: RECT) -> Option<usize> {
+    let width = usize::try_from(i64::from(dest.right) - i64::from(dest.left)).ok()?;
+    let height = usize::try_from(i64::from(dest.bottom) - i64::from(dest.top)).ok()?;
+    let bytes = width.checked_mul(height)?.checked_mul(4)?;
+    (bytes > 0 && bytes <= SURFACE_BYTES).then_some(bytes)
+}
+impl SnapshotOverlay {
+    fn new(owner: HWND) -> Result<Self, String> {
+        let class = wide("e-desktop-static-preview");
+        let instance = unsafe { GetModuleHandleW(null()) };
+        let registered = WNDCLASSW {
+            lpfnWndProc: Some(snapshot_proc),
+            hInstance: instance,
+            lpszClassName: class.as_ptr(),
+            ..unsafe { zeroed() }
+        };
+        unsafe {
+            RegisterClassW(&registered);
+        }
+        let h = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                class.as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                owner,
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        if h.is_null() {
+            return Err("CreateWindowExW static preview failed".into());
+        }
+        Ok(Self {
+            hwnd: h as usize,
+            bytes: 0,
+        })
+    }
+
+    fn paint(
+        &mut self,
+        owner: HWND,
+        frame: &Frame,
+        dest: RECT,
+        src: RECT,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let size = SIZE {
+            cx: dest.right - dest.left,
+            cy: dest.bottom - dest.top,
+        };
+        let mut dib =
+            Dib::new(size, SURFACE_BYTES).ok_or("Static preview bitmap allocation failed")?;
+        let copied = unsafe {
+            SetStretchBltMode(dib.dc, HALFTONE);
+            SetBrushOrgEx(dib.dc, 0, 0, null_mut());
+            StretchDIBits(
+                dib.dc,
+                0,
+                0,
+                size.cx,
+                size.cy,
+                src.left,
+                src.top,
+                src.right - src.left,
+                src.bottom - src.top,
+                frame.pixels.as_ptr().cast(),
+                &bitmap_info(frame.size),
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            )
+        };
+        if copied == 0 || copied == GDI_ERROR as i32 {
+            return Err("StretchDIBits static preview failed".into());
+        }
+        unsafe {
+            GdiFlush();
+        }
+        for pixel in dib.pixels().chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        let mut point = POINT {
+            x: dest.left,
+            y: dest.top,
+        };
+        if unsafe { ClientToScreen(owner, &mut point) } == 0 {
+            return Err("ClientToScreen static preview failed".into());
+        }
+        let origin = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let h = self.hwnd as HWND;
+        if unsafe {
+            UpdateLayeredWindow(
+                h,
+                null_mut(),
+                &point,
+                &size,
+                dib.dc,
+                &origin,
+                0,
+                &blend,
+                ULW_ALPHA,
+            )
+        } == 0
+        {
+            return Err("UpdateLayeredWindow static preview failed".into());
+        }
+        // Owned, not globally topmost: stays above the overview, never activates/grabs input.
+        if unsafe {
+            SetWindowPos(
+                h,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        } == 0
+        {
+            return Err("SetWindowPos static preview failed".into());
+        }
+        self.bytes = bytes;
+        let mut message: MSG = unsafe { zeroed() };
+        while unsafe { PeekMessageW(&mut message, h, 0, 0, PM_REMOVE) } != 0 {
+            unsafe {
+                DispatchMessageW(&message);
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for SnapshotOverlay {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyWindow(self.hwnd as HWND);
+        }
+    }
 }
 
 fn dwm_result(hr: i32, operation: &str) -> Result<(), String> {
@@ -75,6 +243,7 @@ impl Backend {
     /// Also called by restore/drop, and when enumeration observes a dead destination.
     pub fn clear_previews(&mut self) {
         self.previews.thumbnails.clear();
+        self.previews.snapshots.clear();
         if let Some(destination) = self.previews.destination.take() {
             if self.alive(&destination) {
                 unsafe { RemovePropW(destination.hwnd as HWND, self.property.as_ptr()) };
@@ -83,6 +252,7 @@ impl Backend {
     }
 
     pub(super) fn prune_previews(&mut self) {
+        self.poll_snapshots();
         if self
             .previews
             .destination
@@ -96,11 +266,13 @@ impl Backend {
             .previews
             .thumbnails
             .keys()
+            .chain(self.previews.snapshots.keys())
             .filter(|id| self.entry(id).is_err())
             .cloned()
             .collect();
         for id in stale {
             self.previews.thumbnails.remove(&id);
+            self.previews.snapshots.remove(&id);
         }
     }
 
@@ -185,6 +357,9 @@ impl Backend {
         self.previews
             .thumbnails
             .retain(|id, _| requested.contains(id.as_str()));
+        self.previews
+            .snapshots
+            .retain(|id, _| requested.contains(id.as_str()));
         let mut client: RECT = unsafe { zeroed() };
         if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
             self.clear_previews();
@@ -194,11 +369,14 @@ impl Backend {
             .iter()
             .map(|slot| {
                 let (state, message) = match self.update_preview(hwnd, slot, client) {
-                    Ok(state) => (state, String::new()),
+                    Ok(state) => (state, if self.previews.snapshots.contains_key(&slot.window_id) {
+                        "Static snapshot from before hiding; content does not update while minimized".into()
+                    } else { String::new() }),
                     Err((state, message)) => (state, message),
                 };
                 if state != PreviewState::Ready {
                     self.previews.thumbnails.remove(&slot.window_id);
+                    self.previews.snapshots.remove(&slot.window_id);
                 }
                 PreviewStatus {
                     window_id: slot.window_id.clone(),
@@ -229,16 +407,6 @@ impl Backend {
                 size_of::<u32>() as u32,
             )
         };
-        if hr < 0
-            || cloaked != 0
-            || unsafe { IsIconic(source) != 0 || IsWindowVisible(source) == 0 }
-        {
-            return Err((
-                PreviewState::Unavailable,
-                "Source is minimized, hidden, or unavailable; live content cannot be guaranteed"
-                    .into(),
-            ));
-        }
         if slot.rect.width == 0
             || slot.rect.height == 0
             || slot.clip.width == 0
@@ -252,6 +420,53 @@ impl Backend {
             return Ok(PreviewState::Hidden);
         };
         let failed = |message| (PreviewState::Failed, message);
+        if hr < 0
+            || cloaked != 0
+            || unsafe { IsIconic(source) != 0 || IsWindowVisible(source) == 0 }
+        {
+            self.previews.thumbnails.remove(&slot.window_id);
+            let key = Identity::of(
+                self.entry(&slot.window_id)
+                    .map_err(|e| (PreviewState::SourceGone, e.message))?,
+            );
+            let frame = self.snapshots.get(key).ok_or_else(|| {
+                (
+                    PreviewState::Unavailable,
+                    "Source has no completed pre-hide snapshot; minimized content is not captured"
+                        .into(),
+                )
+            })?;
+            let Some((dest, src)) = geometry(frame.size, target, clip) else {
+                return Ok(PreviewState::Hidden);
+            };
+            let used = self
+                .previews
+                .snapshots
+                .iter()
+                .filter(|(id, _)| *id != &slot.window_id)
+                .map(|(_, s)| s.bytes)
+                .sum::<usize>();
+            let bytes = overlay_bytes(dest)
+                .filter(|n| used + n <= OVERLAY_BYTES)
+                .ok_or_else(|| failed("Static preview surface exceeds memory budget".into()))?;
+            if !self.previews.snapshots.contains_key(&slot.window_id) {
+                self.previews.snapshots.insert(
+                    slot.window_id.clone(),
+                    SnapshotOverlay::new(destination).map_err(failed)?,
+                );
+            }
+            self.previews
+                .snapshots
+                .get_mut(&slot.window_id)
+                .unwrap()
+                .paint(destination, frame, dest, src, bytes)
+                .map_err(failed)?;
+            self.entry(&slot.window_id)
+                .map_err(|e| (PreviewState::SourceGone, e.message))?;
+            return Ok(PreviewState::Ready);
+        }
+        // Foreground/visible windows keep the original live DWM path.
+        self.previews.snapshots.remove(&slot.window_id);
         if !self.previews.thumbnails.contains_key(&slot.window_id) {
             let mut handle = 0;
             dwm_result(
@@ -396,6 +611,56 @@ mod tests {
                 huge
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn static_surface_budget_uses_clipped_geometry_and_checks_overflow() {
+        let target = RECT {
+            left: -100,
+            top: 20,
+            right: 300,
+            bottom: 220,
+        };
+        let clip = RECT {
+            left: 0,
+            top: 50,
+            right: 200,
+            bottom: 200,
+        };
+        let (dest, source) = geometry(SIZE { cx: 1024, cy: 512 }, target, clip).unwrap();
+        assert_eq!(rect(dest), rect(clip));
+        assert_eq!(
+            (source.left, source.top, source.right, source.bottom),
+            (256, 76, 768, 461)
+        );
+        assert_eq!(overlay_bytes(dest), Some(200 * 150 * 4));
+        assert!(
+            overlay_bytes(RECT {
+                left: i32::MIN,
+                top: i32::MIN,
+                right: i32::MAX,
+                bottom: i32::MAX
+            })
+            .is_none()
+        );
+        assert!(
+            overlay_bytes(RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 10
+            })
+            .is_none()
+        );
+        assert!(
+            overlay_bytes(RECT {
+                left: 0,
+                top: 0,
+                right: 1025,
+                bottom: 1024
+            })
+            .is_none()
         );
     }
 

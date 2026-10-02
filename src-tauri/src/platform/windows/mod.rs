@@ -2,6 +2,7 @@
 mod compositor;
 pub mod hook;
 pub mod preview;
+mod snapshot;
 pub mod splitter;
 use crate::model::*;
 use std::{
@@ -81,6 +82,7 @@ struct Entry {
 pub struct Backend {
     compositor: compositor::Compositor,
     previews: preview::Previews,
+    snapshots: snapshot::Snapshots,
     entries: HashMap<String, Entry>,
     property: Vec<u16>,
     next: usize,
@@ -341,6 +343,7 @@ impl Backend {
         Ok(Self {
             compositor: compositor::Compositor::default(),
             previews: preview::Previews::default(),
+            snapshots: snapshot::Snapshots::default(),
             entries: HashMap::new(),
             property: wide(&format!(
                 "e-desktop.{}.{}",
@@ -384,7 +387,7 @@ impl Backend {
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
             capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, focus_follows_pointer: true, ..Capabilities::default() },
-            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. Rectangles are visible DWM frames. Focus border color and corner preference apply on Windows 11. DWM live overview previews for visible sources; low-level mouse hook for pointer focus, modifier drags and hot corners.".into() }
+            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. Rectangles are visible DWM frames. Focus border color and corner preference apply on Windows 11. DWM live overview previews for visible sources, best-effort last pre-hide snapshots for minimized sources; low-level mouse hook for pointer focus, modifier drags and hot corners.".into() }
     }
     /// Top-level windows the pointer hook may grab.
     pub fn pointer_targets(&self) -> HashSet<usize> {
@@ -714,6 +717,7 @@ impl Backend {
                 result.focused_window = Some(id);
             }
         }
+        self.warm_snapshots();
         Ok(result)
     }
     fn entry(&self, id: &str) -> Result<&Entry, AppError> {
@@ -935,6 +939,7 @@ impl Backend {
             .unwrap_or_default();
         if minimized || matches!(clipping, Some(None)) {
             if unsafe { IsIconic(h) } == 0 {
+                self.snapshot_before_hide(id);
                 self.show(h, SW_SHOWMINNOACTIVE, true, id)?;
                 self.entries.get_mut(id).unwrap().minimized = true;
             }
@@ -944,6 +949,9 @@ impl Backend {
         // Mask BEFORE moving/restoring with the part visible both before and after the move,
         // so a GDI window never paints outside either clip (an empty mask would blink it).
         if let Some(Some(c)) = clipping.filter(|_| region_clipping) {
+            if !same_rect(c, r) {
+                self.snapshot_before_hide(id);
+            }
             let next = local_clip(c, outset(r, pad))?;
             let now = self.entries[id].region_box.or_else(|| {
                 let o = outer_frame(h)?;
