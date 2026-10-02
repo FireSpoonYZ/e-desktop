@@ -92,3 +92,13 @@ python experiments/window-handoff-probe/test_proxy_interop.py --probe experiment
 这几轮均因检查拒绝而失败，不是视觉通过。`pilot-06` 至 `pilot-09` 的窗口还原、测试桌面关闭、原桌面恢复与所有自建进程退出均核验成功；没有关闭 NVIDIA 或 NapCatQQ。
 
 已恢复原 probe worker 修复这段有界恢复等待：许可只限本 controller 发起的恢复范围，仍保留身份、保护、实际工作区/DPI、遮罩及可见遮挡检查；源真正映射到其它屏幕或离开遮罩仍拒绝。成功/错误/取消/超时后不得遗留许可；恢复完成后必须重新严格校验。修复尚未交付或实机复验。
+
+## 首次完成单次 baseline 闭环
+
+`daa2a42` 合入恢复范围内的未映射状态处理，父级重新通过 9 项 Rust 测试及严格 Clippy。`handoff-single-10` 改用 release 构建；其性能数据不与此前 debug 构建直接作因果比较。
+
+本轮只执行 baseline / delay 0 一次，完成最小化、cover、目标落位、动画交接与还原，exit 0 / completed-unverified，无降级。target apply→handoff 为 232.037 ms（预算 250 ms）；target placed 为请求后约 54.876 ms。源窗口通过父级独立原生几何/可见性/最小化状态前后比较，测试桌面关闭、原桌面恢复、所有自建进程退出均通过。
+
+证据：`target/recordings/handoff-single-10/report.json` 及 `r0-baseline-d0/probe/events.jsonl`。录像为 FFV1/bgr0 1600×2080，共 37 帧，实际 PTS 间隔 33/34 ms。`video-summary.json` 记录提交时序附近的采样索引；这是时间对应候选，不是 DWM presentation acknowledgement。父级检查了五帧缩略图和第 18 帧客户区局部图：可见网格填充及四角标记，尚未完成逐帧全分辨率分析，也未与冻结路径对照。
+
+因此本轮只证明 baseline 程序闭环完成；visualPass 仍为 null。没有把零延迟这一帧组认定为复现原缺陷或冷恢复方案改善。下一步是单次 prehide/staged 路径，再进行迟绘对照。
