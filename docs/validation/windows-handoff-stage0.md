@@ -76,3 +76,19 @@ python experiments/window-handoff-probe/test_proxy_interop.py --probe experiment
 官方 `DWMWINDOWATTRIBUTE` 文档将 `DWMWA_TRANSITIONS_FORCEDISABLED` 列为供 setter 使用，不能用失败的 getter 猜测原值。修复 `3c758f4` 删除 probe 的该属性读取、设置及恢复，明确记录 unchanged-by-probe / originalQueried=false；`27dd108` 由 fixture 在自己的 OnHandleCreated 中明确设置初始禁用过渡策略并检查 HRESULT。全部模式初始条件相同，这仍不是正式程序时序等价证明。父级审查、重建、8 项 Rust 测试及 fixture 离屏自检通过，新的 GUI 路径尚未复验。官方摘录：`target/handoff-recovery/dwm-transition-contract.txt`。
 
 录像预检 `pilot-04/r0-baseline-d0/screen.mkv` 为 FFV1 / bgr0、1600×2080，实际 11 帧，PTS 间隔为 33/34 ms，保留 wall-clock PTS。它仅录到正常窗口和拒绝过程，没有冷恢复动画。父级检查了第 5 帧的窗口局部图。四角均为 G1 / 698×444 / C；完整客户区比较仍为 unknown：309912 个像素中 62 个不匹配，均在底部两角最后 10 行，与图中圆角裁剪位置一致。没有把四角一致或其余像素匹配当作完整画面通过，原始差异保存在 `pixel-mismatch-detail.json`。
+
+## 遮罩与恢复中间状态的实机证据
+
+`pilot-05` 在 Shell 的 `VirtualDesktopHotkeySwitcher` 仍显示时中止。父级增加只等待该实际窗口消失的有界检查；不是给客户重绘增加固定等待。该轮原桌面恢复、进程退出通过，测试桌面留开。
+
+`pilot-06/07` 执行到最小化与遮罩检查，但未完成目标恢复。父级增量 `bf9cfb8` 记录具体遮挡者；`pilot-07` 显示被拦对象为 Explorer 的 `ThumbnailDeviceHelperWnd`，1×1 像素，DWM_CLOAKED 查询成功且值为 1。`7714f38` 因而仅排除 DWM 明确确认 cloaked 的窗口；查询失败及真正可见窗口仍按原规则检查。
+
+`pilot-08/09` 随后执行到 cover_presented 与 target_apply_requested。`d63713b` 增加 monitor/DPI/outer 的失败现场字段。`pilot-09` 捕捉到：
+
+- IsIconic=false；outer=(-32000,-32000,237,39)；MonitorFromWindow 返回 0。
+- 当前 DPI 与预期均为 144，当前 workarea 与预期均为 (0,0,3840,2088)。
+- 该状态发生在 controller 已发出恢复请求、实际位置尚未落位时。不能将此记录写成真实的 DPI 或工作区改变。
+
+这几轮均因检查拒绝而失败，不是视觉通过。`pilot-06` 至 `pilot-09` 的窗口还原、测试桌面关闭、原桌面恢复与所有自建进程退出均核验成功；没有关闭 NVIDIA 或 NapCatQQ。
+
+已恢复原 probe worker 修复这段有界恢复等待：许可只限本 controller 发起的恢复范围，仍保留身份、保护、实际工作区/DPI、遮罩及可见遮挡检查；源真正映射到其它屏幕或离开遮罩仍拒绝。成功/错误/取消/超时后不得遗留许可；恢复完成后必须重新严格校验。修复尚未交付或实机复验。
