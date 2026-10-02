@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -33,6 +33,96 @@ const BAR_HEIGHT: f64 = 36.0;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 type Reply = mpsc::SyncSender<Result<Snapshot, AppError>>;
 
+// Set E_DESKTOP_TRACE_IPC=1 before startup; cached on the first traced request.
+// No window titles/payloads or animation-frame logging. Disabled traces do no log I/O/formatting.
+struct IpcDiagnostics {
+    started: Instant,
+    sequence: AtomicU64,
+}
+
+fn ipc_trace_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[derive(Clone, Copy)]
+struct IpcTrace {
+    diagnostics: Option<&'static IpcDiagnostics>,
+    id: u64,
+    operation: &'static str,
+}
+
+impl IpcTrace {
+    const NONE: Self = Self {
+        diagnostics: None,
+        id: 0,
+        operation: "",
+    };
+
+    fn begin(operation: &'static str) -> Self {
+        static DIAGNOSTICS: OnceLock<Option<IpcDiagnostics>> = OnceLock::new();
+        let diagnostics = DIAGNOSTICS.get_or_init(|| {
+            ipc_trace_enabled(std::env::var_os("E_DESKTOP_TRACE_IPC").as_deref()).then(|| {
+                IpcDiagnostics {
+                    started: Instant::now(),
+                    sequence: AtomicU64::new(1),
+                }
+            })
+        });
+        Self::with_diagnostics(operation, diagnostics.as_ref())
+    }
+
+    fn with_diagnostics(
+        operation: &'static str,
+        diagnostics: Option<&'static IpcDiagnostics>,
+    ) -> Self {
+        match diagnostics {
+            Some(diagnostics) => Self {
+                diagnostics: Some(diagnostics),
+                id: diagnostics.sequence.fetch_add(1, Ordering::Relaxed),
+                operation,
+            },
+            None => Self::NONE,
+        }
+    }
+
+    fn write(self, stage: &str, output: &mut impl std::io::Write) {
+        if let Some(diagnostics) = self.diagnostics {
+            // Ignore logging failures: a closed stderr must not change command results.
+            let _ = writeln!(
+                output,
+                "[ipc-trace] us={} thread={:?} request={} op={} stage={}",
+                diagnostics.started.elapsed().as_micros(),
+                std::thread::current().id(),
+                self.id,
+                self.operation,
+                stage
+            );
+        }
+    }
+
+    fn mark(self, stage: &str) {
+        if self.diagnostics.is_some() {
+            self.write(stage, &mut std::io::stderr().lock());
+        }
+    }
+
+    fn scope(self, enter: &'static str, exit: &'static str) -> IpcTraceScope {
+        self.mark(enter);
+        IpcTraceScope { trace: self, exit }
+    }
+}
+
+// "exit" means the scope returned (including errors), not that native work succeeded.
+struct IpcTraceScope {
+    trace: IpcTrace,
+    exit: &'static str,
+}
+impl Drop for IpcTraceScope {
+    fn drop(&mut self) {
+        self.trace.mark(self.exit);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Surface {
     Overview,
@@ -55,13 +145,14 @@ impl Surface {
 }
 
 enum Request {
-    Command(Command, Option<Reply>),
+    Command(Command, Option<Reply>, IpcTrace),
     Show(Surface, Option<String>),
-    Dismiss(Surface),
+    Dismiss(Surface, IpcTrace),
     Previews(
         u64,
         Vec<PreviewSlot>,
         mpsc::SyncSender<Result<Vec<PreviewStatus>, AppError>>,
+        IpcTrace,
     ),
     Shortcut(String),
     PinBar(String, bool),
@@ -99,6 +190,9 @@ fn send(state: &AppState, request: Request) -> Result<(), AppError> {
 
 #[tauri::command]
 fn get_snapshot(state: tauri::State<'_, AppState>) -> Snapshot {
+    let trace = IpcTrace::begin("get_snapshot");
+    let _ipc = trace.scope("ipc.enter", "ipc.exit");
+    let _read = trace.scope("snapshot.read.enter", "snapshot.read.exit");
     state
         .snapshot
         .lock()
@@ -111,10 +205,19 @@ async fn execute(
     command: Command,
     state: tauri::State<'_, AppState>,
 ) -> Result<Snapshot, AppError> {
+    let trace = IpcTrace::begin(if matches!(command, Command::DropWindow { .. }) {
+        "execute.dropWindow"
+    } else {
+        "execute"
+    });
+    let _ipc = trace.scope("ipc.enter", "ipc.exit");
     let (tx, rx) = mpsc::sync_channel(1);
-    send(&state, Request::Command(command, Some(tx)))?;
+    trace.mark("enqueue.enter");
+    send(&state, Request::Command(command, Some(tx), trace))?;
+    trace.mark("enqueue.accepted");
     // Native calls stay on one dedicated thread, including non-Send AX objects.
     tauri::async_runtime::spawn_blocking(move || {
+        let _wait = trace.scope("reply.wait.enter", "reply.wait.exit");
         rx.recv()
             .map_err(|_| error(ErrorCode::BackendUnavailable, "窗口控制器已停止。"))?
     })
@@ -133,7 +236,12 @@ fn open_surface(
 
 #[tauri::command]
 fn dismiss_surface(surface: String, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
-    send(&state, Request::Dismiss(Surface::parse(&surface)?))
+    let trace = IpcTrace::begin("dismiss_surface");
+    let _ipc = trace.scope("ipc.enter", "ipc.exit");
+    trace.mark("enqueue.enter");
+    send(&state, Request::Dismiss(Surface::parse(&surface)?, trace))?;
+    trace.mark("enqueue.accepted");
+    Ok(())
 }
 
 #[tauri::command]
@@ -143,6 +251,8 @@ async fn sync_previews(
     slots: Vec<PreviewSlot>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PreviewStatus>, AppError> {
+    let trace = IpcTrace::begin("sync_previews");
+    let _ipc = trace.scope("ipc.enter", "ipc.exit");
     if window.label() != "overview" {
         return Err(error(
             ErrorCode::InvalidCommand,
@@ -150,8 +260,11 @@ async fn sync_previews(
         ));
     }
     let (tx, rx) = mpsc::sync_channel(1);
-    send(&state, Request::Previews(session, slots, tx))?;
+    trace.mark("enqueue.enter");
+    send(&state, Request::Previews(session, slots, tx, trace))?;
+    trace.mark("enqueue.accepted");
     tauri::async_runtime::spawn_blocking(move || {
+        let _wait = trace.scope("reply.wait.enter", "reply.wait.exit");
         rx.recv()
             .map_err(|_| error(ErrorCode::BackendUnavailable, "窗口控制器已停止。"))?
     })
@@ -174,6 +287,7 @@ fn quit(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
 }
 
 struct Controller {
+    trace: IpcTrace,
     backend: Option<Backend>,
     engine: Engine,
     errors: Vec<AppError>,
@@ -215,6 +329,7 @@ struct Controller {
 impl Controller {
     fn new() -> Self {
         let mut controller = Self {
+            trace: IpcTrace::NONE,
             backend: None,
             engine: Engine::new(BackendStatus::default()),
             errors: vec![],
@@ -504,6 +619,7 @@ impl Controller {
     }
 
     fn apply(&mut self, actions: &[NativeAction]) -> Result<(), AppError> {
+        let _apply = self.trace.scope("apply.enter", "apply.exit");
         for action in actions {
             if matches!(
                 action,
@@ -655,7 +771,10 @@ impl Controller {
         let already_deferred = self.animation.deferred_focus_id().is_some();
         let observed = self.observed_foreground();
         let prev = self.engine.snapshot().clone();
-        let transition = match self.engine.dispatch(command) {
+        self.trace.mark("dispatch.enter");
+        let result = self.engine.dispatch(command);
+        self.trace.mark("dispatch.exit");
+        let transition = match result {
             Ok(transition) => transition,
             Err(issue) => {
                 self.finish_animation()?;
@@ -690,6 +809,7 @@ impl Controller {
     /// each monitor, as in niri) while the real windows move once; elsewhere, or if the
     /// overlay fails, every frame moves the real windows.
     fn present(&mut self, actions: Vec<NativeAction>, started: bool) -> Result<(), AppError> {
+        let _present = self.trace.scope("present.enter", "present.exit");
         #[cfg(target_os = "windows")]
         if self.animation.deadline().is_some() && self.backend.is_some() {
             let sprites = self.sprites();
@@ -713,7 +833,10 @@ impl Controller {
                 matches!(a, NativeAction::Placement { window_id, .. } if animated.contains(window_id))
             });
             let backend = self.backend.as_mut().unwrap();
-            match backend.compose(&sprites) {
+            self.trace.mark("compose.enter");
+            let result = backend.compose(&sprites);
+            self.trace.mark("compose.exit");
+            match result {
                 Ok(()) => {
                     // The frames on screen: a retarget continues from them.
                     for frame in frames {
@@ -804,6 +927,9 @@ impl Controller {
     }
 
     fn clear_previews(&mut self) {
+        let _clear = self
+            .trace
+            .scope("previews.clear.enter", "previews.clear.exit");
         self.preview_session.end();
         #[cfg(target_os = "windows")]
         if let Some(backend) = &mut self.backend {
@@ -839,9 +965,14 @@ impl Controller {
             let window = app
                 .get_webview_window("overview")
                 .ok_or_else(|| error(ErrorCode::BackendUnavailable, "概览窗口不存在。"))?;
+            self.trace.mark("previews.hwnd.enter");
             let hwnd = window
                 .hwnd()
                 .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?;
+            self.trace.mark("previews.hwnd.exit");
+            let _native = self
+                .trace
+                .scope("previews.native.enter", "previews.native.exit");
             self.backend
                 .as_mut()
                 .ok_or_else(|| error(ErrorCode::BackendUnavailable, "原生窗口后端尚未连接。"))?
@@ -1236,7 +1367,10 @@ impl Controller {
                             .and_then(|w| w.is_visible().ok())
                             .unwrap_or(false);
                         return Ok(Some(if open {
-                            Request::Dismiss(Surface::Overview)
+                            Request::Dismiss(
+                                Surface::Overview,
+                                IpcTrace::begin("native.dismiss_surface"),
+                            )
                         } else {
                             Request::Show(Surface::Overview, Some(monitor_id))
                         }));
@@ -1661,9 +1795,11 @@ fn run_controller(
                     continue;
                 }
                 match action.resolve(controller.engine.snapshot()) {
-                    Some(ShortcutAction::Command { command }) => {
-                        Ok(Request::Command(command, None))
-                    }
+                    Some(ShortcutAction::Command { command }) => Ok(Request::Command(
+                        command,
+                        None,
+                        IpcTrace::begin("shortcut.command"),
+                    )),
                     Some(ShortcutAction::Overview {}) => Ok(Request::Show(Surface::Overview, None)),
                     Some(ShortcutAction::Commands {}) => Ok(Request::Show(Surface::Commands, None)),
                     Some(ShortcutAction::Quit {}) => Ok(Request::Quit),
@@ -1673,7 +1809,9 @@ fn run_controller(
             request => request,
         };
         match request {
-            Ok(Request::Command(mut command, reply)) => {
+            Ok(Request::Command(mut command, reply, trace)) => {
+                let _request = trace.scope("controller.enter", "controller.exit");
+                controller.trace = trace;
                 if let Command::AddPage { monitor_id } = &mut command {
                     if monitor_id.is_empty() {
                         *monitor_id = controller
@@ -1691,12 +1829,20 @@ fn run_controller(
                 } else if shortcuts.config.warp_mouse_to_focus {
                     controller.warp_to_focus(before.as_ref());
                 }
+                trace.mark("snapshot.publish.enter");
                 let current = controller.snapshot(shortcuts.available());
                 *shared.lock().unwrap_or_else(|e| e.into_inner()) = current.clone();
                 let _ = app.emit("snapshot", &current);
+                trace.mark("snapshot.publish.exit");
                 if let Some(reply) = reply {
-                    let _ = reply.send(result.map(|_| current));
+                    trace.mark("reply.send.enter");
+                    trace.mark(if reply.send(result.map(|_| current)).is_ok() {
+                        "reply.sent"
+                    } else {
+                        "reply.disconnected"
+                    });
                 }
+                controller.trace = IpcTrace::NONE;
             }
             Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
             Ok(Request::PinBar(monitor_id, pinned)) => {
@@ -1782,16 +1928,27 @@ fn run_controller(
                     }
                 }
             }
-            Ok(Request::Previews(session, slots, reply)) => {
+            Ok(Request::Previews(session, slots, reply, trace)) => {
+                let _request = trace.scope("controller.enter", "controller.exit");
+                controller.trace = trace;
                 let result = controller.sync_previews(&app, session, &slots);
-                let _ = reply.send(result);
+                trace.mark("reply.send.enter");
+                trace.mark(if reply.send(result).is_ok() {
+                    "reply.sent"
+                } else {
+                    "reply.disconnected"
+                });
+                controller.trace = IpcTrace::NONE;
             }
-            Ok(Request::Dismiss(surface)) => {
+            Ok(Request::Dismiss(surface, trace)) => {
+                let _request = trace.scope("controller.enter", "controller.exit");
+                controller.trace = trace;
                 controller.note_surface(surface, None);
                 if matches!(surface, Surface::Overview) {
                     controller.clear_previews();
                 }
                 if let Some(window) = app.get_webview_window(surface.label()) {
+                    let _hide = trace.scope("surface.hide.enter", "surface.hide.exit");
                     let _ = window.hide();
                 }
                 let current = controller.snapshot(shortcuts.available());
@@ -1802,6 +1959,7 @@ fn run_controller(
                         }
                     }
                 }
+                controller.trace = IpcTrace::NONE;
             }
             Ok(Request::Quit) => {
                 if controller.stop().is_ok() {
@@ -1865,15 +2023,21 @@ pub fn run() {
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "overview" {
                 let _ = send(
                     &window.state::<AppState>(),
-                    Request::Dismiss(Surface::Overview),
+                    Request::Dismiss(Surface::Overview, IpcTrace::begin("native.dismiss_surface")),
                 );
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let state = window.state::<AppState>();
                 let request = match window.label() {
-                    "overview" => Request::Dismiss(Surface::Overview),
-                    "commands" => Request::Dismiss(Surface::Commands),
+                    "overview" => Request::Dismiss(
+                        Surface::Overview,
+                        IpcTrace::begin("native.dismiss_surface"),
+                    ),
+                    "commands" => Request::Dismiss(
+                        Surface::Commands,
+                        IpcTrace::begin("native.dismiss_surface"),
+                    ),
                     _ => Request::Quit,
                 };
                 let _ = send(&state, request);
@@ -1896,6 +2060,61 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::model::Monitor;
+
+    #[test]
+    fn ipc_trace_is_opt_in_correlated_and_tolerates_logging_failure() {
+        use std::ffi::OsStr;
+        assert!(ipc_trace_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("true")] {
+            assert!(!ipc_trace_enabled(value.map(OsStr::new)));
+        }
+        let mut output = Vec::new();
+        let off = IpcTrace::with_diagnostics("execute.dropWindow", None);
+        off.write("ipc.enter", &mut output);
+        assert!(output.is_empty());
+        assert_eq!(off.id, 0);
+
+        static DIAGNOSTICS: OnceLock<IpcDiagnostics> = OnceLock::new();
+        let diagnostics = DIAGNOSTICS.get_or_init(|| IpcDiagnostics {
+            started: Instant::now(),
+            sequence: AtomicU64::new(1),
+        });
+        let trace = IpcTrace::with_diagnostics("execute.dropWindow", Some(diagnostics));
+        let next = IpcTrace::with_diagnostics("get_snapshot", Some(diagnostics));
+        assert_eq!(next.id, trace.id + 1);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let state = AppState {
+            sender, snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            can_exit: AtomicBool::new(false),
+        };
+        send(&state, Request::Command(Command::Refresh, None, trace)).unwrap();
+        let Request::Command(Command::Refresh, None, received) = receiver.try_recv().unwrap() else {
+            panic!("unexpected request");
+        };
+        assert_eq!(received.id, trace.id);
+        assert_eq!(received.operation, trace.operation);
+        received.write("enqueue.accepted", &mut output);
+        trace.write("controller.enter", &mut output);
+        next.write("ipc.enter", &mut output);
+        let lines = String::from_utf8(output).unwrap();
+        let lines: Vec<_> = lines.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for (line, id) in lines.iter().zip([trace.id, trace.id, next.id]) {
+            assert!(line.starts_with("[ipc-trace] us="));
+            assert!(line.contains(" thread=ThreadId("));
+            assert!(line.contains(&format!(" request={id} ")));
+        }
+        assert!(lines[0].ends_with("op=execute.dropWindow stage=enqueue.accepted"));
+        assert!(lines[1].ends_with("op=execute.dropWindow stage=controller.enter"));
+        assert!(lines[2].ends_with("op=get_snapshot stage=ipc.enter"));
+        // std's empty slice writer returns an error; tracing must not propagate/panic.
+        trace.write("ipc.exit", &mut &mut [][..]);
+        let process_trace = IpcTrace::begin("test");
+        assert_eq!(process_trace.diagnostics.is_some(),
+            ipc_trace_enabled(std::env::var_os("E_DESKTOP_TRACE_IPC").as_deref()));
+        let scope = process_trace.scope("test.enter", "test.exit");
+        assert_eq!(scope.trace.id, process_trace.id);
+    }
 
     #[cfg(target_os = "windows")]
     #[test]
