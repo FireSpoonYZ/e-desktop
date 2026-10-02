@@ -9,6 +9,12 @@ export function useSurface(onDismiss: () => void) {
     (root.current?.querySelector<HTMLElement>('[data-initial-focus]') ?? root.current)?.focus();
     return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
   }, []);
+  // Disabling a focused busy control can blur it to body, outside this key handler.
+  useEffect(() => {
+    const dialog = root.current;
+    if (dialog?.isConnected && document.activeElement === document.body
+      && document.visibilityState === 'visible' && document.hasFocus()) dialog.focus();
+  });
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onDismiss(); }

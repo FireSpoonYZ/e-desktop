@@ -222,6 +222,66 @@ test('focus containment skips closed details inputs even when Chromium reports l
   } finally { globalThis.document = previous; }
 });
 
+test('surface restores busy-disabled control focus from body for one Escape, without stealing valid or inactive focus', () => {
+  // Actual hook effects, fake DOM: explicitly model Chromium's disabled-control blur.
+  // This is not a browser reproduction of that blur or a native foreground assertion.
+  const refs = [], effects = [];
+  let cursor = 0, mounted = false;
+  const hooks = {
+    useRef: (value) => refs[cursor++] ??= { current: value },
+    useEffect: (run, deps) => { if (!mounted || !deps) effects.push(run); },
+  };
+  const source = readFileSync(new URL('./surface.ts', import.meta.url), 'utf8');
+  const { outputText } = ts.transpileModule(source, { compilerOptions: {
+    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+  } });
+  const exports = {};
+  new Function('require', 'exports', outputText)((name) => {
+    assert.equal(name, 'react'); return hooks;
+  }, exports);
+  const previous = globalThis.document;
+  try {
+    const body = {}, card = { disabled: false }, control = {};
+    let focuses = 0, dismissed = 0, focusedDocument = true;
+    const dialog = { isConnected: true, querySelector: () => null,
+      focus() { focuses++; document.activeElement = this; } };
+    globalThis.document = { body, activeElement: body, visibilityState: 'visible',
+      hasFocus: () => focusedDocument };
+    const render = () => {
+      cursor = 0; effects.length = 0;
+      const surface = exports.useSurface(() => { dismissed++; });
+      surface.root.current = dialog;
+      effects.forEach((run) => run()); mounted = true;
+      return surface;
+    };
+    render();
+    document.activeElement = card;
+    card.disabled = true;
+    document.activeElement = body; // Browser disabled-blur state is simulated, not observed.
+    const before = focuses, surface = render();
+    assert.equal(document.activeElement, dialog);
+    assert.equal(focuses, before + 1);
+    surface.onKeyDown({ key: 'Escape', nativeEvent: {}, preventDefault() {}, stopPropagation() {} });
+    assert.equal(dismissed, 1);
+
+    for (const activeElement of [control, { external: true }]) {
+      document.activeElement = activeElement;
+      render();
+      assert.equal(document.activeElement, activeElement);
+      assert.equal(focuses, before + 1);
+    }
+    for (const inactive of ['hidden', 'alt-tab', 'detached']) {
+      document.activeElement = body;
+      document.visibilityState = inactive === 'hidden' ? 'hidden' : 'visible';
+      focusedDocument = inactive !== 'alt-tab';
+      dialog.isConnected = inactive !== 'detached';
+      render();
+      assert.equal(document.activeElement, body);
+      assert.equal(focuses, before + 1);
+    }
+  } finally { globalThis.document = previous; }
+});
+
 test('empty surfaces do not fabricate native windows and expose accessible search', () => {
   const props = { snapshot: emptySnapshot, onCommand() {}, onDismiss() {} };
   assert.match(renderToStaticMarkup(createElement(Overview, props)), /尚未发现可用显示器/);

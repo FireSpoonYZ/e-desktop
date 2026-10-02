@@ -658,6 +658,13 @@ impl Controller {
     fn apply(&mut self, actions: &[NativeAction]) -> Result<(), AppError> {
         let _apply = self.trace.scope("apply.enter", "apply.exit");
         for action in actions {
+            // Keep keyboard input on the open surface; Engine focus still updates.
+            // Dismiss clears its host before reissuing FocusWindow for the handoff.
+            if matches!(action, NativeAction::Focus { .. })
+                && (self.overview_host.is_some() || self.commands_host.is_some())
+            {
+                continue;
+            }
             if matches!(
                 action,
                 NativeAction::Placement { window_id, .. } | NativeAction::Focus { window_id }
@@ -2106,6 +2113,117 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::model::Monitor;
+
+    #[test]
+    fn open_surfaces_hold_native_focus_through_drop_resize_and_dismiss_handoff() {
+        use crate::model::{Capabilities, NativeWindow, SystemSnapshot};
+        let area = Rect { x: 0, y: 0, width: 1000, height: 800 };
+        let mut engine = Engine::new(BackendStatus {
+            availability: BackendAvailability::Ready,
+            capabilities: Capabilities {
+                enumerate: true, placement: true, focus: true, minimize: true, clipping: true,
+                ..Capabilities::default()
+            },
+            ..BackendStatus::default()
+        });
+        engine.reconcile(SystemSnapshot {
+            monitors: vec![Monitor {
+                id: "m".into(), name: String::new(), bounds: area, work_area: area,
+                scale_factor: 1.0, primary: true,
+            }],
+            windows: ["source", "target"].into_iter().map(|id| NativeWindow {
+                id: id.into(), title: String::new(), app_name: String::new(),
+                process_id: 1, monitor_id: "m".into(), rect: area,
+                minimized: false, minimized_by_manager: false, resizable: true,
+            }).collect(),
+            focused_window: Some("source".into()),
+        }).unwrap();
+        engine.dispatch(Command::Enable).unwrap();
+        let mut actions = vec![];
+        for id in ["source", "target"] {
+            actions = engine.dispatch(Command::SetWindowColumnWidth {
+                window_id: id.into(), width: 500,
+            }).unwrap().actions;
+        }
+        // No real Backend is created: any unfiltered native action reports unavailable.
+        let mut controller = Controller {
+            trace: IpcTrace::NONE, backend: None, engine, errors: vec![],
+            config_error: None, window_rules: vec![], placements: Placements::new(),
+            refused: Placements::new(), animation: Animation::default(),
+            animation_duration: Duration::from_millis(160),
+            preview_session: PreviewSession::default(), gesture: None, window_drag: false,
+            hovered: None, in_corner: false, top_bar: true, native_drag: None,
+            native_move: None, ignored_foreground: None, refresh_soon: None,
+            autohide: false, pinned: BTreeSet::new(), revealed: BTreeSet::new(),
+            overview_host: None, commands_host: None,
+        };
+        controller.note_surface(Surface::Overview, Some("m".into()));
+        let before = controller.engine.snapshot().clone();
+        let page_id = before.monitors[0].active_page.clone();
+        let drop = controller.engine.dispatch(Command::DropWindow {
+            window_id: "source".into(), x: 750, y: 600,
+            page_id: Some(page_id), viewport_x: Some(0),
+        }).unwrap();
+        assert_eq!(drop.snapshot.focused_window.as_deref(), Some("source"));
+        assert!(drop.snapshot.monitors[0].pages[0].columns[0].windows.contains(&"target".into()));
+        let focus: Vec<_> = drop.actions.iter()
+            .filter(|action| matches!(action, NativeAction::Focus { .. })).cloned().collect();
+        assert_eq!(focus, vec![NativeAction::Focus { window_id: "source".into() }]);
+        controller.apply(&focus).unwrap();
+
+        // A focus emitted by a later animation frame uses the same apply gate.
+        let mut applied = Placements::new();
+        for action in actions {
+            if let NativeAction::Placement { window_id, rect, clip, minimized } = action {
+                applied.insert(window_id, (rect, clip, minimized));
+            }
+        }
+        applied.get_mut("source").unwrap().0.x = 1100;
+        let now = Instant::now();
+        controller.animation.start(&before, &drop.snapshot, &applied, drop.actions,
+            controller.animation_duration, now);
+        assert_eq!(controller.animation.deferred_focus_id(), Some("source"));
+        let final_focus: Vec<_> = controller.animation.frame(now + controller.animation_duration)
+            .into_iter().filter(|action| matches!(action, NativeAction::Focus { .. })).collect();
+        assert_eq!(final_focus, focus);
+        controller.apply(&final_focus).unwrap();
+
+        for command in [
+            Command::SetWindowColumnWidth { window_id: "target".into(), width: 650 },
+            Command::SetColumnWidth { width: 700 },
+        ] {
+            let resized = controller.engine.dispatch(command).unwrap();
+            assert_eq!(resized.snapshot.focused_window.as_deref(), Some("source"));
+            assert!(!resized.actions.iter().any(|action| matches!(action, NativeAction::Focus { .. })));
+        }
+        let enter = controller.engine.dispatch(Command::FocusWindow {
+            window_id: "target".into(),
+        }).unwrap();
+        let focus: Vec<_> = enter.actions.into_iter()
+            .filter(|action| matches!(action, NativeAction::Focus { .. })).collect();
+        assert_eq!(controller.engine.snapshot().focused_window.as_deref(), Some("target"));
+        controller.apply(&focus).unwrap(); // Card selection changes logical focus first.
+        controller.note_surface(Surface::Overview, None);
+        let handoff = controller.engine.dispatch(Command::FocusWindow {
+            window_id: controller.engine.snapshot().focused_window.clone().unwrap(),
+        }).unwrap();
+        let focus: Vec<_> = handoff.actions.into_iter()
+            .filter(|action| matches!(action, NativeAction::Focus { .. })).collect();
+        assert_eq!(focus, vec![NativeAction::Focus { window_id: "target".into() }]);
+        assert_eq!(controller.apply(&focus).unwrap_err().code, ErrorCode::BackendUnavailable);
+
+        controller.note_surface(Surface::Commands, Some("m".into()));
+        controller.apply(&focus).unwrap();
+        controller.note_surface(Surface::Overview, None); // Another surface still owns input.
+        controller.apply(&focus).unwrap();
+        controller.note_surface(Surface::Commands, None);
+        assert_eq!(controller.apply(&focus).unwrap_err().code, ErrorCode::BackendUnavailable);
+        // Placement is never suppressed by the surface focus gate.
+        controller.note_surface(Surface::Overview, Some("m".into()));
+        assert_eq!(controller.apply(&[NativeAction::Placement {
+            window_id: "target".into(), rect: area, clip: None, minimized: false,
+        }]).unwrap_err().code, ErrorCode::BackendUnavailable);
+    }
 
     #[test]
     fn ipc_trace_is_opt_in_correlated_and_tolerates_logging_failure() {
