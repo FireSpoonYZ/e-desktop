@@ -78,8 +78,8 @@ pub struct Engine {
     // lane: rules-spawn-screenshot
     /// Window rule size limits, kept for the window's lifetime.
     size_limits: BTreeMap<WindowId, rules::SizeLimits>,
-    /// Window rule `openFocused` of windows discovered by the running reconcile.
-    open_focus: BTreeMap<WindowId, bool>,
+    /// Window rule `openFocused` of new windows not settled yet (`rules::apply_open_focus`).
+    open_focus: BTreeMap<WindowId, rules::OpenFocus>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -462,7 +462,10 @@ impl Engine {
             return Ok(self.transition(vec![]));
         }
         // lane: rules-spawn-screenshot
-        let refocus = next.apply_open_focus(self.snapshot.focused_window.as_deref());
+        let refocus = next.apply_open_focus(
+            self.snapshot.focused_window.as_deref(),
+            native_focus.as_deref(),
+        );
         let mut actions = next.placements()?;
         if let Some(id) = next.snapshot.focused_window.as_ref().filter(|_| {
             next.snapshot.enabled
@@ -660,7 +663,7 @@ impl Engine {
                     // lane: rules-spawn-screenshot. A window opening unfocused does not move the
                     // view; apply_open_focus hands focus back or reveals it.
                     let reveal = (viewport_changed || previous.as_ref() != Some(&id))
-                        && self.open_focus.get(&id) != Some(&false);
+                        && self.open_focus.get(&id).is_none_or(|request| request.focus);
                     self.set_focus(&id, reveal)?;
                 }
             }

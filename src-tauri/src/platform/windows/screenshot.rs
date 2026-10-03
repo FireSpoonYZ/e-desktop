@@ -132,6 +132,18 @@ fn local_time() -> LocalTime {
     }
 }
 
+/// Picker selection dragged from `anchor` to `pointer`. Right/bottom are exclusive, so the size
+/// equals the drag distance. None without area (a click), leaving Enter to the monitor.
+fn drag_selection(anchor: POINT, pointer: POINT) -> Option<RECT> {
+    let selection = RECT {
+        left: anchor.x.min(pointer.x),
+        top: anchor.y.min(pointer.y),
+        right: anchor.x.max(pointer.x),
+        bottom: anchor.y.max(pointer.y),
+    };
+    (selection.right > selection.left && selection.bottom > selection.top).then_some(selection)
+}
+
 fn size_of_rect(r: RECT) -> SIZE {
     SIZE {
         cx: r.right - r.left,
@@ -313,10 +325,11 @@ impl Picker {
         }
     }
 
+    /// Up to the far edge inclusive: a drag past it selects the last column/row too.
     fn point(&self, l: LPARAM) -> POINT {
         POINT {
-            x: i32::from(l as u16 as i16).clamp(0, self.size.cx - 1),
-            y: i32::from((l >> 16) as u16 as i16).clamp(0, self.size.cy - 1),
+            x: i32::from(l as u16 as i16).clamp(0, self.size.cx),
+            y: i32::from((l >> 16) as u16 as i16).clamp(0, self.size.cy),
         }
     }
 
@@ -398,14 +411,8 @@ unsafe extern "system" fn picker_proc(h: HWND, message: u32, w: WPARAM, l: LPARA
         }
         WM_MOUSEMOVE => {
             if let Some(a) = picker.anchor {
-                let p = picker.point(l);
-                let selection = RECT {
-                    left: a.x.min(p.x),
-                    top: a.y.min(p.y),
-                    right: a.x.max(p.x) + 1,
-                    bottom: a.y.max(p.y) + 1,
-                };
-                picker.select(h, Some(selection));
+                let selection = drag_selection(a, picker.point(l));
+                picker.select(h, selection);
             }
             0
         }
@@ -718,6 +725,21 @@ mod tests {
         assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 2);
         std::fs::remove_dir_all(directory).unwrap();
         assert!(save_png(&image(), Path::new("Z:\\:invalid\\shot.png")).is_err());
+    }
+
+    #[test]
+    fn drag_selection_is_the_drag_distance_and_a_click_selects_nothing() {
+        let point = |x, y| POINT { x, y };
+        for (from, to) in [((2200, 200), (3000, 800)), ((3000, 800), (2200, 200))] {
+            let r = drag_selection(point(from.0, from.1), point(to.0, to.1)).unwrap();
+            assert_eq!((r.left, r.top, r.right, r.bottom), (2200, 200, 3000, 800));
+            let s = size_of_rect(r);
+            assert_eq!((s.cx, s.cy), (800, 600));
+        }
+        assert!(drag_selection(point(5, 5), point(5, 5)).is_none());
+        assert!(drag_selection(point(5, 5), point(5, 9)).is_none());
+        let r = drag_selection(point(5, 5), point(6, 6)).unwrap();
+        assert_eq!(((r.right - r.left), (r.bottom - r.top)), (1, 1));
     }
 
     #[test]

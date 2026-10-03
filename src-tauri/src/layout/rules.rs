@@ -9,6 +9,18 @@ pub(super) struct SizeLimits {
     max_height: Option<u32>,
 }
 
+/// lane: rules-spawn-screenshot. Window rule `openFocused` of a newly discovered window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OpenFocus {
+    pub(super) focus: bool,
+    /// `false` only: further reconciles that still hand the window's own activation back.
+    reconciles_left: u32,
+}
+
+/// Reconciles after discovery during which a window opened with `openFocused: false` may still
+/// activate itself and have native focus handed back. About 5 s at the 500 ms refresh poll.
+pub(super) const OPEN_UNFOCUSED_RECONCILES: u32 = 10;
+
 fn physical(logical: u32, scale: f64) -> u32 {
     (f64::from(logical) * scale)
         .round()
@@ -245,7 +257,13 @@ impl Engine {
             }
         }
         if let Some(focus) = matched.open_focused {
-            self.open_focus.insert(id.into(), focus);
+            self.open_focus.insert(
+                id.into(),
+                OpenFocus {
+                    focus,
+                    reconciles_left: OPEN_UNFOCUSED_RECONCILES,
+                },
+            );
         }
         let limits = SizeLimits {
             min_width: matched.min_width,
@@ -258,14 +276,25 @@ impl Engine {
         }
     }
 
-    /// lane: rules-spawn-screenshot. Settle `openFocused` for windows discovered by this
-    /// reconcile. True when native focus must go back to the engine's (unchanged) focus.
-    pub(super) fn apply_open_focus(&mut self, previous: Option<&str>) -> bool {
+    /// lane: rules-spawn-screenshot. Settle `openFocused`: `true` in the reconcile that
+    /// discovers the window, `false` when the window first takes native focus within
+    /// `OPEN_UNFOCUSED_RECONCILES` further reconciles. `native` is the enumerated focus.
+    /// True when native focus must go back to the engine's (unchanged) focus.
+    pub(super) fn apply_open_focus(
+        &mut self,
+        previous: Option<&str>,
+        native: Option<&str>,
+    ) -> bool {
         let requests = std::mem::take(&mut self.open_focus);
         let manage = self.snapshot.enabled && self.snapshot.backend.capabilities.focus;
         let mut refocus = false;
-        for (id, focus) in requests {
+        for (id, request) in requests {
+            let focus = request.focus;
             let focused = self.snapshot.focused_window.as_deref() == Some(id.as_str());
+            if self.window_index(&id).is_err() || (!focus && previous == Some(id.as_str())) {
+                // Closed, or focused before this reconcile (a user command): settled.
+                continue;
+            }
             if manage
                 && focus
                 && !focused
@@ -273,6 +302,22 @@ impl Engine {
                 && !self.window_protected(&id)
             {
                 let _ = self.set_focus(&id, true);
+            } else if manage && !focus && !focused && native == Some(id.as_str()) {
+                // Native focus that reconcile_inner did not adopt, typically because the
+                // manager already minimized the off-screen window: re-assert the engine focus.
+                if !self.window_protected(&id) {
+                    refocus = true;
+                }
+            } else if !focus && !focused && request.reconciles_left > 0 {
+                // Not activated yet: the app may still activate itself.
+                self.open_focus.insert(
+                    id,
+                    OpenFocus {
+                        focus,
+                        reconciles_left: request.reconciles_left - 1,
+                    },
+                );
+                continue;
             } else if manage && !focus && focused {
                 // Native focus on the new window did not scroll (reconcile_inner); handing focus
                 // back leaves the view as it was before the window opened (niri).
@@ -1063,6 +1108,44 @@ mod open_rule_tests {
         e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
         assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
         assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 600);
+    }
+
+    #[test]
+    fn open_focused_false_hands_back_a_late_activation_of_the_manager_minimized_window() {
+        let rule = r#"{"title":"2","openFocused":false,"columnWidth":600}"#;
+        // "2" opens off-screen right of the full-width "1" while native focus stays on "1".
+        let opened = |reconciles: u32| {
+            let mut e = engine(1.0, rule);
+            e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+            let t = e.reconcile(system(1.0, &["1", "2"], "1")).unwrap();
+            assert!(focus_actions(&t).is_empty());
+            assert!(t.actions.iter().any(|a| matches!(
+                a,
+                NativeAction::Placement { window_id, minimized: true, .. } if window_id == "2"
+            )));
+            let mut native = system(1.0, &["1", "2"], "1");
+            native.windows[1].minimized = true;
+            native.windows[1].minimized_by_manager = true;
+            for _ in 0..reconciles {
+                assert!(focus_actions(&e.reconcile(native.clone()).unwrap()).is_empty());
+            }
+            // The app activates its window only now, after the manager minimized it.
+            native.focused_window = Some("2".into());
+            (e, native)
+        };
+        let (mut e, native) = opened(3);
+        let t = e.reconcile(native.clone()).unwrap();
+        assert_eq!(focus_actions(&t), ["1"]);
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+        assert!(e.open_focus.is_empty());
+
+        // The request is bounded: a later activation is left alone as before.
+        let (mut e, native) = opened(OPEN_UNFOCUSED_RECONCILES);
+        assert!(e.open_focus.is_empty());
+        let t = e.reconcile(native).unwrap();
+        assert!(focus_actions(&t).is_empty());
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
     }
 
     #[test]
