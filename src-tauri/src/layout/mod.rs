@@ -75,6 +75,11 @@ pub struct Engine {
     layout_options: options::LayoutState,
     /// lane: tabbed. Display mode of newly created columns.
     default_column_display: ColumnDisplay,
+    // lane: rules-spawn-screenshot
+    /// Window rule size limits, kept for the window's lifetime.
+    size_limits: BTreeMap<WindowId, rules::SizeLimits>,
+    /// Window rule `openFocused` of windows discovered by the running reconcile.
+    open_focus: BTreeMap<WindowId, bool>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -239,6 +244,8 @@ impl Engine {
             stale_native_focus: None,
             layout_options: Default::default(), // lane: layout-options
             default_column_display: ColumnDisplay::Normal,
+            size_limits: BTreeMap::new(), // lane: rules-spawn-screenshot
+            open_focus: BTreeMap::new(),
         }
     }
 
@@ -454,11 +461,13 @@ impl Engine {
             *self = next;
             return Ok(self.transition(vec![]));
         }
+        // lane: rules-spawn-screenshot
+        let refocus = next.apply_open_focus(self.snapshot.focused_window.as_deref());
         let mut actions = next.placements()?;
         if let Some(id) = next.snapshot.focused_window.as_ref().filter(|_| {
             next.snapshot.enabled
                 && next.snapshot.backend.capabilities.focus
-                && self.snapshot.focused_window != next.snapshot.focused_window
+                && (self.snapshot.focused_window != next.snapshot.focused_window || refocus)
                 && native_focus != next.snapshot.focused_window
         }) {
             if !next.window_protected(id) {
@@ -911,6 +920,7 @@ impl Engine {
     fn cleanup(&mut self) {
         self.sync_minimized();
         self.ensure_named_pages(); // lane: layout-options
+        self.apply_size_limits(); // lane: rules-spawn-screenshot
         let parked: BTreeSet<PageId> = self
             .minimized_slots
             .iter()
@@ -1557,6 +1567,12 @@ impl Engine {
             }
             Command::SnapViewport { monitor_id, delta } => {
                 focus_action = self.snap_viewport(&monitor_id, delta)?;
+            }
+            // lane: rules-spawn-screenshot
+            Command::Screenshot | Command::ScreenshotScreen | Command::ScreenshotWindow => {
+                return Err(invalid(
+                    "Screenshots are taken by the controller, not the layout",
+                ));
             }
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }

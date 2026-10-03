@@ -4,6 +4,7 @@ pub mod hook;
 // lane: input-gestures
 pub mod input_gestures;
 pub mod preview;
+pub mod screenshot; // lane: rules-spawn-screenshot
 mod snapshot;
 pub mod splitter;
 pub mod tabs; // lane: tabbed

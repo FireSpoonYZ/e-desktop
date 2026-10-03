@@ -1,5 +1,84 @@
 use super::*;
 
+/// lane: rules-spawn-screenshot. Window size limits from rules, in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SizeLimits {
+    min_width: Option<u32>,
+    max_width: Option<u32>,
+    min_height: Option<u32>,
+    max_height: Option<u32>,
+}
+
+fn physical(logical: u32, scale: f64) -> u32 {
+    (f64::from(logical) * scale)
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// Rows of `total` pixels shaped like `desired`, each inside `[lo, hi]` (lo wins over hi).
+/// Rows that would leave their range are pinned to it, largest violation side first, and the
+/// rest share what is left. Minimums that cannot all fit shrink proportionally.
+fn constrain_heights(total: u32, desired: &[u32], lo: &[u32], hi: &[u32]) -> Vec<u32> {
+    let n = desired.len();
+    let lo: Vec<u64> = lo.iter().map(|&v| u64::from(v.max(1))).collect();
+    let hi: Vec<u64> = (0..n).map(|i| u64::from(hi[i]).max(lo[i])).collect();
+    let total = u64::from(total);
+    let share = |amount: u64, weights: &[u64]| -> Vec<u64> {
+        let sum = weights.iter().map(|&w| u128::from(w)).sum::<u128>().max(1);
+        let (mut cumulative, mut previous) = (0u128, 0u128);
+        weights
+            .iter()
+            .map(|&w| {
+                cumulative += u128::from(w);
+                let boundary = u128::from(amount) * cumulative / sum;
+                let part = boundary - previous;
+                previous = boundary;
+                part as u64
+            })
+            .collect()
+    };
+    if lo.iter().sum::<u64>() >= total {
+        return share(total, &lo)
+            .into_iter()
+            .map(|h| h.max(1) as u32)
+            .collect();
+    }
+    let mut fixed: Vec<Option<u64>> = vec![None; n];
+    loop {
+        let free: Vec<usize> = (0..n).filter(|&i| fixed[i].is_none()).collect();
+        if free.is_empty() {
+            break;
+        }
+        let used: u64 = fixed.iter().flatten().sum();
+        let weights: Vec<u64> = free.iter().map(|&i| u64::from(desired[i].max(1))).collect();
+        let parts = share(total.saturating_sub(used), &weights);
+        let under: u64 = free
+            .iter()
+            .zip(&parts)
+            .map(|(&i, &p)| lo[i].saturating_sub(p))
+            .sum();
+        let over: u64 = free
+            .iter()
+            .zip(&parts)
+            .map(|(&i, &p)| p.saturating_sub(hi[i]))
+            .sum();
+        if under == 0 && over == 0 {
+            for (&i, &p) in free.iter().zip(&parts) {
+                fixed[i] = Some(p);
+            }
+            break;
+        }
+        for (&i, &p) in free.iter().zip(&parts) {
+            if under >= over && p < lo[i] {
+                fixed[i] = Some(lo[i]);
+            } else if under < over && p > hi[i] {
+                fixed[i] = Some(hi[i]);
+            }
+        }
+    }
+    fixed.into_iter().map(|h| h.unwrap_or(1) as u32).collect()
+}
+
 impl Engine {
     /// Replace rules atomically. Existing window IDs keep their user-controlled layout.
     pub fn set_window_rules(&mut self, rules: Vec<WindowRule>) -> Result<(), AppError> {
@@ -46,6 +125,13 @@ impl Engine {
             matched.monitor_id = rule.monitor_id.clone().or(matched.monitor_id);
             matched.page_index = rule.page_index.or(matched.page_index);
             matched.page_name = rule.page_name.clone().or(matched.page_name); // lane: layout-options
+            matched.open_maximized = rule.open_maximized.or(matched.open_maximized);
+            matched.open_fullscreen = rule.open_fullscreen.or(matched.open_fullscreen);
+            matched.open_focused = rule.open_focused.or(matched.open_focused);
+            matched.min_width = rule.min_width.or(matched.min_width);
+            matched.max_width = rule.max_width.or(matched.max_width);
+            matched.min_height = rule.min_height.or(matched.min_height);
+            matched.max_height = rule.max_height.or(matched.max_height);
         }
         let source = self.monitor_index(&native.monitor_id)?;
         let m = matched
@@ -102,13 +188,149 @@ impl Engine {
             })
             .map(|c| c + 1)
             .unwrap_or(page.columns.len());
-        self.insert_window(m, p, id, matched.column_width)?;
+        // insert_window clamps a maximized column to the target viewport width.
+        let width = if matched.open_maximized == Some(true) {
+            Some(u32::MAX)
+        } else {
+            matched.column_width
+        };
+        self.insert_window(m, p, id, width)?;
         if !self.snapshot.windows[w].floating {
             let page = &mut self.snapshot.monitors[m].pages[p];
             let column = page.columns.pop().unwrap();
             page.columns.insert(at, column);
         }
+        self.apply_open_rules(id, &matched);
         Ok(())
+    }
+
+    /// lane: rules-spawn-screenshot. Fullscreen, focus and size-limit effects of a new window.
+    fn apply_open_rules(&mut self, id: &str, matched: &WindowRule) {
+        let Ok(w) = self.window_index(id) else {
+            return;
+        };
+        let window = &mut self.snapshot.windows[w];
+        if matched.open_fullscreen == Some(true) && window.native.resizable {
+            window.fullscreen = true;
+            if window.floating {
+                self.fullscreen_restore
+                    .insert(id.into(), window.native.rect);
+            }
+        }
+        if let Some(focus) = matched.open_focused {
+            self.open_focus.insert(id.into(), focus);
+        }
+        let limits = SizeLimits {
+            min_width: matched.min_width,
+            max_width: matched.max_width,
+            min_height: matched.min_height,
+            max_height: matched.max_height,
+        };
+        if limits != SizeLimits::default() {
+            self.size_limits.insert(id.into(), limits);
+        }
+    }
+
+    /// lane: rules-spawn-screenshot. Settle `openFocused` for windows discovered by this
+    /// reconcile. True when native focus must go back to the engine's (unchanged) focus.
+    pub(super) fn apply_open_focus(&mut self, previous: Option<&str>) -> bool {
+        let requests = std::mem::take(&mut self.open_focus);
+        if !self.snapshot.enabled || !self.snapshot.backend.capabilities.focus {
+            return false;
+        }
+        let mut refocus = false;
+        for (id, focus) in requests {
+            let focused = self.snapshot.focused_window.as_deref() == Some(id.as_str());
+            if focus && !focused && self.location(&id).is_ok() && !self.window_protected(&id) {
+                let _ = self.set_focus(&id, true);
+            } else if !focus && focused {
+                if let Some(previous) = previous
+                    .filter(|p| *p != id && self.location(p).is_ok() && !self.window_protected(p))
+                {
+                    refocus |= self.set_focus(previous, false).is_ok();
+                }
+            }
+        }
+        refocus
+    }
+
+    /// lane: rules-spawn-screenshot. Clamp tiled column widths to the rule limits of their
+    /// windows (window size plus the gap). Native minimum widths and the viewport still win.
+    pub(super) fn apply_size_limits(&mut self) {
+        let windows = &self.snapshot.windows;
+        self.size_limits
+            .retain(|id, _| windows.iter().any(|w| &w.native.id == id));
+        if self.size_limits.is_empty() {
+            return;
+        }
+        let gaps = self.snapshot.gaps;
+        for monitor in &mut self.snapshot.monitors {
+            let scale = monitor.monitor.scale_factor;
+            let gap = 2 * half_gap(gaps, scale);
+            for column in monitor.pages.iter_mut().flat_map(|p| &mut p.columns) {
+                let limits: Vec<_> = column
+                    .windows
+                    .iter()
+                    .filter_map(|id| self.size_limits.get(id))
+                    .collect();
+                let min = limits
+                    .iter()
+                    .filter_map(|l| l.min_width)
+                    .map(|v| physical(v, scale).saturating_add(gap))
+                    .max()
+                    .unwrap_or(0);
+                let max = limits
+                    .iter()
+                    .filter_map(|l| l.max_width)
+                    .map(|v| physical(v, scale).saturating_add(gap))
+                    .min()
+                    .unwrap_or(u32::MAX);
+                column.width = column.width.min(max).max(min);
+            }
+        }
+    }
+
+    /// lane: rules-spawn-screenshot. Row heights of `column` kept inside rule height limits.
+    pub(super) fn limit_heights(&self, column: &Column, heights: Vec<u32>) -> Vec<u32> {
+        if !column.windows.iter().any(|id| {
+            self.size_limits
+                .get(id)
+                .is_some_and(|l| l.min_height.is_some() || l.max_height.is_some())
+        }) {
+            return heights;
+        }
+        let Some(scale) = self
+            .snapshot
+            .monitors
+            .iter()
+            .find(|m| {
+                m.pages
+                    .iter()
+                    .any(|p| p.columns.iter().any(|c| c.id == column.id))
+            })
+            .map(|m| m.monitor.scale_factor)
+        else {
+            return heights;
+        };
+        let gap = 2 * half_gap(self.snapshot.gaps, scale);
+        let limit = |id: &WindowId, pick: fn(&SizeLimits) -> Option<u32>| {
+            self.size_limits
+                .get(id)
+                .and_then(pick)
+                .map(|v| physical(v, scale).saturating_add(gap))
+        };
+        let lo: Vec<u32> = column
+            .windows
+            .iter()
+            .map(|id| limit(id, |l| l.min_height).unwrap_or(1))
+            .collect();
+        let hi: Vec<u32> = column
+            .windows
+            .iter()
+            .map(|id| limit(id, |l| l.max_height).unwrap_or(u32::MAX))
+            .collect();
+        let total = heights.iter().map(|&h| u64::from(h)).sum::<u64>();
+        constrain_heights(total.min(u64::from(u32::MAX)) as u32, &heights, &lo, &hi)
     }
 }
 
@@ -620,5 +842,185 @@ mod tests {
             600 // Existing window: not the rule's 7, and not stretched to the viewport.
         );
         assert!(!e.snapshot.windows[e.window_index("4").unwrap()].floating);
+    }
+}
+
+// lane: rules-spawn-screenshot
+#[cfg(test)]
+mod open_rule_tests {
+    use super::*;
+
+    fn native(id: &str) -> NativeWindow {
+        NativeWindow {
+            id: id.into(),
+            title: format!("title {id}"),
+            app_name: "app".into(),
+            process_id: 1,
+            monitor_id: "a".into(),
+            rect: Rect {
+                x: 40,
+                y: 40,
+                width: 500,
+                height: 400,
+            },
+            minimized: false,
+            minimized_by_manager: false,
+            resizable: true,
+        }
+    }
+
+    fn system(scale: f64, ids: &[&str], focused: &str) -> SystemSnapshot {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 900,
+        };
+        SystemSnapshot {
+            monitors: vec![Monitor {
+                id: "a".into(),
+                name: "a".into(),
+                bounds: area,
+                work_area: area,
+                scale_factor: scale,
+                primary: true,
+            }],
+            windows: ids.iter().map(|id| native(id)).collect(),
+            focused_window: Some(focused.into()),
+        }
+    }
+
+    /// Enabled engine with window "1" focused and `rule` applying to later windows.
+    fn engine(scale: f64, rule: &str) -> Engine {
+        let mut e = Engine::new(BackendStatus {
+            kind: BackendKind::Windows,
+            availability: BackendAvailability::Ready,
+            capabilities: Capabilities {
+                enumerate: true,
+                placement: true,
+                minimize: true,
+                clipping: true,
+                focus: true,
+                ..Capabilities::default()
+            },
+            message: String::new(),
+        });
+        e.reconcile(system(scale, &["1"], "1")).unwrap();
+        e.dispatch(Command::Enable).unwrap();
+        e.set_window_rules(vec![serde_json::from_str(rule).unwrap()])
+            .unwrap();
+        e
+    }
+
+    fn width(e: &Engine, id: &str) -> u32 {
+        let (m, p, column) = e.location(id).unwrap();
+        e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width
+    }
+
+    fn focus_actions(t: &Transition) -> Vec<&str> {
+        t.actions
+            .iter()
+            .filter_map(|a| match a {
+                NativeAction::Focus { window_id } => Some(window_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn open_maximized_fills_the_viewport_and_open_fullscreen_sets_layout_fullscreen() {
+        let mut e = engine(
+            1.0,
+            r#"{"matches":[{"title":"2$"}],"columnWidth":300,"openMaximized":true}"#,
+        );
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        assert_eq!((width(&e, "1"), width(&e, "2")), (600, 1200));
+        let mut e = engine(1.0, r#"{"title":"2","openFullscreen":true}"#);
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        let fullscreen: Vec<_> = e.snapshot.windows.iter().map(|w| w.fullscreen).collect();
+        assert_eq!(fullscreen, [false, true]);
+    }
+
+    #[test]
+    fn open_focused_false_returns_focus_once_and_true_takes_it() {
+        let mut e = engine(1.0, r#"{"title":"2","openFocused":false}"#);
+        let t = e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+        assert_eq!(focus_actions(&t), ["1"]);
+        let t = e.reconcile(system(1.0, &["1", "2"], "1")).unwrap();
+        assert!(focus_actions(&t).is_empty());
+        // Later native focus on the window is a user choice and is adopted.
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+
+        let mut e = engine(1.0, r#"{"title":"2","openFocused":true}"#);
+        let t = e.reconcile(system(1.0, &["1", "2"], "1")).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+        assert_eq!(focus_actions(&t), ["2"]);
+    }
+
+    #[test]
+    fn width_limits_are_logical_pixels_and_survive_commands_and_rule_reloads() {
+        let mut e = engine(2.0, r#"{"title":"2","minWidth":350,"maxWidth":400}"#);
+        e.reconcile(system(2.0, &["1", "2"], "2")).unwrap();
+        // Default half viewport 600 is raised to 350 logical = 700 physical.
+        assert_eq!(width(&e, "2"), 700);
+        e.set_window_rules(vec![]).unwrap();
+        e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+        assert_eq!(width(&e, "2"), 800);
+        e.dispatch(Command::SetColumnWidth { width: 100 }).unwrap();
+        assert_eq!(width(&e, "2"), 700);
+        e.set_gaps(10);
+        e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+        // The limit is the window; the column adds its two half gaps (10 logical at scale 2).
+        assert_eq!(width(&e, "2"), 820);
+        assert_eq!(width(&e, "1"), 600);
+    }
+
+    #[test]
+    fn height_limits_shape_stacked_rows() {
+        let mut e = engine(1.0, r#"{"title":"2","maxHeight":200}"#);
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        e.dispatch(Command::MoveWindow {
+            direction: Direction::Left,
+        })
+        .unwrap();
+        let (m, p, column) = e.location("2").unwrap();
+        let column = &e.snapshot.monitors[m].pages[p].columns[column.unwrap().0];
+        assert_eq!(column.windows, ["1", "2"]);
+        assert_eq!(e.column_heights(column, 900), [700, 200]);
+        // Growing the limited row is held at its maximum.
+        e.dispatch(Command::AdjustWindowHeight { delta: 300 })
+            .unwrap();
+        let (m, p, column) = e.location("2").unwrap();
+        let column = &e.snapshot.monitors[m].pages[p].columns[column.unwrap().0];
+        assert_eq!(e.column_heights(column, 900), [700, 200]);
+    }
+
+    #[test]
+    fn constrained_heights_pin_violations_and_share_the_rest() {
+        let max = u32::MAX;
+        assert_eq!(
+            constrain_heights(900, &[450, 450], &[1, 1], &[max, max]),
+            [450, 450]
+        );
+        assert_eq!(
+            constrain_heights(900, &[450, 450], &[600, 1], &[max, max]),
+            [600, 300]
+        );
+        assert_eq!(
+            constrain_heights(900, &[300, 300, 300], &[1, 1, 1], &[100, max, max]),
+            [100, 400, 400]
+        );
+        // Minimum wins over a smaller maximum; all at maximum leaves space unused.
+        assert_eq!(
+            constrain_heights(900, &[450, 450], &[500, 1], &[200, 100]),
+            [500, 100]
+        );
+        // Minimums that cannot fit shrink in proportion.
+        assert_eq!(
+            constrain_heights(900, &[450, 450], &[600, 1200], &[max, max]),
+            [300, 600]
+        );
     }
 }

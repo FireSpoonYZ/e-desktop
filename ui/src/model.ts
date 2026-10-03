@@ -145,7 +145,11 @@ export type Command =
   | { type: 'toggleColumnTabbedDisplay' }
   // lane: input-gestures
   | { type: 'dragViewport'; monitorId: MonitorId; delta: number }
-  | { type: 'snapViewport'; monitorId: MonitorId; delta: number };
+  | { type: 'snapViewport'; monitorId: MonitorId; delta: number }
+  // lane: rules-spawn-screenshot
+  | { type: 'screenshot' }
+  | { type: 'screenshotScreen' }
+  | { type: 'screenshotWindow' };
 export type ErrorCode = 'notImplemented' | 'unsupportedSession' | 'backendUnavailable' | 'permissionRequired' | 'windowGone' | 'operationDenied' | 'invalidCommand';
 export interface AppError { code: ErrorCode; message: string; windowId: WindowId | null }
 export type NativeAction =

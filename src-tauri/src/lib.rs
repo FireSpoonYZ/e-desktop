@@ -11,7 +11,9 @@ pub mod model;
 pub mod platform;
 pub mod pointer;
 pub mod rules;
+pub mod screenshot; // lane: rules-spawn-screenshot
 pub mod shortcuts;
+pub mod spawn; // lane: rules-spawn-screenshot
 
 pub mod preview;
 

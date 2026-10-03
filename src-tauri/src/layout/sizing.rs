@@ -85,7 +85,7 @@ impl Engine {
             .iter()
             .map(|id| self.height_weights.get(id).copied().unwrap_or(default))
             .collect();
-        distribute(total, &weights)
+        self.limit_heights(column, distribute(total, &weights)) // lane: rules-spawn-screenshot
     }
 
     /// `applied` holds rects the backend actually placed (non-minimized). A tiled window whose

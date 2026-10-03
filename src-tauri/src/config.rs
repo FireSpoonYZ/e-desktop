@@ -63,6 +63,11 @@ pub struct Config {
     // lane: persistence-ipc
     /// The first enable after startup rebuilds the layout saved in `layout-state.json`.
     pub restore_layout: bool,
+    // lane: rules-spawn-screenshot
+    /// `[program, args...]` commands started once when the application starts.
+    pub spawn_at_startup: Vec<Vec<String>>,
+    /// PNG path template (`%VAR%` environment variables, `%Y %m %d %H %M %S`); null: clipboard only.
+    pub screenshot_path: Option<String>,
 }
 
 // lane: input-gestures
@@ -138,6 +143,18 @@ pub enum ShortcutAction {
     },
     /// lane: ui-animation — toggles the hotkey overlay listing the effective bindings.
     HotkeyOverlay {},
+    // lane: rules-spawn-screenshot
+    /// Start `[program, args...]` detached.
+    Spawn {
+        command: Vec<String>,
+    },
+    /// Run a command line through `cmd.exe /C` (Windows) or `sh -c`.
+    SpawnSh {
+        command: String,
+    },
+    Screenshot {},
+    ScreenshotScreen {},
+    ScreenshotWindow {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +304,10 @@ enum StrictCommand {
         monitor_id: String,
         delta: i32,
     },
+    // lane: rules-spawn-screenshot
+    Screenshot {},
+    ScreenshotScreen {},
+    ScreenshotWindow {},
 }
 
 impl Default for Config {
@@ -322,8 +343,17 @@ impl Default for Config {
             touchpad_gesture_fingers: None,
             // lane: persistence-ipc
             restore_layout: true,
+            spawn_at_startup: vec![], // lane: rules-spawn-screenshot
+            screenshot_path: Some(crate::screenshot::DEFAULT_PATH.into()),
         }
     }
+}
+
+/// lane: rules-spawn-screenshot. `[program, args...]` with a nonblank program.
+fn spawnable(command: &[String]) -> bool {
+    command
+        .first()
+        .is_some_and(|program| !program.trim().is_empty())
 }
 
 fn colorref(hex: &str) -> Option<u32> {
@@ -465,6 +495,14 @@ impl Config {
         );
         // lane: ui-animation
         bind("Control+Alt+Slash".into(), ShortcutAction::HotkeyOverlay {});
+        // lane: rules-spawn-screenshot
+        for (key, action) in [
+            ("S", ShortcutAction::Screenshot {}),
+            ("Shift+S", ShortcutAction::ScreenshotScreen {}),
+            ("X", ShortcutAction::ScreenshotWindow {}),
+        ] {
+            bind(format!("Control+Alt+{key}"), action);
+        }
         shortcuts
     }
 
@@ -496,6 +534,21 @@ impl Config {
                 .map_err(|e| format!("窗口规则 {}：{}", index + 1, e.message))?;
         }
         crate::layout::options::validate(&config)?; // lane: layout-options
+        // lane: rules-spawn-screenshot
+        if !config
+            .spawn_at_startup
+            .iter()
+            .all(|command| spawnable(command))
+        {
+            return Err("spawnAtStartup 的每一项须为非空数组，第一个元素为程序。".into());
+        }
+        if config
+            .screenshot_path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err("screenshotPath 不能为空；不保存文件请用 null。".into());
+        }
         let mut keys = HashSet::new();
         for binding in &config.shortcuts {
             if binding.key.trim().is_empty() || !keys.insert(&binding.key) {
@@ -508,6 +561,12 @@ impl Config {
                 }
             ) {
                 return Err(format!("快捷键 {} 的列宽须大于 0。", binding.key));
+            }
+            // lane: rules-spawn-screenshot
+            if matches!(&binding.action, ShortcutAction::Spawn { command } if !spawnable(command))
+                || matches!(&binding.action, ShortcutAction::SpawnSh { command } if command.trim().is_empty())
+            {
+                return Err(format!("快捷键 {} 的启动命令不能为空。", binding.key));
             }
             if matches!(
                 binding.action,
@@ -643,6 +702,12 @@ impl ConfigFile {
 pub fn foreground_blocks_shortcut(action: &ShortcutAction, suspended: &[String]) -> bool {
     match action {
         ShortcutAction::Quit {} | ShortcutAction::Unbind {} => false,
+        // lane: rules-spawn-screenshot. Not tied to a monitor's layout.
+        ShortcutAction::Spawn { .. }
+        | ShortcutAction::SpawnSh { .. }
+        | ShortcutAction::Screenshot {}
+        | ShortcutAction::ScreenshotScreen {}
+        | ShortcutAction::ScreenshotWindow {} => false,
         ShortcutAction::Overview {}
         | ShortcutAction::Commands {}
         | ShortcutAction::Page { .. }
@@ -658,6 +723,8 @@ fn explicit_live_target(command: &Command, suspended: &[String]) -> bool {
     let live = |id: &str| !id.is_empty() && !suspended.iter().any(|paused| paused == id);
     match command {
         Command::Refresh | Command::Enable | Command::Disable => true,
+        // lane: rules-spawn-screenshot
+        Command::Screenshot | Command::ScreenshotScreen | Command::ScreenshotWindow => true,
         Command::SwitchPage { monitor_id, .. }
         | Command::AddPage { monitor_id }
         | Command::Scroll { monitor_id, .. }
@@ -691,7 +758,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 66);
+        assert_eq!(Config::builtin_shortcuts().len(), 69);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -755,7 +822,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 66);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 69);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -763,7 +830,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 66);
+        assert_eq!(config.shortcuts.len(), 69);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(
@@ -1175,5 +1242,102 @@ mod tests {
         // Ordinary unmanaged foreground on B must not show over stale layout host A.
         assert!(foreground_blocks_show(None, Some("a"), false, &paused));
         assert!(!foreground_blocks_show(None, Some("b"), false, &paused));
+    }
+}
+
+// lane: rules-spawn-screenshot
+#[cfg(test)]
+mod spawn_screenshot_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_and_screenshot_fields_actions_and_default_keys() {
+        let defaults = Config::parse(b"{}").unwrap();
+        assert!(defaults.spawn_at_startup.is_empty());
+        assert_eq!(
+            defaults.screenshot_path.as_deref(),
+            Some(crate::screenshot::DEFAULT_PATH)
+        );
+        let config = Config::parse(
+            br#"{"spawnAtStartup":[["waybar"],["alacritty","-e","htop"]],"screenshotPath":null,
+                "shortcuts":[
+                    {"key":"Control+Alt+T","action":{"type":"spawn","command":["wt.exe","-d","C:\\"]}},
+                    {"key":"Control+Alt+E","action":{"type":"spawnSh","command":"start notepad && calc"}},
+                    {"key":"Control+Alt+P","action":{"type":"command","command":{"type":"screenshotWindow"}}}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.spawn_at_startup[1], ["alacritty", "-e", "htop"]);
+        assert_eq!(config.screenshot_path, None);
+        assert_eq!(
+            config.shortcuts[0].action,
+            ShortcutAction::Spawn {
+                command: vec!["wt.exe".into(), "-d".into(), "C:\\".into()]
+            }
+        );
+        assert_eq!(
+            config.shortcuts[1].action,
+            ShortcutAction::SpawnSh {
+                command: "start notepad && calc".into()
+            }
+        );
+        assert_eq!(
+            config.shortcuts[2].action,
+            ShortcutAction::Command {
+                command: Command::ScreenshotWindow
+            }
+        );
+        assert_eq!(
+            Config::parse(&serde_json::to_vec(&config).unwrap()).unwrap(),
+            config
+        );
+        for text in [
+            r#"{"spawnAtStartup":[[]]}"#,
+            r#"{"spawnAtStartup":[[" "]]}"#,
+            r#"{"spawnAtStartup":["notepad"]}"#,
+            r#"{"screenshotPath":"  "}"#,
+            r#"{"screenshotPath":3}"#,
+            r#"{"shortcuts":[{"key":"A","action":{"type":"spawn","command":[]}}]}"#,
+            r#"{"shortcuts":[{"key":"A","action":{"type":"spawn","command":"notepad"}}]}"#,
+            r#"{"shortcuts":[{"key":"A","action":{"type":"spawnSh","command":" "}}]}"#,
+            r#"{"shortcuts":[{"key":"A","action":{"type":"screenshot","path":"x"}}]}"#,
+            r#"{"shortcuts":[{"key":"A","action":{"type":"command","command":{"type":"screenshot","x":1}}}]}"#,
+        ] {
+            assert!(Config::parse(text.as_bytes()).is_err(), "accepted: {text}");
+        }
+        let builtin = Config::builtin_shortcuts();
+        for (key, action) in [
+            ("Control+Alt+S", ShortcutAction::Screenshot {}),
+            ("Control+Alt+Shift+S", ShortcutAction::ScreenshotScreen {}),
+            ("Control+Alt+X", ShortcutAction::ScreenshotWindow {}),
+        ] {
+            assert_eq!(
+                builtin
+                    .iter()
+                    .filter(|b| b.key == key)
+                    .map(|b| &b.action)
+                    .collect::<Vec<_>>(),
+                [&action]
+            );
+            // Taking a picture of a paused fullscreen display is allowed.
+            assert!(!foreground_blocks_shortcut(&action, &["a".into()]));
+        }
+    }
+
+    #[test]
+    fn invalid_rule_regex_is_a_configuration_error() {
+        let error =
+            Config::parse(br#"{"windowRules":[{"matches":[{"appName":"[a-"}],"floating":true}]}"#)
+                .unwrap_err();
+        assert!(error.contains("invalid regex"), "{error}");
+        let error =
+            Config::parse(br#"{"windowRules":[{"floating":true},{"minHeight":9,"maxHeight":8}]}"#)
+                .unwrap_err();
+        assert!(error.starts_with("窗口规则 2"), "{error}");
+        let config = Config::parse(
+            br#"{"windowRules":[{"matches":[{"title":"^Picture"}],"excludes":[{"appName":"x"}],"openFocused":false,"minWidth":300}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.window_rules[0].min_width, Some(300));
     }
 }

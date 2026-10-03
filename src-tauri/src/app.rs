@@ -31,6 +31,7 @@ use crate::platform::splitter;
 // lane: persistence-ipc
 mod ipc_server;
 use crate::layout::persistence::{LayoutStateFile, state_path};
+mod capture; // lane: rules-spawn-screenshot
 #[cfg(target_os = "windows")]
 mod controller_queue;
 // lane: input-gestures
@@ -210,6 +211,9 @@ enum Request {
     // lane: persistence-ipc
     /// An IPC client ran a shortcut action; resolved like a pressed shortcut.
     ShortcutAction(ShortcutAction),
+    /// lane: rules-spawn-screenshot. A background screenshot failed.
+    #[cfg(target_os = "windows")]
+    Issue(AppError),
 }
 
 struct AppState {
@@ -1811,6 +1815,12 @@ fn run_controller(
             controller.record(error(ErrorCode::OperationDenied, e));
         }
     }
+    // lane: rules-spawn-screenshot
+    for command in &shortcuts.config.spawn_at_startup {
+        if let Err(issue) = crate::spawn::spawn(command) {
+            controller.record(issue);
+        }
+    }
     if controller.backend.is_some() {
         if let Err(issue) = controller.refresh(false) {
             controller.record(issue);
@@ -1971,6 +1981,34 @@ fn run_controller(
                         },
                     ),
                     Some(ShortcutAction::Quit {}) => Ok(Request::Quit),
+                    // lane: rules-spawn-screenshot
+                    Some(ShortcutAction::Spawn { command }) => {
+                        if let Err(issue) = crate::spawn::spawn(&command) {
+                            controller.record(issue);
+                        }
+                        continue;
+                    }
+                    Some(ShortcutAction::SpawnSh { command }) => {
+                        if let Err(issue) = crate::spawn::spawn_sh(&command) {
+                            controller.record(issue);
+                        }
+                        continue;
+                    }
+                    Some(ShortcutAction::Screenshot {}) => Ok(Request::Command(
+                        Command::Screenshot,
+                        None,
+                        IpcTrace::begin("shortcut.command"),
+                    )),
+                    Some(ShortcutAction::ScreenshotScreen {}) => Ok(Request::Command(
+                        Command::ScreenshotScreen,
+                        None,
+                        IpcTrace::begin("shortcut.command"),
+                    )),
+                    Some(ShortcutAction::ScreenshotWindow {}) => Ok(Request::Command(
+                        Command::ScreenshotWindow,
+                        None,
+                        IpcTrace::begin("shortcut.command"),
+                    )),
                     _ => continue,
                 }
             }
@@ -2003,7 +2041,15 @@ fn run_controller(
                     0
                 };
                 let before = controller.engine.snapshot().focused_window.clone();
-                let result = controller.command(command);
+                // lane: rules-spawn-screenshot
+                let result = match crate::screenshot::Kind::of(&command) {
+                    Some(kind) => controller.screenshot(
+                        &sender,
+                        kind,
+                        shortcuts.config.screenshot_path.clone(),
+                    ),
+                    None => controller.command(command),
+                };
                 // lane: persistence-ipc
                 // Native focus follows the restored focus; the next poll would otherwise adopt
                 // whatever window the OS has in front.
@@ -2083,7 +2129,10 @@ fn run_controller(
             }
             #[cfg(target_os = "windows")]
             Ok(Request::Pointer) => {
-                if let Some(request) = controller.pointer(&app, &shortcuts.config) {
+                // lane: rules-spawn-screenshot. No hot corners or pointer focus over the picker.
+                if crate::screenshot::active() {
+                    let _ = crate::platform::hook::drain();
+                } else if let Some(request) = controller.pointer(&app, &shortcuts.config) {
                     let _ = sender.try_send(request);
                 }
                 if let Some(delay) = controller.refresh_soon.take() {
@@ -2199,6 +2248,9 @@ fn run_controller(
                 }
                 break;
             }
+            // lane: rules-spawn-screenshot
+            #[cfg(target_os = "windows")]
+            Ok(Request::Issue(issue)) => controller.record(issue),
             Err(ReceiveError::Timeout) => {}
             #[cfg(target_os = "windows")]
             Err(ReceiveError::Failed(issue)) => {
@@ -2351,6 +2403,8 @@ mod tests {
             native_move: None, ignored_foreground: None, refresh_soon: None,
             autohide: false, pinned: BTreeSet::new(), revealed: BTreeSet::new(),
             overview_host: None, commands_host: None,
+            #[cfg(target_os = "windows")]
+            input_gestures: Default::default(),
         };
         controller.note_surface(Surface::Overview, Some("m".into()));
         let before = controller.engine.snapshot().clone();

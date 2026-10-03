@@ -87,6 +87,13 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
   // lane: input-gestures
   add('视图对齐到最近的列 Snap to column', { type: 'snapViewport', monitorId: target?.monitor.id ?? '', delta: 0 }, !!target,
     `${target?.monitor.name ?? '无可用显示器'} · 对齐列边缘并聚焦该列`);
+  // lane: rules-spawn-screenshot
+  const screenshots = snapshot.backend.kind === 'windows';
+  add('截图 Screenshot', { type: 'screenshot' }, screenshots, '冻结画面后框选区域 · 保存 PNG 并复制');
+  add('截取当前显示器 Screenshot monitor', { type: 'screenshotScreen' }, screenshots && snapshot.activeMonitor !== null,
+    '活动显示器 · 保存 PNG 并复制');
+  add('截取当前窗口 Screenshot window', { type: 'screenshotWindow' }, screenshots && snapshot.focusedWindow !== null,
+    '焦点窗口 · 保存 PNG 并复制');
   const words = query.normalize('NFKC').toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return actions.filter(({ label, detail }) => {
     const text = `${label} ${detail}`.normalize('NFKC').toLocaleLowerCase();

@@ -375,6 +375,13 @@ pub enum Command {
         monitor_id: MonitorId,
         delta: i32,
     },
+    // lane: rules-spawn-screenshot
+    /// Controller-only: freeze the screen and pick a region; PNG file plus clipboard.
+    Screenshot,
+    /// Controller-only: the active monitor.
+    ScreenshotScreen,
+    /// Controller-only: the foreground window (the layout focus behind our own surfaces).
+    ScreenshotWindow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
