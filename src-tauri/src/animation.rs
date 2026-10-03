@@ -118,6 +118,11 @@ impl Animation {
         self.plan.as_ref().map(|plan| plan.next_frame)
     }
 
+    /// Length of the running plan; a refresh keeps it instead of restarting the clock.
+    pub fn duration(&self) -> Option<Duration> {
+        self.plan.as_ref().map(|plan| plan.duration)
+    }
+
     pub fn sprites(&self) -> Vec<Sprite> {
         let Some(plan) = &self.plan else {
             return vec![];
@@ -614,7 +619,8 @@ fn rect_components(rect: Rect) -> [f64; 4] {
 
 /// Analytic critically damped spring, with a small Hermite tail correction so the configured
 /// duration still ends exactly at the target, at rest. No integration step depends on cadence.
-fn spring(from: f64, to: f64, velocity: f64, elapsed: f64, duration: f64) -> (f64, f64) {
+/// Ported to `ui/src/overview/zoom.ts` for the overview zoom; keep both in step.
+pub(crate) fn spring(from: f64, to: f64, velocity: f64, elapsed: f64, duration: f64) -> (f64, f64) {
     if elapsed <= 0.0 {
         return (from, velocity);
     }

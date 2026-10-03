@@ -50,6 +50,10 @@ pub struct Config {
     pub workspaces: Vec<NamedWorkspace>,
     /// lane: tabbed. Display mode of newly created columns.
     pub default_column_display: ColumnDisplay,
+    /// lane: ui-animation — per-kind lengths; a missing or null kind uses `animation_duration_ms`.
+    pub animations: crate::ui_animation::Animations,
+    /// lane: ui-animation — niri hotkey overlay, shown once when tiling is first enabled.
+    pub hotkey_overlay: crate::ui_animation::HotkeyOverlay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ pub enum ShortcutAction {
         #[serde(default)]
         move_window: bool,
     },
+    /// lane: ui-animation — toggles the hotkey overlay listing the effective bindings.
+    HotkeyOverlay {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +286,9 @@ impl Default for Config {
             workspaces: vec![],
             // lane: tabbed
             default_column_display: ColumnDisplay::Normal,
+            // lane: ui-animation
+            animations: Default::default(),
+            hotkey_overlay: Default::default(),
         }
     }
 }
@@ -421,6 +430,8 @@ impl Config {
                 command: Command::ToggleColumnTabbedDisplay,
             },
         );
+        // lane: ui-animation
+        bind("Control+Alt+Slash".into(), ShortcutAction::HotkeyOverlay {});
         shortcuts
     }
 
@@ -429,6 +440,7 @@ impl Config {
         if config.animation_duration_ms > 1000 {
             return Err("animationDurationMs 须在 0 到 1000 之间。".into());
         }
+        config.animations.validate()?; // lane: ui-animation
         if config.gaps > 256 {
             return Err("gaps 须在 0 到 256 之间。".into());
         }
@@ -598,6 +610,7 @@ pub fn foreground_blocks_shortcut(action: &ShortcutAction, suspended: &[String])
         | ShortcutAction::Scroll { .. }
         | ShortcutAction::PageByName { .. } => true, // lane: layout-options
         ShortcutAction::Command { command } => !explicit_live_target(command, suspended),
+        ShortcutAction::HotkeyOverlay {} => true, // lane: ui-animation
     }
 }
 
@@ -638,7 +651,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 65);
+        assert_eq!(Config::builtin_shortcuts().len(), 66);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -702,7 +715,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 65);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 66);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -710,7 +723,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 65);
+        assert_eq!(config.shortcuts.len(), 66);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(

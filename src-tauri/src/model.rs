@@ -172,7 +172,7 @@ pub struct Snapshot {
     pub bars_autohide: bool,
     /// Logical pixels between tiled windows and the screen edges (niri gaps).
     pub gaps: u32,
-    /// Layout and overview animation length; 0 disables animations.
+    /// Base layout animation length (`animationDurationMs`); 0 disables animations.
     pub animation_duration_ms: u32,
     /// Monitors paused while a foreign window covers the full display.
     /// Not layout fullscreen, not a maximized work-area window, and not a
@@ -183,6 +183,9 @@ pub struct Snapshot {
     /// Pages carrying a user or configured name in `Page::name`; they persist while empty.
     #[serde(default)]
     pub named_pages: Vec<PageId>,
+    /// lane: ui-animation — overview open/close length after per-kind overrides; 0 disables.
+    #[serde(default)]
+    pub overview_animation_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

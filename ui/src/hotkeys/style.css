@@ -1,0 +1,12 @@
+.hotkey-overlay { height: 100vh; padding: 18px 22px; overflow: auto; background: var(--background); border: 1px solid var(--border); cursor: default; outline: none; }
+.hotkey-overlay > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.hotkey-overlay h1 { margin: 0 0 12px; }
+.hotkey-overlay header p { margin: 0; font-size: 12px; }
+.hotkey-groups { columns: 2 300px; column-gap: 28px; }
+.hotkey-groups > section { break-inside: avoid; margin-bottom: 14px; }
+.hotkey-groups h2 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--focus); }
+.hotkey-groups dl { margin: 0; }
+.hotkey-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 10px; padding: 3px 0; font-size: 12px; }
+.hotkey-row dt { display: flex; flex-wrap: wrap; gap: 4px; }
+.hotkey-row dd { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.hotkey-row kbd { padding: 1px 5px; border: 1px solid var(--border); border-radius: 3px; background: var(--surface); font-size: 11px; white-space: nowrap; }

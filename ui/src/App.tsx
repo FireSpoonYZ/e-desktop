@@ -6,6 +6,8 @@ import type { Command, OnCommand } from './model';
 import { TopBar } from './shell';
 import { Overview } from './overview';
 import { CommandPalette } from './commands';
+import { HotkeyOverlay } from './hotkeys';
+import type { Hotkey } from './hotkeys/describe';
 import { TerminalManager, TerminalView } from './terminal/Terminal';
 import { openTerminal, observeTerminalConnection } from './terminal/client';
 import { observeSessionWindows } from './terminal/session-windows';
@@ -31,6 +33,7 @@ function DesktopApp() {
   const [opening, setOpening] = useState(0);
   const [overlayMonitor, setOverlayMonitor] = useState<string | null>(null);
   const [previewSession, setPreviewSession] = useState<number | null>(null);
+  const [hotkeys, setHotkeys] = useState<Hotkey[] | null>(null);
   const executing = useRef(false);
   const seenTerminalSessions = useRef(new Set<string>());
 
@@ -66,8 +69,8 @@ function DesktopApp() {
       });
       if (disposed) { unlisten(); return; }
       cleanups.push(unlisten);
-      const reopen = await onSurfaceOpened(({ monitorId, previewSession }) => {
-        if (!disposed) { setOpening((value) => value + 1); setOverlayMonitor(monitorId); setPreviewSession(previewSession); setLocalError(null); }
+      const reopen = await onSurfaceOpened(({ monitorId, previewSession, hotkeys }) => {
+        if (!disposed) { setOpening((value) => value + 1); setOverlayMonitor(monitorId); setPreviewSession(previewSession); setHotkeys(hotkeys ?? null); setLocalError(null); }
       });
       if (disposed) { reopen(); return; }
       cleanups.push(reopen);
@@ -100,7 +103,7 @@ function DesktopApp() {
       .catch((cause: unknown) => setLocalError(errorMessage(cause)));
   }, [snapshot.monitors]);
   const onDismiss = useCallback(() => {
-    if (surface === 'overview' || surface === 'commands') {
+    if (surface === 'overview' || surface === 'commands' || surface === 'hotkeys') {
       setPreviewSession(null);
       void dismissSurface(surface).catch((cause: unknown) => setLocalError(errorMessage(cause)));
     }
@@ -119,6 +122,7 @@ function DesktopApp() {
   return <main className={`desktop-surface desktop-surface--${surface}`}>
     {surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
       : surface === 'commands' ? <CommandPalette key={opening} {...props} onDismiss={onDismiss} />
+      : surface === 'hotkeys' ? <HotkeyOverlay key={opening} hotkeys={hotkeys} onDismiss={onDismiss} />
       : <TopBar {...props} onOpenTerminals={() => { void openTerminal().catch(cause => setLocalError(errorMessage(cause))); }} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
         onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }}
         onTogglePin={monitor && snapshot.barsAutohide ? () => {

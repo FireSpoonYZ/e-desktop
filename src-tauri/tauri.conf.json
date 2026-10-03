@@ -43,6 +43,17 @@
         "shadow": false,
         "skipTaskbar": true,
         "visible": false
+      },
+      {
+        "label": "hotkeys",
+        "title": "e-desktop hotkeys",
+        "url": "index.html?surface=hotkeys",
+        "width": 760,
+        "height": 600,
+        "decorations": false,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false
       }
     ],
     "security": {

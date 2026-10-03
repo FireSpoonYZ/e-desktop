@@ -1,8 +1,21 @@
 import type { Command, Page, Rect, Snapshot, WindowId } from '../model';
 
-/** Niri's half-size overview, reduced further when viewing a larger display. */
-export const overviewScale = (scaleFactor: number, viewportWidth = 1, availableWidth = Infinity) =>
-  Math.min(.5 / Math.max(1, scaleFactor), availableWidth / Math.max(1, viewportWidth));
+/** Niri's half-size overview, reduced further when viewing a larger display.
+ * `zoom` is the user's Ctrl+wheel / pinch factor on top of that fitted scale. */
+export const overviewScale = (scaleFactor: number, viewportWidth = 1, availableWidth = Infinity, zoom = 1) =>
+  Math.min(.5 / Math.max(1, scaleFactor), availableWidth / Math.max(1, viewportWidth)) * zoom;
+
+/** lane: ui-animation — overview zoom limits relative to the fitted scale. */
+export const OVERVIEW_ZOOM_MIN = .5, OVERVIEW_ZOOM_MAX = 2;
+
+/** Ctrl+wheel / touchpad pinch (a ctrlKey wheel in the webview): wheel up zooms in. One mouse
+ * notch (100 px) is about 1.5×; pinch deltas are small and adjust continuously. */
+export function wheelZoom(zoom: number, deltaY: number, deltaMode = 0) {
+  const pixels = deltaY * (deltaMode === 1 ? 40 : deltaMode === 2 ? 800 : 1);
+  if (!Number.isFinite(pixels) || !Number.isFinite(zoom)) return Number.isFinite(zoom) ? zoom : 1;
+  const next = zoom * Math.exp(-Math.max(-100, Math.min(100, pixels)) / 250);
+  return Math.min(OVERVIEW_ZOOM_MAX, Math.max(OVERVIEW_ZOOM_MIN, next));
+}
 
 /** Keep column widths and scroll offsets in the same physical-to-CSS scale. */
 export function pageGeometry(page: Page, viewport: Rect, scale: number) {

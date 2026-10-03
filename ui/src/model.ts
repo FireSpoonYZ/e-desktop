@@ -83,13 +83,15 @@ export interface Snapshot {
   barsAutohide: boolean;
   /** 平铺间距，逻辑像素。 */
   gaps: number;
-  /** 概览开合动画时长（毫秒）；0 禁用。 */
+  /** 布局动画基准时长（毫秒）；0 禁用。概览开合用 overviewAnimationMs。 */
   animationDurationMs: number;
   /** Monitors paused while a foreign window covers the full display. */
   suspendedMonitors: MonitorId[];
   // lane: layout-options
   /** 带名称的页面（名称在 Page.name 中）；为空时也保留。 */
   namedPages?: PageId[];
+  /** lane: ui-animation — 概览开合动画时长（毫秒，已套用 animations.overviewOpenClose）；0 禁用。 */
+  overviewAnimationMs: number;
 }
 export type Direction = 'left' | 'right' | 'up' | 'down';
 export type Command =
@@ -178,4 +180,5 @@ export const emptySnapshot: Snapshot = {
   monitors: [], windows: [], focusedWindow: null, activeMonitor: null, errors: [],
   pinnedBars: [], barsAutohide: false, gaps: 0, animationDurationMs: 0,
   suspendedMonitors: [],
+  overviewAnimationMs: 0, // lane: ui-animation
 };

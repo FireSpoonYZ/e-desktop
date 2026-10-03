@@ -14,22 +14,37 @@ function load(relative) {
 }
 
 const { emptySnapshot } = await load('../src/model.ts');
-const { easeOut, lerpRect, desktopRect, clientArea, clipRect, zoomPlan, zoomSlots } = await load('../src/overview/zoom.ts');
+const { spring, springProgress, lerpRect, desktopRect, clientArea, clipRect, zoomPlan, zoomSlots } = await load('../src/overview/zoom.ts');
 
 const slot = (windowId, rect, clip = rect) => ({ windowId, rect, clip });
 
 test('empty snapshot keeps the logical gap and does not animate before a real snapshot', () => {
   assert.equal(emptySnapshot.gaps, 0);
   assert.equal(emptySnapshot.animationDurationMs, 0);
+  assert.equal(emptySnapshot.overviewAnimationMs, 0);
 });
 
-test('ease-out cubic matches the Rust curve and clamps', () => {
-  assert.equal(easeOut(0), 0);
-  assert.equal(easeOut(1), 1);
-  assert.equal(easeOut(0.5), 0.875);
-  assert.equal(easeOut(-2), 0);
-  assert.equal(easeOut(3), 1);
-  assert.equal(easeOut(Number.NaN), 1);
+test('spring matches the Rust layout curve, ends at rest and clamps', () => {
+  // Same samples as ui_animation::tests::spring_samples_match_the_frontend_port.
+  const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
+  assert.equal(springProgress(0), 0);
+  assert.equal(springProgress(1), 1);
+  close(springProgress(0.5), 0.8206817439418751);
+  close(springProgress(0.25), 0.4490686291202788);
+  assert.equal(springProgress(-2), 0);
+  assert.equal(springProgress(3), 1);
+  assert.equal(springProgress(Number.NaN), 1);
+  // Duration independent, monotonic without overshoot, and at rest at the end.
+  close(spring(100, 300, 0, 0.2, 0.4)[0], 100 + 200 * springProgress(0.5));
+  let previous = 0;
+  for (let step = 1; step <= 100; step++) {
+    const value = springProgress(step / 100);
+    assert.ok(value >= previous && value <= 1, `step ${step}`);
+    previous = value;
+  }
+  assert.deepEqual(spring(0, 1, 5, 1, 1), [1, 0]);
+  assert.ok(Math.abs(spring(0, 1, 0, 0.999999, 1)[1]) < 1e-3);
+  assert.deepEqual(spring(4, 1, 2, 0, 1), [4, 2]);
 });
 
 test('lerp keeps endpoints exact and rounds half away from zero', () => {
@@ -39,7 +54,7 @@ test('lerp keeps endpoints exact and rounds half away from zero', () => {
   assert.deepEqual(lerpRect(from, to, -1), from);
   assert.deepEqual(lerpRect(from, to, 1), to);
   assert.deepEqual(lerpRect(from, to, 4), to);
-  assert.deepEqual(lerpRect(from, to, 0.5), { x: 9, y: 8, width: 30, height: 75 });
+  assert.deepEqual(lerpRect(from, to, 0.5), { x: 8, y: 6, width: 34, height: 73 });
   assert.equal(lerpRect({ x: 0, y: 0, width: 1, height: 1 }, { x: 1, y: 0, width: 1, height: 1 }, 0.05).x, 0);
   assert.equal(lerpRect({ x: 0, y: 0, width: 1, height: 1 }, { x: -1, y: 0, width: 1, height: 1 }, 0.5).x, -1);
 });

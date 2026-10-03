@@ -2,11 +2,31 @@ import { useLayoutEffect, useRef, useState } from 'react';
 import type { MonitorState, Rect, Snapshot } from '../model';
 import type { PreviewSlot } from './previews';
 
-/** 与 Rust `animation::ease` 相同的 ease-out cubic（niri 默认曲线）。 */
-export function easeOut(t: number) {
+/** 与 Rust `animation::spring` 相同：临界阻尼弹簧（ω = 6 / 时长）加结尾 Hermite 修正，
+ * 按配置时长准确停在终点且速度为 0。返回 [位置, 速度]。 */
+export function spring(from: number, to: number, velocity: number, elapsed: number, duration: number): [number, number] {
+  if (elapsed <= 0) return [from, velocity];
+  if (elapsed >= duration) return [to, 0];
+  const omega = 6 / duration;
+  const displacement = from - to;
+  const coefficient = velocity + omega * displacement;
+  const decay = Math.exp(-omega * elapsed);
+  const endDecay = Math.exp(-omega * duration);
+  const residual = (displacement + coefficient * duration) * endDecay;
+  const endVelocity = (velocity - omega * coefficient * duration) * endDecay;
+  const t = elapsed / duration;
+  return [
+    to + (displacement + coefficient * elapsed) * decay
+      - residual * (3 * t * t - 2 * t * t * t) - duration * endVelocity * (t * t * t - t * t),
+    (velocity - omega * coefficient * elapsed) * decay
+      - residual * (6 * t - 6 * t * t) / duration - endVelocity * (3 * t * t - 2 * t),
+  ];
+}
+
+/** 零初速度的弹簧进度（0→1），与时长无关；夹在 [0, 1]，非有限值视为结束。 */
+export function springProgress(t: number) {
   if (!Number.isFinite(t)) return 1;
-  const x = Math.min(1, Math.max(0, t));
-  return 1 - (1 - x) ** 3;
+  return spring(0, 1, 0, Math.min(1, Math.max(0, t)), 1)[0];
 }
 
 /** Rust `f64::round` 半数远离 0；`Math.round` 半数朝 +∞。 */
@@ -18,7 +38,7 @@ function roundAway(value: number) {
 export function lerpRect(from: Rect, to: Rect, t: number): Rect {
   if (!(t > 0)) return from;
   if (t >= 1) return to;
-  const eased = easeOut(t);
+  const eased = springProgress(t);
   const n = (start: number, end: number) => roundAway(start + (end - start) * eased);
   return { x: n(from.x, to.x), y: n(from.y, to.y), width: n(from.width, to.width), height: n(from.height, to.height) };
 }
@@ -110,7 +130,7 @@ export function useOverviewZoom({
   publish: (slots: PreviewSlot[]) => void;
   onDismiss: () => void;
 }) {
-  const animate = previewsAvailable && snapshot.animationDurationMs > 0 && !prefersReducedMotion();
+  const animate = previewsAvailable && snapshot.overviewAnimationMs > 0 && !prefersReducedMotion();
   const [phase, setPhase] = useState<'open' | 'close' | null>(animate ? 'open' : null);
   const mode = useRef<'open' | 'live' | 'close'>(animate ? 'open' : 'live');
   const opened = useRef(false);
@@ -146,7 +166,7 @@ export function useOverviewZoom({
     if (!mounted.current) return;
     const state = live.current;
     const work = workArea(state.monitor);
-    const duration = state.snapshot.animationDurationMs;
+    const duration = state.snapshot.overviewAnimationMs;
     const closing = mode.current === 'close';
     if (!work || !(duration > 0)) {
       if (closing) dismiss();
@@ -202,7 +222,7 @@ export function useOverviewZoom({
     if (!mounted.current || mode.current === 'close') return;
     const state = live.current;
     const work = workArea(state.monitor);
-    if (!state.previewsAvailable || !(state.snapshot.animationDurationMs > 0) || prefersReducedMotion() || !work) {
+    if (!state.previewsAvailable || !(state.snapshot.overviewAnimationMs > 0) || prefersReducedMotion() || !work) {
       dismiss();
       return;
     }

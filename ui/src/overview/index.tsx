@@ -1,13 +1,16 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { OverviewProps, Page, WindowId } from '../model';
 import { useCommand, useSurface } from '../commands/surface';
-import { canInteract, dropCommand, moveCommand, overviewScale, pageGeometry, sizingTarget, trackDrag, trackResize, widthCommand } from './pointer';
+import { canInteract, dropCommand, moveCommand, overviewScale, pageGeometry, sizingTarget, trackDrag, trackResize, wheelZoom, widthCommand } from './pointer';
 import { WindowPreview, usePreviewFeed, usePreviewSlots } from './previews';
 import type { PreviewRequest } from './previews';
 import { useOverviewZoom } from './zoom';
 import { shownTab } from './tabs';
 import './style.css';
+
+/** lane: ui-animation — Ctrl+wheel / pinch zoom, kept while the app runs (each opening remounts). */
+let sessionZoom = 1;
 
 export function Overview({ snapshot, onCommand, onDismiss, busy = false, previewSession = null, syncPreviews }: OverviewProps & {
   previewSession?: number | null; syncPreviews?: PreviewRequest;
@@ -18,9 +21,10 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
   const { run, pending, error } = useCommand(onCommand);
   const [monitorId, setMonitorId] = useState(snapshot.activeMonitor);
   const [availableWidth, setAvailableWidth] = useState(Infinity);
+  const [zoomFactor, setZoomFactor] = useReducer((_: number, next: number) => next, sessionZoom);
   const selected = snapshot.monitors.find(({ monitor }) => monitor.id === monitorId)
     ?? snapshot.monitors.find(({ monitor }) => monitor.id === snapshot.activeMonitor) ?? snapshot.monitors[0];
-  const scale = selected ? overviewScale(selected.monitor.scaleFactor, selected.viewport.width, availableWidth) : .5;
+  const scale = selected ? overviewScale(selected.monitor.scaleFactor, selected.viewport.width, availableWidth, zoomFactor) : .5;
   const ready = snapshot.enabled && snapshot.backend.availability === 'ready' && snapshot.backend.capabilities.placement;
   const blocked = busy || pending;
   const latest = useRef({ snapshot, blocked, run, scale });
@@ -46,6 +50,20 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
     const observer = new ResizeObserver(measure);
     observer.observe(element); measure();
     return () => observer.disconnect();
+  }, [root]);
+  useEffect(() => {
+    const element = root.current;
+    if (!element) return;
+    // Native listener: React's wheel handler is passive and cannot stop the webview zoom.
+    const wheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      if (dragging.current || resizing.current) return;
+      sessionZoom = wheelZoom(sessionZoom, event.deltaY, event.deltaMode);
+      setZoomFactor(sessionZoom);
+    };
+    element.addEventListener('wheel', wheel, { passive: false });
+    return () => element.removeEventListener('wheel', wheel);
   }, [root]);
   const scrollPositions = selected?.pages.map((page) => `${page.id}:${page.viewportX}`).join('|');
   useLayoutEffect(() => {
@@ -154,7 +172,7 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
   };
   return <section ref={root} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={`${id}-title`}
     className="desktop-overview" data-animating={zoom.phase ?? undefined}
-    style={zoom.phase ? { '--overview-ms': `${snapshot.animationDurationMs}ms` } as CSSProperties : undefined}
+    style={zoom.phase ? { '--overview-ms': `${snapshot.overviewAnimationMs}ms` } as CSSProperties : undefined}
     onKeyDown={(event) => {
       if (event.key === 'Escape' && (dragging.current || resizing.current)) {
         event.preventDefault(); event.stopPropagation(); dragging.current?.cancel(); resizing.current?.cancel(); return;
@@ -268,6 +286,6 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
         <button className="overview-add" disabled={blocked || !ready} onClick={() => void run({ type: 'addPage', monitorId: selected.monitor.id })}>＋ 新增工作区</button>
       </section>}
     </div>
-    <footer className="overview-help">滚动浏览工作区 <span>·</span> 拖动窗口移动 <span>·</span> 拖动列边缘调宽 <span>·</span> <kbd>Tab</kbd> 选择，<kbd>Enter</kbd> 进入</footer>
+    <footer className="overview-help">滚动浏览工作区 <span>·</span> <kbd>Ctrl</kbd>+滚轮或捏合缩放 <span>·</span> 拖动窗口移动 <span>·</span> 拖动列边缘调宽 <span>·</span> <kbd>Tab</kbd> 选择，<kbd>Enter</kbd> 进入</footer>
   </section>;
 }

@@ -161,18 +161,22 @@ impl Drop for IpcTraceScope {
 enum Surface {
     Overview,
     Commands,
+    /// lane: ui-animation — hotkey overlay.
+    Hotkeys,
 }
 impl Surface {
     fn label(self) -> &'static str {
         match self {
             Self::Overview => "overview",
             Self::Commands => "commands",
+            Self::Hotkeys => "hotkeys",
         }
     }
     fn parse(value: &str) -> Result<Self, AppError> {
         match value {
             "overview" => Ok(Self::Overview),
             "commands" => Ok(Self::Commands),
+            "hotkeys" => Ok(Self::Hotkeys),
             _ => Err(error(ErrorCode::InvalidCommand, "未知的界面入口。")),
         }
     }
@@ -335,6 +339,8 @@ struct Controller {
     refused: Placements,
     animation: Animation,
     animation_duration: Duration,
+    /// lane: ui-animation — per-kind overrides of `animation_duration`.
+    animations: crate::ui_animation::Animations,
     preview_session: PreviewSession,
     gesture: Option<Gesture>,
     /// A tiled window is being dragged with the modifier (the splitter thread previews it).
@@ -393,6 +399,7 @@ impl Controller {
             animation_duration: Duration::from_millis(u64::from(
                 Config::default().animation_duration_ms,
             )),
+            animations: Config::default().animations,
         };
         if let Err(e) = controller.connect() {
             controller.record(e);
@@ -448,6 +455,9 @@ impl Controller {
         snapshot.errors.extend(self.config_error.clone());
         snapshot.bars_autohide = self.autohide;
         snapshot.animation_duration_ms = self.animation_duration.as_millis() as u32;
+        snapshot.overview_animation_ms = self
+            .animation_for(Some(crate::ui_animation::AnimationKind::OverviewOpenClose))
+            .as_millis() as u32;
         snapshot.pinned_bars = snapshot
             .monitors
             .iter()
@@ -455,6 +465,11 @@ impl Controller {
             .filter(|id| self.bar_pinned(id))
             .collect();
         snapshot
+    }
+
+    /// lane: ui-animation
+    fn animation_for(&self, kind: Option<crate::ui_animation::AnimationKind>) -> Duration {
+        self.animations.duration(kind, self.animation_duration)
     }
 
     fn bar_pinned(&self, monitor_id: &str) -> bool {
@@ -612,6 +627,14 @@ impl Controller {
             {
                 self.animation.discard_stale_focus();
             }
+            // A running plan keeps its length; otherwise windows appeared or went away.
+            let duration = self.animation.duration().unwrap_or_else(|| {
+                self.animation_for(crate::ui_animation::transition_kind(
+                    &prev,
+                    &transition.snapshot,
+                    Some(crate::ui_animation::AnimationKind::WindowOpenClose),
+                ))
+            });
             let (actions, fresh) = crate::animation::poll_refresh(
                 &mut self.animation,
                 &self.placements,
@@ -620,7 +643,7 @@ impl Controller {
                 transition.actions,
                 enumerated.as_deref(),
                 self.ignored_foreground.as_deref(),
-                self.animation_duration,
+                duration,
                 Instant::now(),
             );
             self.note_ignored(fresh, deferred_focus.is_some(), None);
@@ -824,6 +847,7 @@ impl Controller {
         let already_deferred = self.animation.deferred_focus_id().is_some();
         let observed = self.observed_foreground();
         let prev = self.engine.snapshot().clone();
+        let kind = crate::ui_animation::command_kind(&command);
         self.trace.mark("dispatch.enter");
         let result = self.engine.dispatch(command);
         self.trace.mark("dispatch.exit");
@@ -840,12 +864,14 @@ impl Controller {
             .any(|a| matches!(a, NativeAction::Placement { .. }));
         let actions = if animate && layout {
             // Retargets a running animation from the frames currently on screen.
+            let kind = crate::ui_animation::transition_kind(&prev, &transition.snapshot, kind);
+            let duration = self.animation_for(kind);
             self.animation.start(
                 &prev,
                 &transition.snapshot,
                 &self.placements,
                 transition.actions,
-                self.animation_duration,
+                duration,
                 Instant::now(),
             )
         } else {
@@ -1102,10 +1128,12 @@ impl Controller {
     }
 
     fn note_surface(&mut self, surface: Surface, host: Option<String>) {
-        *match surface {
-            Surface::Overview => &mut self.overview_host,
-            Surface::Commands => &mut self.commands_host,
-        } = host;
+        match surface {
+            Surface::Overview => self.overview_host = host,
+            Surface::Commands => self.commands_host = host,
+            // The hotkey overlay does not hold native focus back from the layout.
+            Surface::Hotkeys => {}
+        }
     }
 
     fn foreground_on_paused_display(&self) -> bool {
@@ -1127,6 +1155,7 @@ impl Controller {
             let host = match surface {
                 Surface::Overview => self.overview_host.clone(),
                 Surface::Commands => self.commands_host.clone(),
+                Surface::Hotkeys => None, // lane: ui-animation — not iterated
             };
             let Some(id) = host else { continue };
             if !suspended.iter().any(|paused| paused == &id) {
@@ -1604,6 +1633,7 @@ fn show_surface(
     monitor: Option<&MonitorState>,
     surface: Surface,
     preview_session: Option<u64>,
+    hotkeys: Option<&[crate::config::ShortcutBinding]>,
 ) -> Result<Option<String>, AppError> {
     let window = app
         .get_webview_window(surface.label())
@@ -1612,10 +1642,14 @@ fn show_surface(
         let area = monitor.monitor.work_area;
         let rect = match surface {
             Surface::Overview => area,
-            Surface::Commands => {
+            Surface::Commands | Surface::Hotkeys => {
                 let scale = monitor.monitor.scale_factor;
-                let width = ((640.0 * scale) as u32).min(area.width);
-                let height = ((480.0 * scale) as u32).min(area.height);
+                let (width, height) = match surface {
+                    Surface::Hotkeys => (760.0, 600.0), // lane: ui-animation
+                    _ => (640.0, 480.0),
+                };
+                let width = ((width * scale) as u32).min(area.width);
+                let height = ((height * scale) as u32).min(area.height);
                 Rect {
                     x: area.x + ((area.width - width) / 2) as i32,
                     y: area.y + ((area.height - height) / 3) as i32,
@@ -1626,7 +1660,7 @@ fn show_surface(
         };
         configure_window(&window, rect)?;
     }
-    for label in ["overview", "commands"] {
+    for label in ["overview", "commands", "hotkeys"] {
         if label != surface.label() {
             if let Some(other) = app.get_webview_window(label) {
                 let _ = other.hide();
@@ -1642,7 +1676,12 @@ fn show_surface(
     app.emit_to(
         surface.label(),
         "surface-opened",
-        serde_json::json!({ "monitorId": host, "previewSession": preview_session }),
+        // lane: ui-animation — the hotkey overlay lists the effective (normalized) bindings.
+        serde_json::json!({
+            "monitorId": host,
+            "previewSession": preview_session,
+            "hotkeys": hotkeys,
+        }),
     )
     .map_err(|e| error(ErrorCode::BackendUnavailable, e.to_string()))?;
     Ok(host)
@@ -1705,6 +1744,7 @@ fn reload_config(
                 }
                 controller.animation_duration =
                     Duration::from_millis(u64::from(shortcuts.config.animation_duration_ms));
+                controller.animations = shortcuts.config.animations; // lane: ui-animation
                 Ok(())
             })
             .map_err(|e| {
@@ -1788,6 +1828,8 @@ fn run_controller(
     };
     let mut previous = Vec::new();
     let mut controls = String::new();
+    // lane: ui-animation — the hotkey overlay is shown once, when tiling is first enabled.
+    let mut hotkeys_pending = true;
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
     loop {
         // A deadline, not an idle timeout: queued commands cannot starve config reloads.
@@ -1879,6 +1921,18 @@ fn run_controller(
                     )),
                     Some(ShortcutAction::Overview {}) => Ok(Request::Show(Surface::Overview, None)),
                     Some(ShortcutAction::Commands {}) => Ok(Request::Show(Surface::Commands, None)),
+                    // lane: ui-animation — pressing the key again closes the overlay.
+                    Some(ShortcutAction::HotkeyOverlay {}) => Ok(
+                        if app
+                            .get_webview_window(Surface::Hotkeys.label())
+                            .and_then(|w| w.is_visible().ok())
+                            .unwrap_or(false)
+                        {
+                            Request::Dismiss(Surface::Hotkeys, IpcTrace::begin("shortcut.dismiss"))
+                        } else {
+                            Request::Show(Surface::Hotkeys, None)
+                        },
+                    ),
                     Some(ShortcutAction::Quit {}) => Ok(Request::Quit),
                     _ => continue,
                 }
@@ -1920,6 +1974,14 @@ fn run_controller(
                     });
                 }
                 controller.trace = IpcTrace::NONE;
+                // lane: ui-animation
+                if crate::ui_animation::hotkeys_at_first_enable(
+                    &mut hotkeys_pending,
+                    controller.engine.snapshot().enabled,
+                    shortcuts.config.hotkey_overlay,
+                ) {
+                    let _ = sender.try_send(Request::Show(Surface::Hotkeys, None));
+                }
             }
             Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
             Ok(Request::PinBar(monitor_id, pinned)) => {
@@ -1948,9 +2010,8 @@ fn run_controller(
                         controller.native_move = None;
                         controller.placements.remove(id);
                     }
-                    // Moved windows slide into place; boundary drags resize once, unanimated.
-                    let animate = matches!(drop.command, Command::DropWindow { .. });
-                    if let Err(issue) = controller.run(drop.command, animate) {
+                    // Moved windows slide into place; released boundaries resize animated.
+                    if let Err(issue) = controller.run(drop.command, true) {
                         controller.record(issue);
                     }
                 }
@@ -1990,14 +2051,14 @@ fn run_controller(
                 let available =
                     matches!(surface, Surface::Overview) && controller.preview_capable();
                 let session = controller.preview_session.begin(available);
-                match show_surface(&app, host, surface, session) {
+                let hotkeys = matches!(surface, Surface::Hotkeys)
+                    .then_some(shortcuts.config.shortcuts.as_slice());
+                match show_surface(&app, host, surface, session, hotkeys) {
                     Ok(host) => {
+                        // Showing one surface hides the others.
+                        controller.note_surface(Surface::Overview, None);
+                        controller.note_surface(Surface::Commands, None);
                         controller.note_surface(surface, host);
-                        let other = match surface {
-                            Surface::Overview => Surface::Commands,
-                            Surface::Commands => Surface::Overview,
-                        };
-                        controller.note_surface(other, None);
                     }
                     Err(issue) => {
                         controller.clear_previews();
@@ -2024,12 +2085,17 @@ fn run_controller(
                 if matches!(surface, Surface::Overview) {
                     controller.clear_previews();
                 }
+                // lane: ui-animation — a hotkey overlay that lost focus to a click elsewhere
+                // must not pull focus back to the layout's window.
+                let mut handoff = true;
                 if let Some(window) = app.get_webview_window(surface.label()) {
+                    handoff = !matches!(surface, Surface::Hotkeys)
+                        || window.is_focused().unwrap_or(false);
                     let _hide = trace.scope("surface.hide.enter", "surface.hide.exit");
                     let _ = window.hide();
                 }
                 let current = controller.snapshot(shortcuts.available());
-                if current.enabled && current.backend.capabilities.focus {
+                if handoff && current.enabled && current.backend.capabilities.focus {
                     if let Some(window_id) = current.focused_window {
                         if let Err(issue) = controller.command(Command::FocusWindow { window_id }) {
                             controller.record(issue);
@@ -2133,6 +2199,10 @@ pub fn run() {
                         Surface::Commands,
                         IpcTrace::begin("native.dismiss_surface"),
                     ),
+                    "hotkeys" => Request::Dismiss(
+                        Surface::Hotkeys,
+                        IpcTrace::begin("native.dismiss_surface"),
+                    ),
                     _ => Request::Quit,
                 };
                 let _ = send(&state, request);
@@ -2194,6 +2264,7 @@ mod tests {
             config_error: None, window_rules: vec![], placements: Placements::new(),
             refused: Placements::new(), animation: Animation::default(),
             animation_duration: Duration::from_millis(160),
+            animations: Default::default(),
             preview_session: PreviewSession::default(), gesture: None, window_drag: false,
             hovered: None, in_corner: false, top_bar: true, native_drag: None,
             native_move: None, ignored_foreground: None, refresh_soon: None,

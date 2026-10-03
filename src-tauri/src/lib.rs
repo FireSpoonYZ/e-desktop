@@ -13,3 +13,5 @@ pub mod preview;
 
 #[cfg(feature = "desktop")]
 pub mod terminal;
+
+pub mod ui_animation; // lane: ui-animation
