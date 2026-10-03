@@ -2,6 +2,8 @@
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{Backend, hook, splitter};
+#[cfg(target_os = "windows")]
+pub use windows::tabs; // lane: tabbed
 
 #[cfg(target_os = "linux")]
 mod linux;

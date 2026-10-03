@@ -81,6 +81,9 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
   const pageName = /^\s*(?:命名|name)\s+(.+)$/iu.exec(query)?.[1].trim();
   if (pageName) add(`命名当前页面为 ${pageName} Name page`, { type: 'setPageName', name: pageName }, managed, '当前显示器的活动页面');
   add('取消页面命名 Unset page name', { type: 'unsetPageName' }, managed, '当前显示器的活动页面');
+  // lane: tabbed
+  add('切换标签列 Tabbed column', { type: 'toggleColumnTabbedDisplay' }, focused && !!window && !window.floating,
+    '当前聚焦列 · 标签显示 / 纵向堆叠');
   const words = query.normalize('NFKC').toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return actions.filter(({ label, detail }) => {
     const text = `${label} ${detail}`.normalize('NFKC').toLocaleLowerCase();

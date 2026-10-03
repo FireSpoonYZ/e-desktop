@@ -83,3 +83,9 @@
   .overview-monitors button { padding: 6px; font-size: 11px; }
   .overview-help { line-height: 1.8; }
 }
+/* lane: tabbed：标签列只显示当前标签，上方一排标签按钮。 */
+.overview-tabs { display: flex; gap: 2px; flex-shrink: 0; min-width: 0; }
+.overview-tabs button { flex: 1 1 0; min-width: 0; padding: 2px 6px; border: 0; border-radius: 0; background: #343434; color: var(--muted); font-size: 10px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.overview-tabs button[aria-selected="true"] { background: var(--focus); color: #191919; }
+.desktop-overview[data-animating] .overview-tabs { animation: var(--overview-fade, none) var(--overview-ms, 160ms) ease-in-out both; }
+@media (prefers-reduced-motion: reduce) { .desktop-overview[data-animating] .overview-tabs { animation: none; } }

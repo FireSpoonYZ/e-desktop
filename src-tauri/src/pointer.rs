@@ -105,6 +105,8 @@ mod tests {
                     id: "c".into(),
                     width: 400,
                     windows: vec!["w".into()],
+                    display: ColumnDisplay::Normal,
+                    active_tab: None,
                 }],
                 floating_windows: vec![],
                 viewport_x: 0,

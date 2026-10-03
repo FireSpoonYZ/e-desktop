@@ -102,6 +102,10 @@ impl Engine {
                     continue;
                 };
                 let active = active.contains(id);
+                // lane: tabbed. A tab behind the shown one is not pushed off screen.
+                if minimized && tabbed::shown_tab(column).is_some_and(|shown| shown != id) {
+                    continue;
+                }
                 if minimized {
                     if active || shown.contains(id) {
                         scene.marks.push(Mark {
@@ -116,7 +120,7 @@ impl Engine {
                 // Label the column's real width. A 100% column scrolled halfway is still 100%,
                 // not the clipped slice (that would look like a resize).
                 let w = percent(width, area.width);
-                let label = if column.windows.len() > 1 {
+                let label = if column.windows.len() > 1 && tabbed::shown_tab(column).is_none() {
                     format!("{w}% × {}%", percent(height.into(), area.height))
                 } else {
                     format!("{w}%")

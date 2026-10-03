@@ -173,7 +173,11 @@ pub fn strips(engine: &Engine) -> Vec<Strip> {
         for (c, column) in page.columns.iter().enumerate() {
             let from = (i64::from(inner.x) + edge_position(&widths, x, c) + size / 2).max(left);
             let to = (i64::from(inner.x) + edge_position(&widths, x, c + 1) - size / 2).min(right);
-            if column.windows.len() < 2 || to <= from {
+            // lane: tabbed. Tabs share one slot: no row boundaries.
+            if column.windows.len() < 2
+                || to <= from
+                || column.display == crate::model::ColumnDisplay::Tabbed
+            {
                 continue;
             }
             let mut y = i64::from(inner.y);

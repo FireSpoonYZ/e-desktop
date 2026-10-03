@@ -13,6 +13,7 @@ mod rules;
 pub mod scene;
 
 mod sizing;
+pub mod tabbed; // lane: tabbed
 
 /// Monitor/page indices plus optional column/row (None for floating windows).
 type WindowLocation = (usize, usize, Option<(usize, usize)>);
@@ -68,6 +69,8 @@ pub struct Engine {
     stale_native_focus: Option<WindowId>,
     // lane: layout-options
     layout_options: options::LayoutState,
+    /// lane: tabbed. Display mode of newly created columns.
+    default_column_display: ColumnDisplay,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -231,6 +234,7 @@ impl Engine {
             previous_pages: BTreeMap::new(),
             stale_native_focus: None,
             layout_options: Default::default(), // lane: layout-options
+            default_column_display: ColumnDisplay::Normal,
         }
     }
 
@@ -319,7 +323,8 @@ impl Engine {
             | Command::ToggleFullscreen
             | Command::CycleWidthBack
             | Command::CycleWindowHeight
-            | Command::MaximizeColumn => {
+            | Command::MaximizeColumn
+            | Command::ToggleColumnTabbedDisplay => {
                 self.snapshot.focused_window.as_deref().is_some_and(win)
             }
             _ => false,
@@ -366,6 +371,8 @@ impl Engine {
             id: self.id("column"),
             width: width.max(1),
             windows: vec![window],
+            display: self.default_column_display,
+            active_tab: None,
         }
     }
 
@@ -870,6 +877,8 @@ impl Engine {
                 id: slot.column_id,
                 width: slot.width.max(1),
                 windows: vec![slot.id],
+                display: self.default_column_display,
+                active_tab: None,
             },
         );
     }
@@ -977,6 +986,7 @@ impl Engine {
                     &w.native.id == window && (!w.native.minimized || w.native.minimized_by_manager)
                 })
         });
+        self.sync_active_tabs();
         if let Some(id) = self.snapshot.focused_window.clone() {
             self.remember_column_focus(&id);
         }
@@ -985,10 +995,12 @@ impl Engine {
     fn remember_column_focus(&mut self, id: &str) {
         if self.navigable(id) {
             if let Ok((m, p, Some((c, _)))) = self.location(id) {
-                self.column_focus.insert(
-                    self.snapshot.monitors[m].pages[p].columns[c].id.clone(),
-                    id.into(),
-                );
+                let column = &mut self.snapshot.monitors[m].pages[p].columns[c];
+                // lane: tabbed. Focusing a tab makes it the shown one.
+                if column.display == ColumnDisplay::Tabbed {
+                    column.active_tab = Some(id.into());
+                }
+                self.column_focus.insert(column.id.clone(), id.into());
             }
         }
     }
@@ -1534,6 +1546,7 @@ impl Engine {
             Command::MaximizeColumn => self.toggle_maximize_column()?,
             Command::SetPageName { name } => self.set_page_name(&name)?,
             Command::UnsetPageName => self.unset_page_name()?,
+            Command::ToggleColumnTabbedDisplay => self.toggle_column_tabbed_display()?,
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
         self.cleanup();
@@ -1652,6 +1665,35 @@ impl Engine {
                 let uncovered = self.uncovered_monitors(&monitor.monitor.id);
                 let mut x = monitor.viewport.x as i64 - page.viewport_x as i64;
                 for column in &page.columns {
+                    // lane: tabbed. One window shown below the indicator; the others hidden.
+                    if let Some(shown) = tabbed::shown_tab(column) {
+                        let tile = inset_gap(
+                            Rect {
+                                x: coordinate(x),
+                                y: monitor.viewport.y,
+                                width: column.width,
+                                height: monitor.viewport.height,
+                            },
+                            half,
+                        );
+                        let (_, rect) = tabbed::split_tab_bar(tile, monitor.monitor.scale_factor);
+                        for id in &column.windows {
+                            self.place(&mut actions, id, rect, outer, &uncovered, active, fullscreen);
+                            if let Some(NativeAction::Placement {
+                                window_id,
+                                clip,
+                                minimized,
+                                ..
+                            }) = actions.last_mut().filter(|_| id != shown)
+                            {
+                                if window_id == id {
+                                    (*clip, *minimized) = (None, true);
+                                }
+                            }
+                        }
+                        x += column.width as i64;
+                        continue;
+                    }
                     let heights = self.column_heights(column, monitor.viewport.height);
                     let mut y = monitor.viewport.y as i64;
                     for (id, height) in column.windows.iter().zip(heights) {

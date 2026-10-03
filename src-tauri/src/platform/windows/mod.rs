@@ -4,6 +4,7 @@ pub mod hook;
 pub mod preview;
 mod snapshot;
 pub mod splitter;
+pub mod tabs; // lane: tabbed
 use crate::model::*;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

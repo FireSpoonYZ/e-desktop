@@ -65,6 +65,22 @@ pub struct Column {
     pub width: u32,
     /// Top-to-bottom order within this column.
     pub windows: Vec<WindowId>,
+    /// lane: tabbed. Absent in older snapshots means normal.
+    #[serde(default)]
+    pub display: ColumnDisplay,
+    /// lane: tabbed. The one window a tabbed column shows; the engine keeps it in sync with
+    /// the column's focus memory. None for normal columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<WindowId>,
+}
+
+/// lane: tabbed. niri column display: stacked rows, or tabs showing one window at a time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ColumnDisplay {
+    #[default]
+    Normal,
+    Tabbed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +357,8 @@ pub enum Command {
         name: String,
     },
     UnsetPageName,
+    /// lane: tabbed. Switch the focused window's column between normal and tabbed display.
+    ToggleColumnTabbedDisplay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -242,6 +242,10 @@ impl Engine {
                     (c, None)
                 } else if x >= right - quarter {
                     (c + 1, None)
+                } else if let Some(shown) = super::tabbed::shown_tab(column) {
+                    // lane: tabbed. A new tab goes right after the shown one.
+                    let at = column.windows.iter().position(|id| id == shown).unwrap();
+                    (c, Some(at + 1))
                 } else {
                     let mut top = viewport.y as i64;
                     let mut row = column.windows.len();

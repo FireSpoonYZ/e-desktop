@@ -30,7 +30,15 @@ export interface SystemSnapshot {
   focusedWindow: WindowId | null;
 }
 export interface WindowState { native: NativeWindow; floating: boolean; fullscreen: boolean }
-export interface Column { id: ColumnId; width: number; windows: WindowId[] }
+/** lane: tabbed. niri column display: stacked rows or one shown tab. */
+export type ColumnDisplay = 'normal' | 'tabbed';
+export interface Column {
+  id: ColumnId; width: number; windows: WindowId[];
+  /** lane: tabbed. Absent means normal. */
+  display?: ColumnDisplay;
+  /** lane: tabbed. The window a tabbed column shows. */
+  activeTab?: WindowId;
+}
 export interface Page {
   id: PageId;
   name: string;
@@ -130,7 +138,9 @@ export type Command =
   | { type: 'cycleWindowHeight' }
   | { type: 'maximizeColumn' }
   | { type: 'setPageName'; name: string }
-  | { type: 'unsetPageName' };
+  | { type: 'unsetPageName' }
+  /** lane: tabbed */
+  | { type: 'toggleColumnTabbedDisplay' };
 export type ErrorCode = 'notImplemented' | 'unsupportedSession' | 'backendUnavailable' | 'permissionRequired' | 'windowGone' | 'operationDenied' | 'invalidCommand';
 export interface AppError { code: ErrorCode; message: string; windowId: WindowId | null }
 export type NativeAction =

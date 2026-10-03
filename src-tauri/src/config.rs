@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layout::options::{CenterFocusedColumn, NamedWorkspace, PresetSize, Struts},
-    model::{Command, Direction, Snapshot},
+    model::{ColumnDisplay, Command, Direction, Snapshot},
     rules::WindowRule,
 };
 
@@ -48,6 +48,8 @@ pub struct Config {
     pub struts: Struts,
     /// Named pages created at startup that are kept while empty.
     pub workspaces: Vec<NamedWorkspace>,
+    /// lane: tabbed. Display mode of newly created columns.
+    pub default_column_display: ColumnDisplay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +251,8 @@ enum StrictCommand {
         name: String,
     },
     UnsetPageName {},
+    // lane: tabbed
+    ToggleColumnTabbedDisplay {},
 }
 
 impl Default for Config {
@@ -274,6 +278,8 @@ impl Default for Config {
             always_center_single_column: false,
             struts: Struts::default(),
             workspaces: vec![],
+            // lane: tabbed
+            default_column_display: ColumnDisplay::Normal,
         }
     }
 }
@@ -408,6 +414,13 @@ impl Config {
                 ShortcutAction::Command { command },
             );
         }
+        // lane: tabbed
+        bind(
+            "Control+Alt+W".into(),
+            ShortcutAction::Command {
+                command: Command::ToggleColumnTabbedDisplay,
+            },
+        );
         shortcuts
     }
 
@@ -625,7 +638,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 64);
+        assert_eq!(Config::builtin_shortcuts().len(), 65);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -689,7 +702,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 64);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 65);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -697,7 +710,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 64);
+        assert_eq!(config.shortcuts.len(), 65);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(

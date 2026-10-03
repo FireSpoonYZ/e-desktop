@@ -164,7 +164,8 @@ impl Engine {
             .ok_or_else(|| invalid("Column does not exist"))?;
         let windows = column.windows.clone();
         let rows = windows.len();
-        if edge == 0 || edge >= rows {
+        // lane: tabbed. Tabs share one slot; there is no boundary between them.
+        if edge == 0 || edge >= rows || tabbed::shown_tab(column).is_some() {
             return Err(invalid("Row boundary does not exist"));
         }
         let total = monitor.viewport.height;
@@ -205,6 +206,8 @@ impl Engine {
                 id: self.id("column"),
                 width,
                 windows: expelled.clone(),
+                display: self.default_column_display,
+                active_tab: None,
             };
             self.queue_column(m, p, column, right);
             if before.as_ref().is_some_and(|f| expelled.contains(f)) {

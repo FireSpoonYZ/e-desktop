@@ -409,6 +409,7 @@ impl Controller {
         engine.set_window_rules(self.window_rules.clone())?;
         engine.set_gaps(gaps);
         engine.set_layout_options(layout_options);
+        engine.set_default_column_display(self.engine.default_column_display()); // lane: tabbed
         self.engine = engine;
         self.backend = Some(backend);
         Ok(())
@@ -924,7 +925,11 @@ impl Controller {
     #[cfg(target_os = "windows")]
     fn sprites(&self) -> Vec<crate::animation::Sprite> {
         let mut sprites = self.animation.sprites();
-        sprites.retain(|sprite| !self.engine.window_protected(&sprite.window_id));
+        // lane: tabbed. Tabs hidden behind the shown one are never drawn.
+        sprites.retain(|sprite| {
+            !self.engine.window_protected(&sprite.window_id)
+                && !self.engine.hidden_tab(&sprite.window_id)
+        });
         let snapshot = self.engine.snapshot();
         let areas: Vec<Rect> = sprites.iter().map(|s| s.bounds).collect();
         for monitor in snapshot.monitors.iter().filter(|monitor| {
@@ -946,7 +951,7 @@ impl Controller {
             };
             let tiled = page.columns.iter().flat_map(|c| c.windows.iter());
             for id in tiled.chain(page.floating_windows.iter()) {
-                if sprites.iter().any(|s| &s.window_id == id) {
+                if sprites.iter().any(|s| &s.window_id == id) || self.engine.hidden_tab(id) {
                     continue;
                 }
                 let rect = match self.placements.get(id) {
@@ -1691,6 +1696,9 @@ fn reload_config(
                 controller
                     .engine
                     .set_layout_options((&shortcuts.config).into()); // lane: layout-options
+                controller
+                    .engine
+                    .set_default_column_display(shortcuts.config.default_column_display); // lane: tabbed
                 controller.top_bar = shortcuts.config.top_bar;
                 if !controller.top_bar {
                     controller.revealed.clear();
@@ -1764,6 +1772,20 @@ fn run_controller(
         .map_err(|issue| controller.record(issue))
         .ok()
     };
+    // lane: tabbed. A click on a tab indicator focuses that tab through the command queue.
+    #[cfg(target_os = "windows")]
+    let _tabs = {
+        let sender = sender.clone();
+        crate::platform::tabs::start(Box::new(move |command| {
+            let _ = sender.try_send(Request::Command(
+                command,
+                None,
+                IpcTrace::begin("tabs.click"),
+            ));
+        }))
+        .map_err(|issue| controller.record(issue))
+        .ok()
+    };
     let mut previous = Vec::new();
     let mut controls = String::new();
     let mut next_refresh = Instant::now() + REFRESH_INTERVAL;
@@ -1830,6 +1852,8 @@ fn run_controller(
             // Publish pause state before SYNC can inspect the configured strips.
             splitter::publish(controller.engine.clone());
             controller.sync_edges(surface_open);
+            // lane: tabbed
+            crate::platform::tabs::configure(crate::layout::tabbed::tab_bars(&controller.engine));
             controller.sync_decorations(&shortcuts.config);
         }
         let next_deadline = controller

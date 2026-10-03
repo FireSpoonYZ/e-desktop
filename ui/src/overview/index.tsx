@@ -6,6 +6,7 @@ import { canInteract, dropCommand, moveCommand, overviewScale, pageGeometry, siz
 import { WindowPreview, usePreviewFeed, usePreviewSlots } from './previews';
 import type { PreviewRequest } from './previews';
 import { useOverviewZoom } from './zoom';
+import { shownTab } from './tabs';
 import './style.css';
 
 export function Overview({ snapshot, onCommand, onDismiss, busy = false, previewSession = null, syncPreviews }: OverviewProps & {
@@ -126,6 +127,19 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
       </button>
     </article>;
   };
+  // lane: tabbed. A tabbed column shows only its active tab, under a strip of every tab; a click switches tabs.
+  const tabGroup = (windowIds: WindowId[], shown: WindowId) => <>
+    <div className="overview-tabs" role="tablist" aria-label={`标签列 · ${windowIds.length} 个标签`}>
+      {windowIds.map((windowId, index) => {
+        const title = windows.get(windowId)?.native.title || '无标题窗口';
+        return <button key={windowId} role="tab" aria-selected={windowId === shown}
+          title={`标签 ${index + 1}/${windowIds.length} · ${title}`}
+          disabled={blocked || !ready || !snapshot.backend.capabilities.focus}
+          onClick={() => void run({ type: 'focusWindow', windowId })}>{title}</button>;
+      })}
+    </div>
+    {card(shown)}
+  </>;
   const moveControl = (windowId: WindowId, page: Page) => {
     const native = windows.get(windowId)?.native;
     if (!native) return null;
@@ -190,8 +204,9 @@ export function Overview({ snapshot, onCommand, onDismiss, busy = false, preview
                   const windowId = column.windows.find((id) => sizingTarget(snapshot, id));
                   const width = preview?.columnId === column.id ? preview.width : column.width;
                   const disabled = blocked || !ready || !windowId;
+                  const shown = shownTab(column);
                   return <div key={column.id} className="overview-column" style={{ width: width * scale }}>
-                    {column.windows.map(card)}
+                    {shown ? tabGroup(column.windows, shown) : column.windows.map(card)}
                     <button className="overview-resize" aria-label={`拖动调整列 ${column.id} 宽度；也可展开调整布局使用列宽输入框`}
                       disabled={disabled} tabIndex={-1}
                       onLostPointerCapture={() => resizing.current?.cancel()}
