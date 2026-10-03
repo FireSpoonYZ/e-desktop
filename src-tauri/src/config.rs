@@ -60,6 +60,9 @@ pub struct Config {
     pub wheel_modifier: Option<WheelModifier>,
     /// Precision-touchpad finger count (3 or 4) for swipe gestures; null disables. Windows only.
     pub touchpad_gesture_fingers: Option<u8>,
+    // lane: persistence-ipc
+    /// The first enable after startup rebuilds the layout saved in `layout-state.json`.
+    pub restore_layout: bool,
 }
 
 // lane: input-gestures
@@ -317,6 +320,8 @@ impl Default for Config {
             // lane: input-gestures
             wheel_modifier: Some(WheelModifier::Super),
             touchpad_gesture_fingers: None,
+            // lane: persistence-ipc
+            restore_layout: true,
         }
     }
 }

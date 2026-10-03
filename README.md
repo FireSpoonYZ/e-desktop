@@ -99,5 +99,6 @@ powershell -NoProfile -File scripts/windows-smoke.ps1
 - [niri UI 对齐与多屏实机检查](docs/validation/windows-2026-09-26-niri-ui.md)
 - [Windows 后端边界与人工检查](src-tauri/src/platform/windows/SMOKE.md)
 - [macOS 接入与验证步骤](src-tauri/src/platform/macos/README.md)
+- [外部 IPC 与命令行客户端](docs/ipc.md)
 
 当前不是系统合成器。独立弹窗、应用自定义窗口区域、提权窗口、挂起进程及异常终止都可能影响管理效果；强制结束进程或系统崩溃时不能保证恢复。尚未完成任意第三方应用、显示器热插拔、真实 IME、Linux/macOS 目标机和恢复失败交互的全面验证。

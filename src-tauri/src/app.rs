@@ -28,6 +28,9 @@ use crate::{
 
 #[cfg(target_os = "windows")]
 use crate::platform::splitter;
+// lane: persistence-ipc
+mod ipc_server;
+use crate::layout::persistence::{LayoutStateFile, state_path};
 #[cfg(target_os = "windows")]
 mod controller_queue;
 // lane: input-gestures
@@ -204,6 +207,9 @@ enum Request {
     #[cfg(target_os = "windows")]
     Edges,
     Quit,
+    // lane: persistence-ipc
+    /// An IPC client ran a shortcut action; resolved like a pressed shortcut.
+    ShortcutAction(ShortcutAction),
 }
 
 struct AppState {
@@ -1783,6 +1789,11 @@ fn run_controller(
         .normalize_keys(normalize_key)
         .expect("valid default shortcuts");
     let mut shortcuts = Shortcuts::new(defaults);
+    // lane: persistence-ipc
+    let mut layout_state = LayoutStateFile::new(state_path(&config_path));
+    if let Err(issue) = ipc_server::start(sender.clone(), shared.clone()) {
+        controller.record(issue);
+    }
     let mut config_file = ConfigFile::new(config_path);
     // Install the requested map first; an invalid startup file falls back to defaults.
     if let Some(Err(issue)) = reload_config(
@@ -1897,6 +1908,11 @@ fn run_controller(
             let _ = app.emit("snapshot", &snapshot);
             previous = fingerprint;
         }
+        // lane: persistence-ipc
+        ipc_server::publish_config(&shortcuts.config);
+        if let Err(issue) = layout_state.observe(&controller.engine, Instant::now()) {
+            controller.record(layout_state_error(&layout_state, issue));
+        }
         #[cfg(target_os = "windows")]
         {
             controller.conceal_suspended_surfaces(&app);
@@ -1919,10 +1935,15 @@ fn run_controller(
             .deadline()
             .map_or(next_refresh, |frame| frame.min(next_refresh));
         let request = match receive_request(&receiver, next_deadline) {
-            Ok(Request::Shortcut(key)) => {
-                let Some(action) = shortcuts.action(&key).cloned() else {
-                    continue;
-                };
+            // lane: persistence-ipc
+            Ok(Request::Shortcut(key)) => match shortcuts.action(&key) {
+                Some(action) => Ok(Request::ShortcutAction(action.clone())),
+                None => continue,
+            },
+            request => request,
+        };
+        let request = match request {
+            Ok(Request::ShortcutAction(action)) => {
                 let suspended = controller.engine.snapshot().suspended_monitors.clone();
                 if controller.foreground_on_paused_display()
                     && crate::config::foreground_blocks_shortcut(&action, &suspended)
@@ -1969,8 +1990,34 @@ fn run_controller(
                             .unwrap_or_default();
                     }
                 }
+                // lane: persistence-ipc
+                let restored = if command == Command::Enable {
+                    let allowed = shortcuts.config.restore_layout;
+                    layout_state
+                        .restore(&mut controller.engine, allowed)
+                        .unwrap_or_else(|issue| {
+                            controller.record(layout_state_error(&layout_state, issue));
+                            0
+                        })
+                } else {
+                    0
+                };
                 let before = controller.engine.snapshot().focused_window.clone();
                 let result = controller.command(command);
+                // lane: persistence-ipc
+                // Native focus follows the restored focus; the next poll would otherwise adopt
+                // whatever window the OS has in front.
+                if let Some(window_id) = controller
+                    .engine
+                    .snapshot()
+                    .focused_window
+                    .clone()
+                    .filter(|_| result.is_ok() && restored > 0)
+                {
+                    if let Err(issue) = controller.command(Command::FocusWindow { window_id }) {
+                        controller.record(issue);
+                    }
+                }
                 if let Err(issue) = &result {
                     controller.record(issue.clone());
                 } else if shortcuts.config.warp_mouse_to_focus {
@@ -2000,6 +2047,8 @@ fn run_controller(
                 }
             }
             Ok(Request::Shortcut(_)) => unreachable!("shortcut resolved above"),
+            // lane: persistence-ipc
+            Ok(Request::ShortcutAction(_)) => unreachable!("shortcut action resolved above"),
             Ok(Request::PinBar(monitor_id, pinned)) => {
                 // Unpinning under the pointer keeps the bar until the pointer leaves it.
                 if pinned {
@@ -2121,6 +2170,10 @@ fn run_controller(
                 controller.trace = IpcTrace::NONE;
             }
             Ok(Request::Quit) => {
+                // lane: persistence-ipc
+                if let Err(issue) = layout_state.flush() {
+                    eprintln!("{}", layout_state_error(&layout_state, issue).message);
+                }
                 if controller.stop().is_ok() {
                     app.state::<AppState>()
                         .can_exit
@@ -2137,6 +2190,10 @@ fn run_controller(
                 }
             }
             Err(ReceiveError::Disconnected) => {
+                // lane: persistence-ipc
+                if let Err(issue) = layout_state.flush() {
+                    eprintln!("{}", layout_state_error(&layout_state, issue).message);
+                }
                 if let Err(issue) = controller.stop() {
                     eprintln!("窗口控制器停止时还原失败：{}", issue.message);
                 }
@@ -2156,6 +2213,14 @@ fn run_controller(
             }
         }
     }
+}
+
+// lane: persistence-ipc
+fn layout_state_error(file: &LayoutStateFile, issue: String) -> AppError {
+    error(
+        ErrorCode::InvalidCommand,
+        format!("布局状态 {}：{issue}，已忽略。", file.path.display()),
+    )
 }
 
 pub fn run() {

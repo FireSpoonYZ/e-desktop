@@ -1,0 +1,10 @@
+[package]
+name = "e-desktop-msg"
+version = "0.1.0"
+edition = "2024"
+description = "Console client for the e-desktop IPC endpoint"
+
+[dependencies]
+# Only the protocol and transport; the GUI stack stays out of this console binary.
+e-desktop = { path = "../src-tauri", default-features = false }
+serde_json = "1"

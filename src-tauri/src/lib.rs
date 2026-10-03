@@ -4,6 +4,8 @@ pub mod app;
 pub mod config;
 // lane: input-gestures
 pub mod gestures;
+// lane: persistence-ipc
+pub mod ipc;
 pub mod layout;
 pub mod model;
 pub mod platform;

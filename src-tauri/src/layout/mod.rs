@@ -9,6 +9,8 @@ mod layout_actions; // lane: layout-actions
 mod input_gestures;
 mod monitors;
 pub mod options; // lane: layout-options
+// lane: persistence-ipc
+pub mod persistence;
 mod pointer;
 pub use pointer::top_band;
 mod rules;

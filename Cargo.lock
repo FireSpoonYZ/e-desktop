@@ -733,6 +733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "e-desktop-msg"
+version = "0.1.0"
+dependencies = [
+ "e-desktop",
+ "serde_json",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
