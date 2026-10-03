@@ -84,6 +84,9 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
   // lane: tabbed
   add('切换标签列 Tabbed column', { type: 'toggleColumnTabbedDisplay' }, focused && !!window && !window.floating,
     '当前聚焦列 · 标签显示 / 纵向堆叠');
+  // lane: input-gestures
+  add('视图对齐到最近的列 Snap to column', { type: 'snapViewport', monitorId: target?.monitor.id ?? '', delta: 0 }, !!target,
+    `${target?.monitor.name ?? '无可用显示器'} · 对齐列边缘并聚焦该列`);
   const words = query.normalize('NFKC').toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return actions.filter(({ label, detail }) => {
     const text = `${label} ${detail}`.normalize('NFKC').toLocaleLowerCase();

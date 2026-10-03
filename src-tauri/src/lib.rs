@@ -2,6 +2,8 @@ pub mod animation;
 #[cfg(feature = "desktop")]
 pub mod app;
 pub mod config;
+// lane: input-gestures
+pub mod gestures;
 pub mod layout;
 pub mod model;
 pub mod platform;

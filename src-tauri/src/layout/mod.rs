@@ -5,6 +5,8 @@ use crate::rules::WindowRule;
 
 pub mod edges;
 mod layout_actions; // lane: layout-actions
+// lane: input-gestures
+mod input_gestures;
 mod monitors;
 pub mod options; // lane: layout-options
 mod pointer;
@@ -1547,6 +1549,13 @@ impl Engine {
             Command::SetPageName { name } => self.set_page_name(&name)?,
             Command::UnsetPageName => self.unset_page_name()?,
             Command::ToggleColumnTabbedDisplay => self.toggle_column_tabbed_display()?,
+            // lane: input-gestures
+            Command::DragViewport { monitor_id, delta } => {
+                self.drag_viewport(&monitor_id, delta)?;
+            }
+            Command::SnapViewport { monitor_id, delta } => {
+                focus_action = self.snap_viewport(&monitor_id, delta)?;
+            }
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
         self.cleanup();

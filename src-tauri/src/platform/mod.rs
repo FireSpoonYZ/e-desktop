@@ -4,6 +4,9 @@ mod windows;
 pub use windows::{Backend, hook, splitter};
 #[cfg(target_os = "windows")]
 pub use windows::tabs; // lane: tabbed
+// lane: input-gestures
+#[cfg(target_os = "windows")]
+pub use windows::input_gestures;
 
 #[cfg(target_os = "linux")]
 mod linux;

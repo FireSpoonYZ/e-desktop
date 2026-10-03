@@ -1,6 +1,8 @@
 //! Win32 backend. Poll on the owning thread; no hooks or desktop mutation at construction.
 mod compositor;
 pub mod hook;
+// lane: input-gestures
+pub mod input_gestures;
 pub mod preview;
 mod snapshot;
 pub mod splitter;

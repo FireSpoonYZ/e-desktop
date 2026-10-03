@@ -54,6 +54,21 @@ pub enum Raw {
     },
     /// A managed window was destroyed or hidden, or a new top-level window was shown.
     Windows,
+    // lane: input-gestures
+    /// A swallowed modifier + wheel event; `delta` > 0 is up, or right when `horizontal`.
+    Wheel {
+        x: i32,
+        y: i32,
+        delta: i32,
+        horizontal: bool,
+        time: u32,
+    },
+    /// A touchpad swipe step with the pointer at (x, y).
+    Swipe {
+        x: i32,
+        y: i32,
+        swipe: crate::gestures::Swipe,
+    },
 }
 
 #[derive(Default)]
@@ -89,10 +104,25 @@ thread_local! {
     static ZONE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-fn push(event: Raw) {
+pub(super) fn push(event: Raw) {
     let shared = shared();
     {
         let mut events = shared.events.lock().unwrap_or_else(|e| e.into_inner());
+        // lane: input-gestures: one swipe drag per drained batch; the batch is already woken.
+        if let (
+            Some(Raw::Swipe {
+                swipe: crate::gestures::Swipe::Drag(sum),
+                ..
+            }),
+            Raw::Swipe {
+                swipe: crate::gestures::Swipe::Drag(step),
+                ..
+            },
+        ) = (events.back_mut(), &event)
+        {
+            *sum += step;
+            return;
+        }
         if matches!(
             (events.back(), &event),
             (Some(Raw::Move { .. }), Raw::Move { .. }) | (Some(Raw::Windows), Raw::Windows)
@@ -124,12 +154,12 @@ pub fn drain() -> Vec<Raw> {
         .collect()
 }
 
-fn down(key: VIRTUAL_KEY) -> bool {
+pub(super) fn down(key: VIRTUAL_KEY) -> bool {
     (unsafe { GetAsyncKeyState(key as i32) }) < 0
 }
 
 /// Consume the held modifier so releasing it does not open the Alt menu or Start.
-fn mask_modifier() {
+pub(super) fn mask_modifier() {
     let mut inputs: [INPUT; 2] = unsafe { zeroed() };
     for (input, flags) in inputs.iter_mut().zip([0, KEYEVENTF_KEYUP]) {
         input.r#type = INPUT_KEYBOARD;
@@ -237,6 +267,14 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
         WM_LBUTTONUP => {
             push(Raw::Up);
             false
+        }
+        // lane: input-gestures
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let suspended = {
+                let settings = shared().settings.lock().unwrap_or_else(|e| e.into_inner());
+                on_suspended(&settings.suspended, x, y)
+            };
+            !grabbed && !suspended && super::input_gestures::wheel(message, info, x, y)
         }
         _ => false,
     }
@@ -364,10 +402,13 @@ pub fn start(wake: Box<dyn Fn() + Send>) -> Result<Hook, AppError> {
             .map(|(min, max)| {
                 SetWinEventHook(min, max, null_mut(), Some(window_event), 0, 0, flags)
             });
+            // lane: input-gestures: Raw Input from the touchpad arrives on this thread too.
+            let touchpad = super::input_gestures::create_window();
             let _ = tx.send(Ok(GetCurrentThreadId()));
             while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
                 DispatchMessageW(&message);
             }
+            super::input_gestures::destroy_window(touchpad);
             for event in events.into_iter().filter(|h| !h.is_null()) {
                 UnhookWinEvent(event);
             }

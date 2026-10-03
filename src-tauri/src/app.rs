@@ -30,6 +30,9 @@ use crate::{
 use crate::platform::splitter;
 #[cfg(target_os = "windows")]
 mod controller_queue;
+// lane: input-gestures
+#[cfg(target_os = "windows")]
+mod input_gestures;
 #[cfg(target_os = "windows")]
 use controller_queue::{Receiver as RequestReceiver, Sender as RequestSender};
 #[cfg(not(target_os = "windows"))]
@@ -367,6 +370,9 @@ struct Controller {
     /// Monitor the overview or commands surface was opened on.
     overview_host: Option<String>,
     commands_host: Option<String>,
+    // lane: input-gestures
+    #[cfg(target_os = "windows")]
+    input_gestures: input_gestures::InputGestures,
 }
 
 impl Controller {
@@ -400,6 +406,9 @@ impl Controller {
                 Config::default().animation_duration_ms,
             )),
             animations: Config::default().animations,
+            // lane: input-gestures
+            #[cfg(target_os = "windows")]
+            input_gestures: Default::default(),
         };
         if let Err(e) = controller.connect() {
             controller.record(e);
@@ -1358,6 +1367,11 @@ impl Controller {
                 self.refresh_within(Duration::from_millis(30));
                 return Ok(None);
             }
+            // lane: input-gestures
+            Raw::Wheel { .. } | Raw::Swipe { .. } => {
+                self.input_gesture(app, raw)?;
+                return Ok(None);
+            }
             // A title bar drag of a tiled window previews where it will land.
             Raw::MoveSize {
                 hwnd,
@@ -1413,6 +1427,7 @@ impl Controller {
                 }
             }
             Raw::Up | Raw::Windows | Raw::MoveSize { .. } => unreachable!("handled above"),
+            Raw::Wheel { .. } | Raw::Swipe { .. } => unreachable!("lane: input-gestures, handled above"),
             Raw::Release { x, y } => {
                 if let Some(mut gesture) = self.gesture.take() {
                     for command in gesture.update(x, y, true) {
@@ -1896,6 +1911,7 @@ fn run_controller(
             controller.sync_edges(surface_open);
             // lane: tabbed
             crate::platform::tabs::configure(crate::layout::tabbed::tab_bars(&controller.engine));
+            controller.sync_input_gestures(&shortcuts.config, surface_open); // lane: input-gestures
             controller.sync_decorations(&shortcuts.config);
         }
         let next_deadline = controller

@@ -362,6 +362,19 @@ pub enum Command {
     UnsetPageName,
     /// lane: tabbed. Switch the focused window's column between normal and tabbed display.
     ToggleColumnTabbedDisplay,
+    // lane: input-gestures
+    /// Touchpad swipe step: move the monitor's active page view by `delta` physical pixels,
+    /// without snapping to columns or changing focus.
+    DragViewport {
+        monitor_id: MonitorId,
+        delta: i32,
+    },
+    /// Touchpad swipe release: settle the view on the column edge nearest its position plus
+    /// `delta` (the projected fling) and focus that column.
+    SnapViewport {
+        monitor_id: MonitorId,
+        delta: i32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

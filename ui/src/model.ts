@@ -142,7 +142,10 @@ export type Command =
   | { type: 'setPageName'; name: string }
   | { type: 'unsetPageName' }
   /** lane: tabbed */
-  | { type: 'toggleColumnTabbedDisplay' };
+  | { type: 'toggleColumnTabbedDisplay' }
+  // lane: input-gestures
+  | { type: 'dragViewport'; monitorId: MonitorId; delta: number }
+  | { type: 'snapViewport'; monitorId: MonitorId; delta: number };
 export type ErrorCode = 'notImplemented' | 'unsupportedSession' | 'backendUnavailable' | 'permissionRequired' | 'windowGone' | 'operationDenied' | 'invalidCommand';
 export interface AppError { code: ErrorCode; message: string; windowId: WindowId | null }
 export type NativeAction =

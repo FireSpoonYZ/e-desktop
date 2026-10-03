@@ -54,6 +54,22 @@ pub struct Config {
     pub animations: crate::ui_animation::Animations,
     /// lane: ui-animation — niri hotkey overlay, shown once when tiling is first enabled.
     pub hotkey_overlay: crate::ui_animation::HotkeyOverlay,
+    // lane: input-gestures
+    /// Held with the wheel: vertical switches pages, horizontal or with Shift focuses columns.
+    /// null disables. Windows only.
+    pub wheel_modifier: Option<WheelModifier>,
+    /// Precision-touchpad finger count (3 or 4) for swipe gestures; null disables. Windows only.
+    pub touchpad_gesture_fingers: Option<u8>,
+}
+
+// lane: input-gestures
+/// Exact modifier set for global wheel gestures; Shift is the only extra key allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WheelModifier {
+    Super,
+    Alt,
+    ControlAlt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +275,15 @@ enum StrictCommand {
     UnsetPageName {},
     // lane: tabbed
     ToggleColumnTabbedDisplay {},
+    // lane: input-gestures
+    DragViewport {
+        monitor_id: String,
+        delta: i32,
+    },
+    SnapViewport {
+        monitor_id: String,
+        delta: i32,
+    },
 }
 
 impl Default for Config {
@@ -289,6 +314,9 @@ impl Default for Config {
             // lane: ui-animation
             animations: Default::default(),
             hotkey_overlay: Default::default(),
+            // lane: input-gestures
+            wheel_modifier: Some(WheelModifier::Super),
+            touchpad_gesture_fingers: None,
         }
     }
 }
@@ -450,6 +478,13 @@ impl Config {
             .is_some_and(|color| colorref(color).is_none())
         {
             return Err("focusBorderColor 须为 #rrggbb 或 null。".into());
+        }
+        // lane: input-gestures
+        if config
+            .touchpad_gesture_fingers
+            .is_some_and(|fingers| !matches!(fingers, 3 | 4))
+        {
+            return Err("touchpadGestureFingers 须为 3、4 或 null。".into());
         }
         for (index, rule) in config.window_rules.iter().enumerate() {
             rule.validate()
