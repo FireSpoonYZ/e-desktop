@@ -241,7 +241,7 @@ mod tests {
                 .is_err()
         );
         let defaults = Config::default().normalize_keys(normalize_key).unwrap();
-        assert_eq!(defaults.shortcuts.len(), 48);
+        assert_eq!(defaults.shortcuts.len(), 62);
         // The documented Ctrl+Alt+L replacement.
         assert!(normalize_key("Control+Alt+Semicolon").is_ok());
     }

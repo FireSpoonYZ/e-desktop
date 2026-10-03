@@ -188,3 +188,41 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
 - 拖动不会把剩余列自动撑满屏幕；居中后的拖动保留未拖动边界的位置。点一下不移动什么也不改。
 
 直接拖窗口自己的边框时本程序不移动任何窗口；松手后约 80 ms 刷新一次，采用新尺寸并重排其他窗口（这条路径没有吸附）。列之间和堆叠窗口之间的边框被上面的拖动条盖住，走的是带预览的路径。
+
+## 列、显示器与焦点历史动作
+
+参照 niri 的同名动作。下表的 `command` 都可以写进 `shortcuts` 的 `command` 动作，也都能在命令面板中搜索；`direction` 取 `left`、`right`、`up`、`down`，只接受左右或上下的命令收到其他方向时报错。
+
+| 命令 `type` | 默认快捷键 | 行为 |
+| --- | --- | --- |
+| `consumeOrExpelWindow` | `Ctrl+Alt+[ / ]` | 当前窗口所在列有多个窗口时，拆成该侧的新列（沿用原列宽）；单独一列时，并入该侧相邻列的底部 |
+| `consumeWindowIntoColumn` | 无 | 右侧相邻列的第一个窗口并入当前列底部 |
+| `expelWindowFromColumn` | 无 | 当前窗口从堆叠中拆出，成为右侧新列；单独一列时不变 |
+| `moveColumn` | `Ctrl+Alt+Shift+[ / ]` | 当前列与左 / 右相邻列交换位置 |
+| `moveColumnToFirst` / `moveColumnToLast` | `Ctrl+Alt+Shift+Home/End` | 当前列移到条带最前 / 最后 |
+| `swapWindow` | 无 | 当前窗口与左 / 右相邻列中上次聚焦的窗口互换位置，焦点跟随当前窗口 |
+| `focusColumnFirst` / `focusColumnLast` | `Ctrl+Alt+Home/End` | 聚焦活动显示器当前页面的第一列 / 最后一列 |
+| `focusWindowOrPage` | 无 | 上 / 下聚焦列内窗口；已在列顶 / 列底时切换到上一个 / 下一个页面 |
+| `focusColumnOrMonitor` | 无 | 左 / 右聚焦；已到条带尽头时聚焦该侧的显示器 |
+| `focusMonitor` | `Ctrl+Alt+,/.`（左 / 右） | 激活该方向的显示器及其当前页面，聚焦这个页面上次聚焦的窗口；页面为空时它也成为活动显示器 |
+| `moveColumnToMonitor` | `Ctrl+Alt+Shift+,/.`（左 / 右） | 当前列移到该方向显示器的当前页面，放在那里上次聚焦的列右侧，焦点跟随；浮动窗口单独移动 |
+| `moveWindowToMonitor` | 无 | 当前窗口移到该方向显示器的当前页面，焦点跟随，与“移动当前窗口到页面”相同 |
+| `movePageToMonitor` | 无 | 当前页面整体移到该方向的显示器，插在那里当前页面之后，并成为活动页面；空页面不移动 |
+| `focusWindowPrevious` | `` Ctrl+Alt+` `` | 回到上一次聚焦的受管窗口，可跨页面和显示器；连按在最近两个窗口间切换。已关闭或被用户最小化的窗口跳过 |
+| `focusPagePrevious` | `Ctrl+Alt+P` | 活动显示器回到上一个活动页面；连按在两个页面之间切换。每个显示器分别记录 |
+
+仅命令的动作可以自己绑定，例如：
+
+```json
+{
+  "shortcuts": [
+    { "key": "Control+Alt+U", "action": { "type": "command", "command": { "type": "focusWindowOrPage", "direction": "down" } } },
+    { "key": "Control+Alt+I", "action": { "type": "command", "command": { "type": "focusWindowOrPage", "direction": "up" } } },
+    { "key": "Control+Alt+Semicolon", "action": { "type": "command", "command": { "type": "focusColumnOrMonitor", "direction": "right" } } }
+  ]
+}
+```
+
+显示器方向按显示器矩形计算：只考虑在该方向上与当前显示器有重叠的显示器，取中心最近的一个；该方向没有显示器时不执行。列与窗口的移动动作只适用于平铺窗口，浮动窗口上执行时报错，与“移动窗口”一致；布局全屏的窗口可以移动。动作结束后焦点窗口滚动到完整可见。焦点和页面历史只保存在本次运行内。
+
+`focusMonitor` 移到空页面时没有窗口可以接收原生焦点，键盘输入仍然交给原来的窗口，直到点击或聚焦其他窗口；在此之前刷新不会把活动显示器拉回原处。目标显示器因外部全屏暂停时，这些动作不执行。

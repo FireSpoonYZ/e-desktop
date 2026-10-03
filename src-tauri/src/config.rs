@@ -183,6 +183,42 @@ enum StrictCommand {
         window_id: String,
         rect: crate::model::Rect,
     },
+    // lane: layout-actions
+    ConsumeOrExpelWindow {
+        direction: Direction,
+    },
+    ConsumeWindowIntoColumn {},
+    ExpelWindowFromColumn {},
+    MoveColumn {
+        direction: Direction,
+    },
+    MoveColumnToFirst {},
+    MoveColumnToLast {},
+    SwapWindow {
+        direction: Direction,
+    },
+    FocusColumnFirst {},
+    FocusColumnLast {},
+    FocusWindowOrPage {
+        direction: Direction,
+    },
+    FocusColumnOrMonitor {
+        direction: Direction,
+    },
+    FocusMonitor {
+        direction: Direction,
+    },
+    MoveColumnToMonitor {
+        direction: Direction,
+    },
+    MoveWindowToMonitor {
+        direction: Direction,
+    },
+    MovePageToMonitor {
+        direction: Direction,
+    },
+    FocusWindowPrevious {},
+    FocusPagePrevious {},
 }
 
 impl Default for Config {
@@ -305,6 +341,29 @@ impl Config {
         ] {
             bind(
                 format!("Control+Alt+Shift+{key}"),
+                ShortcutAction::Command { command },
+            );
+        }
+        // lane: layout-actions
+        let (left, right) = (Direction::Left, Direction::Right);
+        for (key, command) in [
+            ("BracketLeft", Command::ConsumeOrExpelWindow { direction: left }),
+            ("BracketRight", Command::ConsumeOrExpelWindow { direction: right }),
+            ("Shift+BracketLeft", Command::MoveColumn { direction: left }),
+            ("Shift+BracketRight", Command::MoveColumn { direction: right }),
+            ("Home", Command::FocusColumnFirst),
+            ("End", Command::FocusColumnLast),
+            ("Shift+Home", Command::MoveColumnToFirst),
+            ("Shift+End", Command::MoveColumnToLast),
+            ("Comma", Command::FocusMonitor { direction: left }),
+            ("Period", Command::FocusMonitor { direction: right }),
+            ("Shift+Comma", Command::MoveColumnToMonitor { direction: left }),
+            ("Shift+Period", Command::MoveColumnToMonitor { direction: right }),
+            ("Backquote", Command::FocusWindowPrevious),
+            ("P", Command::FocusPagePrevious),
+        ] {
+            bind(
+                format!("Control+Alt+{key}"),
                 ShortcutAction::Command { command },
             );
         }
@@ -518,7 +577,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 48);
+        assert_eq!(Config::builtin_shortcuts().len(), 62);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -582,7 +641,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 48);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 62);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -590,7 +649,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 48);
+        assert_eq!(config.shortcuts.len(), 62);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(

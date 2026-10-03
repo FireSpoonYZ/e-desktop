@@ -274,6 +274,56 @@ pub enum Command {
         window_id: WindowId,
         rect: Rect,
     },
+    // lane: layout-actions
+    /// niri consume-or-expel-window-left/right: a stacked window leaves for a new column on
+    /// that side; a window alone in its column joins the bottom of the neighbouring column.
+    ConsumeOrExpelWindow {
+        direction: Direction,
+    },
+    /// The first window of the column to the right joins the bottom of the focused column.
+    ConsumeWindowIntoColumn,
+    /// The focused window leaves its stack for a new column to its right.
+    ExpelWindowFromColumn,
+    /// Swap the focused column with its left/right neighbour.
+    MoveColumn {
+        direction: Direction,
+    },
+    MoveColumnToFirst,
+    MoveColumnToLast,
+    /// Swap the focused window with the remembered window of the left/right column.
+    SwapWindow {
+        direction: Direction,
+    },
+    FocusColumnFirst,
+    FocusColumnLast,
+    /// Focus up/down in the column; past its top/bottom, switch to the previous/next page.
+    FocusWindowOrPage {
+        direction: Direction,
+    },
+    /// Focus left/right; past the end of the strip, focus the monitor on that side.
+    FocusColumnOrMonitor {
+        direction: Direction,
+    },
+    /// Activate the nearest monitor that way and focus its active page's remembered window.
+    FocusMonitor {
+        direction: Direction,
+    },
+    /// Move the focused column (a floating window alone) to that monitor's active page.
+    MoveColumnToMonitor {
+        direction: Direction,
+    },
+    MoveWindowToMonitor {
+        direction: Direction,
+    },
+    /// Move the active monitor's active page to the monitor on that side (niri
+    /// move-workspace-to-monitor).
+    MovePageToMonitor {
+        direction: Direction,
+    },
+    /// Focus the previously focused managed window, across pages and monitors.
+    FocusWindowPrevious,
+    /// Return the active monitor to the page it showed before.
+    FocusPagePrevious,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

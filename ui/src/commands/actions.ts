@@ -48,6 +48,32 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
       }, focused, monitor.name);
     }
   }
+  // lane: layout-actions
+  const tiled = focused && !!window && !window.floating;
+  const focusable = managed && capabilities.focus;
+  for (const [direction, label] of [['left', '左'], ['right', '右']] as const) {
+    add(`窗口并入或移出${label}侧列 Consume or expel ${direction}`, { type: 'consumeOrExpelWindow', direction }, tiled);
+    add(`当前列${label}移 Move column ${direction}`, { type: 'moveColumn', direction }, tiled);
+    add(`与${label}侧列交换窗口 Swap window ${direction}`, { type: 'swapWindow', direction }, tiled);
+    add(`向${label}聚焦列或显示器 Focus column or monitor ${direction}`, { type: 'focusColumnOrMonitor', direction }, focusable);
+  }
+  add('右侧列首个窗口并入当前列 Consume into column', { type: 'consumeWindowIntoColumn' }, tiled);
+  add('当前窗口移出为右侧新列 Expel from column', { type: 'expelWindowFromColumn' }, tiled);
+  add('当前列移到最前 Move column to first', { type: 'moveColumnToFirst' }, tiled);
+  add('当前列移到最后 Move column to last', { type: 'moveColumnToLast' }, tiled);
+  add('聚焦第一列 Focus first column', { type: 'focusColumnFirst' }, focusable);
+  add('聚焦最后一列 Focus last column', { type: 'focusColumnLast' }, focusable);
+  for (const [direction, label] of [['up', '上'], ['down', '下']] as const) {
+    add(`向${label}聚焦窗口或页面 Focus window or page ${direction}`, { type: 'focusWindowOrPage', direction }, managed);
+  }
+  for (const [direction, label] of [['left', '左侧'], ['right', '右侧'], ['up', '上方'], ['down', '下方']] as const) {
+    add(`聚焦${label}显示器 Focus monitor ${direction}`, { type: 'focusMonitor', direction }, managed);
+    add(`当前列移到${label}显示器 Move column to monitor ${direction}`, { type: 'moveColumnToMonitor', direction }, focused);
+    add(`当前窗口移到${label}显示器 Move window to monitor ${direction}`, { type: 'moveWindowToMonitor', direction }, focused);
+    add(`当前页面移到${label}显示器 Move page to monitor ${direction}`, { type: 'movePageToMonitor', direction }, managed);
+  }
+  add('聚焦上一个窗口 Previous window', { type: 'focusWindowPrevious' }, focusable);
+  add('回到上一个页面 Previous page', { type: 'focusPagePrevious' }, managed);
   const words = query.normalize('NFKC').toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return actions.filter(({ label, detail }) => {
     const text = `${label} ${detail}`.normalize('NFKC').toLocaleLowerCase();

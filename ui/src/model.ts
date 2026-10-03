@@ -103,7 +103,25 @@ export type Command =
   | { type: 'scroll'; monitorId: MonitorId; delta: number }
   | { type: 'toggleFloating' }
   | { type: 'toggleFullscreen' }
-  | { type: 'closeWindow'; windowId: WindowId };
+  | { type: 'closeWindow'; windowId: WindowId }
+  // lane: layout-actions
+  | { type: 'consumeOrExpelWindow'; direction: Direction }
+  | { type: 'consumeWindowIntoColumn' }
+  | { type: 'expelWindowFromColumn' }
+  | { type: 'moveColumn'; direction: Direction }
+  | { type: 'moveColumnToFirst' }
+  | { type: 'moveColumnToLast' }
+  | { type: 'swapWindow'; direction: Direction }
+  | { type: 'focusColumnFirst' }
+  | { type: 'focusColumnLast' }
+  | { type: 'focusWindowOrPage'; direction: Direction }
+  | { type: 'focusColumnOrMonitor'; direction: Direction }
+  | { type: 'focusMonitor'; direction: Direction }
+  | { type: 'moveColumnToMonitor'; direction: Direction }
+  | { type: 'moveWindowToMonitor'; direction: Direction }
+  | { type: 'movePageToMonitor'; direction: Direction }
+  | { type: 'focusWindowPrevious' }
+  | { type: 'focusPagePrevious' };
 export type ErrorCode = 'notImplemented' | 'unsupportedSession' | 'backendUnavailable' | 'permissionRequired' | 'windowGone' | 'operationDenied' | 'invalidCommand';
 export interface AppError { code: ErrorCode; message: string; windowId: WindowId | null }
 export type NativeAction =

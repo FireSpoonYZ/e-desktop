@@ -4,6 +4,7 @@ use crate::model::*;
 use crate::rules::WindowRule;
 
 pub mod edges;
+mod layout_actions; // lane: layout-actions
 mod monitors;
 mod pointer;
 pub use pointer::top_band;
@@ -57,6 +58,13 @@ pub struct Engine {
     outputs_suspended: bool,
     /// Managed windows detected covering some monitor, wherever their column lives.
     covering_windows: BTreeSet<WindowId>,
+    // lane: layout-actions
+    /// Previously focused windows, most recent last; never the focused window itself.
+    focus_history: Vec<WindowId>,
+    /// Page each monitor showed before its active one (niri focus-workspace-previous).
+    previous_pages: BTreeMap<MonitorId, PageId>,
+    /// Native focus left behind when FocusMonitor activated an empty page.
+    stale_native_focus: Option<WindowId>,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -215,6 +223,10 @@ impl Engine {
             hotplug_pinned: BTreeMap::new(),
             outputs_suspended: false,
             covering_windows: BTreeSet::new(),
+            // lane: layout-actions
+            focus_history: vec![],
+            previous_pages: BTreeMap::new(),
+            stale_native_focus: None,
         }
     }
 
@@ -437,6 +449,7 @@ impl Engine {
             }
         }
         next.update_pending_rule_floating(&actions);
+        next.track_layout_history(&self.snapshot); // lane: layout-actions
         *self = next;
         Ok(self.transition(actions))
     }
@@ -606,7 +619,7 @@ impl Engine {
             self.location(id).is_ok() && !self.window_protected(id)
         }) {
             self.set_focus(&id, true)?;
-        } else if let Some(id) = system.focused_window {
+        } else if let Some(id) = self.fresh_native_focus(system.focused_window) { // lane: layout-actions
             // A user-minimized window has left the columns; native focus must not error or wake it.
             // Focus on a suspended monitor must not scroll that page back into the covering window.
             if let Ok((m, p, _)) = self.location(&id) {
@@ -1090,6 +1103,7 @@ impl Engine {
         let mut next = self.clone();
         let actions = next.dispatch_inner(command)?;
         next.update_pending_rule_floating(&actions);
+        next.track_layout_history(&self.snapshot); // lane: layout-actions
         *self = next;
         Ok(self.transition(actions))
     }
@@ -1505,6 +1519,28 @@ impl Engine {
             }
             Command::SetFloatingRect { window_id, rect } => {
                 self.set_floating_rect(&window_id, rect)?;
+            }
+            // lane: layout-actions
+            command @ (Command::ConsumeOrExpelWindow { .. }
+            | Command::ConsumeWindowIntoColumn
+            | Command::ExpelWindowFromColumn
+            | Command::MoveColumn { .. }
+            | Command::MoveColumnToFirst
+            | Command::MoveColumnToLast
+            | Command::SwapWindow { .. }
+            | Command::FocusColumnFirst
+            | Command::FocusColumnLast
+            | Command::FocusWindowOrPage { .. }
+            | Command::FocusColumnOrMonitor { .. }
+            | Command::FocusMonitor { .. }
+            | Command::MoveColumnToMonitor { .. }
+            | Command::MoveWindowToMonitor { .. }
+            | Command::MovePageToMonitor { .. }
+            | Command::FocusWindowPrevious
+            | Command::FocusPagePrevious) => {
+                if let Some(actions) = self.layout_action(command, &mut focus_action)? {
+                    return Ok(actions);
+                }
             }
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
