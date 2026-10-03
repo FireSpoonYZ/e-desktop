@@ -8,10 +8,15 @@
     "typecheck": "tsc --noEmit -p ui/tsconfig.json",
     "build": "npm run typecheck && vite build --config ui/vite.config.ts",
     "test": "node --test ui/tests/*.test.mjs ui/src/shell/*.test.mjs ui/src/commands/*.test.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "postinstall": "node scripts/prepare-terminal-host.mjs --patch-only",
+    "prepare:terminal-host": "node scripts/prepare-terminal-host.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-unicode11": "0.10.0-beta.300",
+    "@xterm/xterm": "6.1.0-beta.303",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

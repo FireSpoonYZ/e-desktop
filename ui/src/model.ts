@@ -118,6 +118,7 @@ export interface ControlProps { snapshot: Snapshot; onCommand: OnCommand; busy?:
 export interface TopBarProps extends ControlProps {
   onOpenOverview: () => void;
   onOpenCommands: () => void;
+  onOpenTerminals?: () => void;
   onQuit?: () => void;
   onTogglePin?: () => void;
 }

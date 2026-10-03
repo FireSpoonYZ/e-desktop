@@ -1,0 +1,87 @@
+{
+  "upstreamRepository": "https://github.com/stablyai/orca",
+  "upstreamCommit": "de8bffe24045b396212f4f63de8960ec8380ea07",
+  "upstreamPatchPath": "config/patches/node-pty@1.1.0.patch",
+  "patchSHA256": "92c95cffab383d86b3b13a460c75a08074468ebf1f3911db8e874e083201f192",
+  "nodePtyVersion": "1.1.0",
+  "nodeAddonApiVersion": "7.1.1",
+  "nodeGypVersion": "11.4.2",
+  "licenses": {
+    "orca": "ORCA-LICENSE",
+    "nodePty": "NODE-PTY-LICENSE",
+    "nodeAddonApi": "NODE-ADDON-API-LICENSE"
+  },
+  "files": [
+    {
+      "path": "binding.gyp",
+      "stockSHA256": "2e6fdfd713f8b3485dd4e2f4efe93bf5436a5ff4eec4deb45533b09b6932efff",
+      "patchedSHA256": "40fdda1b73db9deba77945100df7c9ab68f2226bd3c14e96544bed629db4e50c"
+    },
+    {
+      "path": "deps/winpty/src/winpty.gyp",
+      "stockSHA256": "c67cd1b1d1e5aad4ac8795dccdb94df3bd43fd5f268cdeb7d4ce183bf6ce6315",
+      "patchedSHA256": "98bea4c25e13da8372dc089791b59e2b86ba7c24ebfbc449157d18b8f68ea2b8"
+    },
+    {
+      "path": "lib/conpty_console_list_agent.js",
+      "stockSHA256": "0d010879bb6680a0253d44363183d53e631f42972594eb6dcb1fb842c8c85e52",
+      "patchedSHA256": "345337d05527cc0a6e26bf618bc63cda3d98aabb677f1399e6040c90414e50ea"
+    },
+    {
+      "path": "lib/terminal.js",
+      "stockSHA256": "5ed5cd66a766afba4a04093284e999f8516d41936501839055800b10eca5d304",
+      "patchedSHA256": "7bf8b54691a735654cd9a19104fe4d8ffcbcbca455075998bc53b363c3031843"
+    },
+    {
+      "path": "lib/unixTerminal.js",
+      "stockSHA256": "a62e3a60c3bc1b0e7261f58284856df748dcee6761a2bc7a5a5ba98b22660473",
+      "patchedSHA256": "73497355416919e4dd984eea84e267b8615f9fe3080f4a66944453292cb452fe"
+    },
+    {
+      "path": "src/conpty_console_list_agent.ts",
+      "stockSHA256": "9ebb0d2c188d0408987ecfcdcd68a3751ea6bb5886d631267055664c65357d45",
+      "patchedSHA256": "d3946469cc0a6dddeacb13926c096c92fc4740c7e16e3441043f6ded62f415da"
+    },
+    {
+      "path": "src/unix/pty.cc",
+      "stockSHA256": "5e1005d6bdcfbe97b486ee415419fe7adae99035047f07340fbad36419e0bae6",
+      "patchedSHA256": "2f62cd6eea07c3b9647593c398fa7ba2e6d8151e231c902784ef56a34cd9dcba"
+    },
+    {
+      "path": "src/unixTerminal.ts",
+      "stockSHA256": "0bb9163a7c86d18516faf8a6e1326312dca36e21cab4a6a716fc396fedbcfbcd",
+      "patchedSHA256": "185d6aa14ed1aa38108800c14881ea2ba73a5aa0c73ae2dafd4bd8e18fe40476"
+    },
+    {
+      "path": "src/win/conpty.cc",
+      "stockSHA256": "52c893b689ab3210c0961e2a6aa805a82350003767b21069b164926b5becd4e2",
+      "patchedSHA256": "26b16ab880cc6ff1253ac39c9345efa26730d0d64bc01c4b6852af987d4ed363"
+    },
+    {
+      "path": "lib/windowsPtyAgent.js",
+      "stockSHA256": "8636d16b38266112204061a22b135734177c242837982fd3a4055be726efa64a",
+      "patchedSHA256": "b395bf47bd4f8ce9573c66987129a2c8385499887a8e9aadbd4037cb42afe8f8"
+    },
+    {
+      "path": "lib/windowsTerminal.js",
+      "stockSHA256": "c3a65716f53fed0135a8a633373d5f9c2ab092544d651f27ef0a67096dd3bcd9",
+      "patchedSHA256": "8247ecd69be8b18257050fb026b290024612c5ffc6d492ff1d46f81e613be2cf"
+    },
+    {
+      "path": "src/windowsPtyAgent.ts",
+      "stockSHA256": "57077d9a8891a8582f1976a5f30e408bb8a94b2fa14e197908843e06f4e1f51f",
+      "patchedSHA256": "e5c606330ba47d9067f752405a51d6911b8256fd45a33a4e22b5b08f286dc8ee"
+    },
+    {
+      "path": "src/windowsTerminal.ts",
+      "stockSHA256": "35e4ac4a2c4be98d1ba11fd3b469745519e2ee9f9c2f6283c7fe3ce99a8c4550",
+      "patchedSHA256": "57d2bea3cc9d480da32d49c2810782994c646b1323a5048bb9baedf15df56603"
+    }
+  ],
+  "upstreamPatchGitBlob": "40b240f3296c050167062eff0c8e920c3d13c937",
+  "licenseSHA256": {
+    "ORCA-LICENSE": "ff1b611f80580d49f4b97e93a97b24eb050b0671b26b8afe16341fab699112f3",
+    "NODE-PTY-LICENSE": "a3d60eaf32d2fb09c9d82ef39f14bd6e2c0f3ca7de30daa827486c0d6f8b6e9f",
+    "NODE-ADDON-API-LICENSE": "89024017b88a9f2b763f79b941a4f2db3b4428edfcacdc0b23866b2da633ad0c"
+  }
+}

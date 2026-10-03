@@ -1,0 +1,1 @@
+Generated release resource staging. Run npm run prepare:terminal-host after integrating terminal-host. Source and native production dependencies are copied here, never committed. Node.js itself must be installed separately.

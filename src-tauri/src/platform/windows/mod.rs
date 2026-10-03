@@ -565,7 +565,10 @@ impl Backend {
                 let mut class = [0u16; 256];
                 let n = unsafe { GetClassNameW(h, class.as_mut_ptr(), class.len() as i32) };
                 let class = String::from_utf16_lossy(&class[..n.max(0) as usize]);
-                if pid == unsafe { GetCurrentProcessId() }
+                let mut own_title = [0u16; 512];
+                let title_len = unsafe { GetWindowTextW(h, own_title.as_mut_ptr(), own_title.len() as i32) }.max(0) as usize;
+                if (pid == unsafe { GetCurrentProcessId() }
+                    && !super::own_terminal_title(&String::from_utf16_lossy(&own_title[..title_len])))
                     || pid == 0
                     || unsafe { IsWindowVisible(h) } == 0
                     || style & WS_CHILD != 0

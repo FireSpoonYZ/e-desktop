@@ -127,7 +127,7 @@ impl Backend {
             ..SystemSnapshot::default()
         };
         let mut seen = std::collections::BTreeSet::new();
-        for pid in pids.into_iter().filter(|pid| *pid > 0 && *pid != own_pid) {
+        for pid in pids.into_iter().filter(|pid| *pid > 0) {
             let Some(app) = (unsafe { Owned::from_create(AXUIElementCreateApplication(pid)) })
             else {
                 continue;
@@ -165,6 +165,8 @@ impl Backend {
                 unsafe {
                     AXUIElementSetMessagingTimeout(element, 0.5);
                 }
+                if pid == own_pid && !attribute(element, "AXTitle").ok().and_then(|v| text(v.0))
+                    .is_some_and(|title| super::own_terminal_title(&title)) { continue; }
                 let known_id = self
                     .windows
                     .iter()

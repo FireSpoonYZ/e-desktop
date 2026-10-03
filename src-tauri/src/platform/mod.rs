@@ -15,3 +15,10 @@ pub use macos::Backend;
 
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 compile_error!("e-desktop currently supports desktop Windows, Linux X11, and macOS targets.");
+
+pub(crate) fn own_terminal_title(title: &str) -> bool {
+    #[cfg(feature = "desktop")]
+    { crate::terminal::eligible_title(title) }
+    #[cfg(not(feature = "desktop"))]
+    { let _ = title; false }
+}

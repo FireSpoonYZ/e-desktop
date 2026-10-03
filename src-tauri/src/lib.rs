@@ -10,3 +10,6 @@ pub mod rules;
 pub mod shortcuts;
 
 pub mod preview;
+
+#[cfg(feature = "desktop")]
+pub mod terminal;

@@ -1,0 +1,34 @@
+{
+  "name": "e-terminal-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "esbuild src/emulator.ts src/termination.ts src/session.ts --bundle --platform=node --format=esm --packages=external --outdir=dist --out-extension:.js=.mjs",
+    "prepare": "node scripts/rebuild-native.mjs && npm run build",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "start": "node src/server.mjs",
+    "smoke": "node test/pty-smoke.mjs",
+    "patch:native": "node scripts/patch-node-pty.mjs",
+    "rebuild:native": "node scripts/rebuild-native.mjs",
+    "check:deployment": "node scripts/check-native-deployment.mjs",
+    "test:native": "node --test scripts/native-deployment.test.mjs",
+    "smoke:native": "node scripts/native-shell-smoke.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-serialize": "0.15.0-beta.300",
+    "@xterm/addon-unicode11": "0.10.0-beta.300",
+    "@xterm/headless": "6.1.0-beta.302",
+    "node-pty": "1.1.0",
+    "selfsigned": "5.5.0",
+    "ws": "8.22.0",
+    "node-addon-api": "7.1.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "node-gyp": "11.4.2"
+  }
+}

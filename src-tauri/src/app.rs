@@ -2051,8 +2051,11 @@ pub fn run() {
     };
     tauri::Builder::default()
         .manage(state)
+        .manage(crate::terminal::TerminalHost::default())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            crate::terminal::terminal_endpoint,
+            crate::terminal::open_terminal_window,
             get_snapshot,
             execute,
             open_surface,
@@ -2073,6 +2076,10 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label().starts_with("terminal-") {
+                if matches!(event, tauri::WindowEvent::Destroyed) { crate::terminal::unregister(window); }
+                return; // Closing a view detaches; only explicit terminal.close kills a shell.
+            }
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "overview" {
                 let _ = send(
                     &window.state::<AppState>(),
@@ -2099,6 +2106,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build e-desktop")
         .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) { app.state::<crate::terminal::TerminalHost>().shutdown(); }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 let state = app.state::<AppState>();
                 if !state.can_exit.load(Ordering::Acquire) {

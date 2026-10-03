@@ -4,20 +4,55 @@
   "version": "0.1.0",
   "identifier": "local.e-desktop.manager",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:terminal-host && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepare:terminal-host && npm run build",
     "frontendDist": "../ui/dist"
   },
   "app": {
     "windows": [
-      { "label": "topbar", "title": "e-desktop", "url": "index.html?surface=topbar", "width": 960, "height": 36, "resizable": false, "decorations": false, "shadow": false, "focus": false },
-      { "label": "overview", "title": "e-desktop overview", "url": "index.html?surface=overview", "width": 1000, "height": 700, "decorations": false, "shadow": false, "skipTaskbar": true, "visible": false },
-      { "label": "commands", "title": "e-desktop commands", "url": "index.html?surface=commands", "width": 640, "height": 480, "decorations": false, "shadow": false, "skipTaskbar": true, "visible": false }
+      {
+        "label": "topbar",
+        "title": "e-desktop",
+        "url": "index.html?surface=topbar",
+        "width": 960,
+        "height": 36,
+        "resizable": false,
+        "decorations": false,
+        "shadow": false,
+        "focus": false
+      },
+      {
+        "label": "overview",
+        "title": "e-desktop overview",
+        "url": "index.html?surface=overview",
+        "width": 1000,
+        "height": 700,
+        "decorations": false,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false
+      },
+      {
+        "label": "commands",
+        "title": "e-desktop commands",
+        "url": "index.html?surface=commands",
+        "width": 640,
+        "height": 480,
+        "decorations": false,
+        "shadow": false,
+        "skipTaskbar": true,
+        "visible": false
+      }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost ws://127.0.0.1:*"
     }
   },
-  "bundle": { "active": false }
+  "bundle": {
+    "active": false,
+    "resources": {
+      "terminal-host/": "terminal-host/"
+    }
+  }
 }

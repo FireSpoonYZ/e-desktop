@@ -514,7 +514,10 @@ impl X11 {
             .first()
             .copied()
             .unwrap_or(0);
-        Ok(pid == 0 || pid != std::process::id())
+        if pid != std::process::id() { return Ok(true); }
+        let mut title = self.text(w, "_NET_WM_NAME")?;
+        if title.is_empty() { title = self.text(w, "WM_NAME")?; }
+        Ok(super::own_terminal_title(String::from_utf8_lossy(&title).trim_end_matches(char::from(0))))
     }
     fn ensure_managed(&self, w: Window) -> Result<(), AppError> {
         if !self.client_list()?.contains(&w) && !self.saved.contains_key(&w) {

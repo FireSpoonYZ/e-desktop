@@ -6,6 +6,9 @@ import type { Command, OnCommand } from './model';
 import { TopBar } from './shell';
 import { Overview } from './overview';
 import { CommandPalette } from './commands';
+import { TerminalManager, TerminalView } from './terminal/Terminal';
+import { openTerminal, observeTerminalConnection } from './terminal/client';
+import { observeSessionWindows } from './terminal/session-windows';
 
 const query = new URLSearchParams(location.search);
 const surface = query.get('surface') ?? 'topbar';
@@ -14,7 +17,14 @@ const errorMessage = (cause: unknown) => typeof cause === 'object' && cause !== 
   ? String(cause.message) : String(cause);
 
 export default function App() {
+  if (surface === 'terminals') return <TerminalManager />;
+  if (surface === 'terminal') return <TerminalView sessionId={query.get('sessionId') ?? ''} />;
+  return <DesktopApp />;
+}
+
+function DesktopApp() {
   const [snapshot, setSnapshot] = useState(emptySnapshot);
+  const [terminalError, setTerminalError] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [busyCommand, setBusyCommand] = useState<Command['type'] | null>(null);
   const busy = busyCommand !== null;
@@ -22,6 +32,24 @@ export default function App() {
   const [overlayMonitor, setOverlayMonitor] = useState<string | null>(null);
   const [previewSession, setPreviewSession] = useState<number | null>(null);
   const executing = useRef(false);
+  const seenTerminalSessions = useRef(new Set<string>());
+
+  useEffect(() => {
+    // control_label(0) is the single persistent primary topbar, not each monitor's bar.
+    if (surface !== 'topbar' || monitorIndex !== 0 || !desktopAvailable()) return;
+    let disposed = false;
+    let stopObserving = () => {};
+    const report = (cause: unknown) => { if (!disposed) setTerminalError(errorMessage(cause)); };
+    const stopConnection = observeTerminalConnection(current => {
+      stopObserving(); setTerminalError(null);
+      stopObserving = observeSessionWindows(current, seenTerminalSessions.current, openTerminal, report);
+    }, cause => {
+      stopObserving(); report(cause);
+    });
+    return () => {
+      disposed = true; stopObserving(); stopConnection();
+    };
+  }, []);
 
   useEffect(() => {
     if (!desktopAvailable()) {
@@ -78,9 +106,10 @@ export default function App() {
     }
   }, []);
 
-  const displaySnapshot = localError ? {
+  const displaySnapshot = localError || terminalError ? {
     ...snapshot,
-    errors: [...snapshot.errors, { code: 'backendUnavailable' as const, message: localError, windowId: null }],
+    errors: [...snapshot.errors, ...[localError, terminalError].filter((value): value is string => !!value)
+      .map(message => ({ code: 'backendUnavailable' as const, message, windowId: null }))],
   } : snapshot;
   const monitor = snapshot.monitors[monitorIndex];
   const selectedMonitor = surface === 'topbar' ? monitor?.monitor.id : overlayMonitor;
@@ -90,7 +119,7 @@ export default function App() {
   return <main className={`desktop-surface desktop-surface--${surface}`}>
     {surface === 'overview' ? <Overview key={opening} {...props} onDismiss={onDismiss} previewSession={previewSession} syncPreviews={syncPreviews} />
       : surface === 'commands' ? <CommandPalette key={opening} {...props} onDismiss={onDismiss} />
-      : <TopBar {...props} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
+      : <TopBar {...props} onOpenTerminals={() => { void openTerminal().catch(cause => setLocalError(errorMessage(cause))); }} onOpenOverview={() => show('overview')} onOpenCommands={() => show('commands')}
         onQuit={() => { void quit().catch((cause: unknown) => setLocalError(errorMessage(cause))); }}
         onTogglePin={monitor && snapshot.barsAutohide ? () => {
           void setBarPinned(monitor.monitor.id, !snapshot.pinnedBars.includes(monitor.monitor.id))
