@@ -315,7 +315,8 @@ impl Engine {
                 let page_id = self.snapshot.monitors[t].pages[tp].id.clone();
                 let mut column = take_column(self, m, p, c);
                 // A fresh identity: a parked minimized window may still restore the old one.
-                column.id = self.id("column");
+                let old_id = std::mem::replace(&mut column.id, self.id("column"));
+                self.carry_maximized_column(&old_id, &mut column, m, t); // lane: layout-options
                 for window in &column.windows {
                     self.record_hotplug_move(window, &page_id);
                 }
@@ -782,6 +783,44 @@ mod tests {
         run(&mut e, Command::MoveColumnToMonitor { direction: right() });
         assert_eq!(e.location("1").unwrap(), (0, 0, None));
         assert_eq!((focused(&e), active(&e)), (Some("1"), "a"));
+    }
+
+    #[test]
+    fn moved_maximized_column_keeps_its_restore_width_and_fills_the_target() {
+        let mut e = engine();
+        // Monitor a shows 1000 px, monitor b its whole 1200 px work area.
+        let viewport = Rect {
+            width: 1000,
+            ..e.snapshot.monitors[0].viewport
+        };
+        e.set_viewports(BTreeMap::from([("a".into(), viewport)]));
+        e.reconcile(native(&e, "1")).unwrap();
+        let width = |e: &Engine| {
+            let (m, p, column) = e.location("1").unwrap();
+            e.snapshot.monitors[m].pages[p].columns[column.unwrap().0].width
+        };
+        run(&mut e, Command::SetColumnWidth { width: 450 });
+        run(&mut e, Command::MaximizeColumn);
+        assert_eq!(width(&e), 1000);
+        run(&mut e, Command::MoveColumnToMonitor { direction: left() });
+        assert_eq!((e.location("1").unwrap().0, width(&e)), (1, 1200));
+        run(&mut e, Command::MaximizeColumn);
+        assert_eq!(width(&e), 450);
+        // Back onto the narrower monitor, still maximized and still restoring 450.
+        run(&mut e, Command::MaximizeColumn);
+        run(&mut e, Command::MoveColumnToMonitor { direction: right() });
+        assert_eq!((e.location("1").unwrap().0, width(&e)), (0, 1000));
+        run(&mut e, Command::MaximizeColumn);
+        assert_eq!(width(&e), 450);
+        // A column that is not maximized moves at its own width.
+        run(&mut e, Command::MoveColumnToMonitor { direction: left() });
+        assert_eq!(width(&e), 450);
+        // MovePageToMonitor keeps column identities, so the restore width stays attached.
+        run(&mut e, Command::MaximizeColumn);
+        run(&mut e, Command::MovePageToMonitor { direction: right() });
+        assert_eq!((e.location("1").unwrap().0, width(&e)), (0, 1000));
+        run(&mut e, Command::MaximizeColumn);
+        assert_eq!(width(&e), 450);
     }
 
     #[test]

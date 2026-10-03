@@ -71,8 +71,8 @@ impl Animations {
     }
 }
 
-/// The animation kind a command asks for. Commands without a kind (including ones added
-/// later) use `animationDurationMs`.
+/// The animation kind a command asks for; `None` uses `animationDurationMs`. The match is
+/// exhaustive so that every new command gets classified.
 pub fn command_kind(command: &Command) -> Option<AnimationKind> {
     use AnimationKind::*;
     Some(match command {
@@ -81,15 +81,39 @@ pub fn command_kind(command: &Command) -> Option<AnimationKind> {
         | Command::FocusDirection { .. }
         | Command::Scroll { .. }
         | Command::SlideColumn { .. }
-        | Command::CenterFocused => ViewMovement,
-        Command::SwitchPage { .. } | Command::AddPage { .. } => WorkspaceSwitch,
+        | Command::CenterFocused
+        | Command::FocusColumnFirst
+        | Command::FocusColumnLast
+        | Command::FocusWindowOrPage { .. }
+        | Command::FocusColumnOrMonitor { .. }
+        | Command::FocusMonitor { .. }
+        | Command::FocusWindowPrevious
+        | Command::DragViewport { .. }
+        | Command::SnapViewport { .. } => ViewMovement,
+        Command::SwitchPage { .. }
+        | Command::AddPage { .. }
+        | Command::FocusPagePrevious
+        | Command::MovePageToMonitor { .. } => WorkspaceSwitch,
         Command::MoveWindow { .. }
         | Command::MoveWindowToPage { .. }
         | Command::DropWindow { .. }
         | Command::ToggleFloating
         | Command::ToggleFullscreen
-        | Command::SetFloatingRect { .. } => WindowMovement,
+        | Command::SetFloatingRect { .. }
+        | Command::ConsumeOrExpelWindow { .. }
+        | Command::ConsumeWindowIntoColumn
+        | Command::ExpelWindowFromColumn
+        | Command::MoveColumn { .. }
+        | Command::MoveColumnToFirst
+        | Command::MoveColumnToLast
+        | Command::SwapWindow { .. }
+        | Command::MoveColumnToMonitor { .. }
+        | Command::MoveWindowToMonitor { .. }
+        | Command::ToggleColumnTabbedDisplay => WindowMovement,
         Command::CycleWidth
+        | Command::CycleWidthBack
+        | Command::CycleWindowHeight
+        | Command::MaximizeColumn
         | Command::SetColumnWidth { .. }
         | Command::SetWindowColumnWidth { .. }
         | Command::AdjustColumnWidth { .. }
@@ -97,7 +121,13 @@ pub fn command_kind(command: &Command) -> Option<AnimationKind> {
         | Command::ResetWindowHeights
         | Command::DragEdge { .. }
         | Command::DragRow { .. } => WindowResize,
-        _ => return None,
+        // No layout motion of their own.
+        Command::Disable
+        | Command::SetPageName { .. }
+        | Command::UnsetPageName
+        | Command::Screenshot
+        | Command::ScreenshotScreen
+        | Command::ScreenshotWindow => return None,
     })
 }
 
@@ -270,6 +300,109 @@ mod tests {
             assert_eq!(command_kind(&command), Some(kind), "{command:?}");
         }
         assert_eq!(command_kind(&Command::Disable), None);
+    }
+
+    #[test]
+    fn newer_layout_commands_use_their_documented_kind_not_the_base_duration() {
+        let (left, right) = (Direction::Left, Direction::Right);
+        let m = || "m".to_string();
+        let cases = [
+            (
+                Command::MoveColumn { direction: left },
+                AnimationKind::WindowMovement,
+            ),
+            (Command::MoveColumnToFirst, AnimationKind::WindowMovement),
+            (Command::MoveColumnToLast, AnimationKind::WindowMovement),
+            (
+                Command::ConsumeOrExpelWindow { direction: right },
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::ConsumeWindowIntoColumn,
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::ExpelWindowFromColumn,
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::SwapWindow { direction: left },
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::MoveColumnToMonitor { direction: right },
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::MoveWindowToMonitor { direction: right },
+                AnimationKind::WindowMovement,
+            ),
+            (
+                Command::ToggleColumnTabbedDisplay,
+                AnimationKind::WindowMovement,
+            ),
+            (Command::MaximizeColumn, AnimationKind::WindowResize),
+            (Command::CycleWindowHeight, AnimationKind::WindowResize),
+            (Command::CycleWidthBack, AnimationKind::WindowResize),
+            (Command::FocusColumnFirst, AnimationKind::ViewMovement),
+            (Command::FocusColumnLast, AnimationKind::ViewMovement),
+            (
+                Command::FocusWindowOrPage {
+                    direction: Direction::Down,
+                },
+                AnimationKind::ViewMovement,
+            ),
+            (
+                Command::FocusColumnOrMonitor { direction: left },
+                AnimationKind::ViewMovement,
+            ),
+            (
+                Command::FocusMonitor { direction: right },
+                AnimationKind::ViewMovement,
+            ),
+            (Command::FocusWindowPrevious, AnimationKind::ViewMovement),
+            (
+                Command::DragViewport {
+                    monitor_id: m(),
+                    delta: 5,
+                },
+                AnimationKind::ViewMovement,
+            ),
+            (
+                Command::SnapViewport {
+                    monitor_id: m(),
+                    delta: 0,
+                },
+                AnimationKind::ViewMovement,
+            ),
+            (Command::FocusPagePrevious, AnimationKind::WorkspaceSwitch),
+            (
+                Command::MovePageToMonitor { direction: left },
+                AnimationKind::WorkspaceSwitch,
+            ),
+        ];
+        // Base 0 with one override per kind: an unclassified command would not animate.
+        let animations = Animations {
+            workspace_switch: Some(250),
+            view_movement: Some(150),
+            window_movement: Some(300),
+            window_resize: Some(200),
+            ..Animations::default()
+        };
+        for (command, kind) in cases {
+            let classified = command_kind(&command);
+            assert_eq!(classified, Some(kind), "{command:?}");
+            assert_ne!(animations.duration(classified, MS(0)), MS(0), "{command:?}");
+        }
+        for command in [
+            Command::SetPageName { name: "web".into() },
+            Command::UnsetPageName,
+            Command::Screenshot,
+            Command::ScreenshotScreen,
+            Command::ScreenshotWindow,
+        ] {
+            assert_eq!(command_kind(&command), None, "{command:?}");
+        }
     }
 
     fn engine() -> Engine {

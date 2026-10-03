@@ -15,6 +15,33 @@ fn physical(logical: u32, scale: f64) -> u32 {
         .clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
+/// Column width range from the rule limits of the column's windows (window size plus `gap`).
+fn rule_width_bounds(
+    size_limits: &BTreeMap<WindowId, SizeLimits>,
+    column: &Column,
+    scale: f64,
+    gap: u32,
+) -> (u32, u32) {
+    let limits: Vec<_> = column
+        .windows
+        .iter()
+        .filter_map(|id| size_limits.get(id))
+        .collect();
+    let min = limits
+        .iter()
+        .filter_map(|l| l.min_width)
+        .map(|v| physical(v, scale).saturating_add(gap))
+        .max()
+        .unwrap_or(0);
+    let max = limits
+        .iter()
+        .filter_map(|l| l.max_width)
+        .map(|v| physical(v, scale).saturating_add(gap))
+        .min()
+        .unwrap_or(u32::MAX);
+    (min, max)
+}
+
 /// Rows of `total` pixels shaped like `desired`, each inside `[lo, hi]` (lo wins over hi).
 /// Rows that would leave their range are pinned to it, largest violation side first, and the
 /// rest share what is left. Minimums that cannot all fit shrink proportionally.
@@ -235,20 +262,29 @@ impl Engine {
     /// reconcile. True when native focus must go back to the engine's (unchanged) focus.
     pub(super) fn apply_open_focus(&mut self, previous: Option<&str>) -> bool {
         let requests = std::mem::take(&mut self.open_focus);
-        if !self.snapshot.enabled || !self.snapshot.backend.capabilities.focus {
-            return false;
-        }
+        let manage = self.snapshot.enabled && self.snapshot.backend.capabilities.focus;
         let mut refocus = false;
         for (id, focus) in requests {
             let focused = self.snapshot.focused_window.as_deref() == Some(id.as_str());
-            if focus && !focused && self.location(&id).is_ok() && !self.window_protected(&id) {
+            if manage
+                && focus
+                && !focused
+                && self.location(&id).is_ok()
+                && !self.window_protected(&id)
+            {
                 let _ = self.set_focus(&id, true);
-            } else if !focus && focused {
+            } else if manage && !focus && focused {
+                // Native focus on the new window did not scroll (reconcile_inner); handing focus
+                // back leaves the view as it was before the window opened (niri).
                 if let Some(previous) = previous
                     .filter(|p| *p != id && self.location(p).is_ok() && !self.window_protected(p))
                 {
                     refocus |= self.set_focus(previous, false).is_ok();
                 }
+            }
+            // Focus stays on a window that opened unfocused: reveal it as native focus would.
+            if !focus && self.snapshot.focused_window.as_deref() == Some(id.as_str()) {
+                let _ = self.reveal(&id, false, previous);
             }
         }
         refocus
@@ -268,26 +304,60 @@ impl Engine {
             let scale = monitor.monitor.scale_factor;
             let gap = 2 * half_gap(gaps, scale);
             for column in monitor.pages.iter_mut().flat_map(|p| &mut p.columns) {
-                let limits: Vec<_> = column
-                    .windows
-                    .iter()
-                    .filter_map(|id| self.size_limits.get(id))
-                    .collect();
-                let min = limits
-                    .iter()
-                    .filter_map(|l| l.min_width)
-                    .map(|v| physical(v, scale).saturating_add(gap))
-                    .max()
-                    .unwrap_or(0);
-                let max = limits
-                    .iter()
-                    .filter_map(|l| l.max_width)
-                    .map(|v| physical(v, scale).saturating_add(gap))
-                    .min()
-                    .unwrap_or(u32::MAX);
+                let (min, max) = rule_width_bounds(&self.size_limits, column, scale, gap);
                 column.width = column.width.min(max).max(min);
             }
         }
+    }
+
+    /// The width `cleanup` settles `column` of monitor `m` at when it asks for `width`: rule
+    /// limits (`apply_size_limits`), then native minimum widths and the viewport.
+    pub(super) fn settled_column_width(&self, m: usize, column: &Column, width: u32) -> u32 {
+        let monitor = &self.snapshot.monitors[m];
+        let scale = monitor.monitor.scale_factor;
+        let gap = 2 * half_gap(self.snapshot.gaps, scale);
+        let (min, max) = rule_width_bounds(&self.size_limits, column, scale, gap);
+        let native = column
+            .windows
+            .iter()
+            .filter_map(|id| self.min_widths.get(id))
+            .max()
+            .map_or(0, |w| w.saturating_add(gap));
+        width
+            .min(max)
+            .max(min)
+            .max(native)
+            .min(monitor.viewport.width)
+            .max(1)
+    }
+
+    /// Settle the column widths of page `p` on monitor `m` now, so a scroll computed before
+    /// the next `cleanup` already sees the final widths.
+    pub(super) fn settle_column_widths(&mut self, m: usize, p: usize) {
+        let widths: Vec<u32> = self.snapshot.monitors[m].pages[p]
+            .columns
+            .iter()
+            .map(|column| self.settled_column_width(m, column, column.width))
+            .collect();
+        let columns = &mut self.snapshot.monitors[m].pages[p].columns;
+        for (column, width) in columns.iter_mut().zip(widths) {
+            column.width = width;
+        }
+    }
+
+    /// Height of tab `id` in a tabbed column, `available` below the indicator: only that
+    /// window's rule limits apply, and the space below a capped tab stays empty.
+    pub(super) fn limit_tab_height(&self, id: &str, available: u32, scale: f64) -> u32 {
+        let Some(limits) = self.size_limits.get(id) else {
+            return available;
+        };
+        let max = limits
+            .max_height
+            .map_or(available, |v| physical(v, scale).min(available));
+        let min = limits
+            .min_height
+            .map_or(0, |v| physical(v, scale).min(available));
+        max.max(min).max(1)
     }
 
     /// lane: rules-spawn-screenshot. Row heights of `column` kept inside rule height limits.
@@ -957,6 +1027,81 @@ mod open_rule_tests {
         let t = e.reconcile(system(1.0, &["1", "2"], "1")).unwrap();
         assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
         assert_eq!(focus_actions(&t), ["2"]);
+    }
+
+    #[test]
+    fn open_focused_false_keeps_the_view_on_the_previous_window() {
+        let rule = r#"{"title":"2","openFocused":false,"columnWidth":600}"#;
+        let mut e = engine(1.0, rule);
+        e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+        // The new window opens right of "1" and natively takes focus.
+        let t = e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("1"));
+        assert_eq!(focus_actions(&t), ["1"]);
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+        let placed = |id: &str| {
+            t.actions
+                .iter()
+                .find_map(|a| match a {
+                    NativeAction::Placement {
+                        window_id,
+                        rect,
+                        clip,
+                        minimized,
+                    } if window_id == id => Some((rect.x, rect.width, *clip, *minimized)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(placed("1"), (0, 1200, None, false));
+        assert!(placed("2").3);
+
+        // When focus cannot be handed back, the new window keeps it and is revealed.
+        let mut e = engine(1.0, rule);
+        e.dispatch(Command::SetColumnWidth { width: 1200 }).unwrap();
+        e.snapshot.backend.capabilities.focus = false;
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        assert_eq!(e.snapshot.focused_window.as_deref(), Some("2"));
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 600);
+    }
+
+    #[test]
+    fn tabbed_column_applies_the_shown_tab_height_limits() {
+        let mut e = engine(1.0, r#"{"title":"2","maxHeight":200}"#);
+        e.reconcile(system(1.0, &["1", "2"], "2")).unwrap();
+        e.dispatch(Command::MoveWindow {
+            direction: Direction::Left,
+        })
+        .unwrap();
+        let t = e.dispatch(Command::ToggleColumnTabbedDisplay).unwrap();
+        let rect = |t: &Transition, id: &str| {
+            t.actions
+                .iter()
+                .find_map(|a| match a {
+                    NativeAction::Placement {
+                        window_id,
+                        rect,
+                        minimized,
+                        ..
+                    } if window_id == id => Some((*rect, *minimized)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // 900 tall, 12 px indicator: the capped tab stays at 200 and the rest stays empty.
+        let (shown, minimized) = rect(&t, "2");
+        assert!(!minimized);
+        assert_eq!((shown.y, shown.height), (12, 200));
+        // The unlimited tab still fills the column once shown.
+        let t = e
+            .dispatch(Command::FocusDirection {
+                direction: Direction::Up,
+            })
+            .unwrap();
+        let (shown, minimized) = rect(&t, "1");
+        assert!(!minimized);
+        assert_eq!((shown.y, shown.height), (12, 888));
+        assert!(rect(&t, "2").1);
     }
 
     #[test]

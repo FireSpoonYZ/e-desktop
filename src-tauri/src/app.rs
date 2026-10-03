@@ -1201,6 +1201,22 @@ fn compositor_blocks_native_pointer(composing: bool, raw: &crate::platform::hook
     composing && matches!(raw, Raw::Grab { .. } | Raw::Move { .. } | Raw::MoveSize { start: true, .. })
 }
 
+/// lane: rules-spawn-screenshot. While a screenshot runs, hook events start nothing (drags,
+/// hover focus, hot corners, wheel or swipe actions). Releases, the end of native move loops,
+/// window lifetime events and swipe ends still drain, to finish what the screenshot cancelled.
+#[cfg(target_os = "windows")]
+fn screenshot_blocks_native_pointer(raw: &crate::platform::hook::Raw) -> bool {
+    use crate::{gestures::Swipe, platform::hook::Raw};
+    matches!(
+        raw,
+        Raw::Grab { .. }
+            | Raw::Move { .. }
+            | Raw::MoveSize { start: true, .. }
+            | Raw::Wheel { .. }
+            | Raw::Swipe { swipe: Swipe::Drag(_) | Swipe::PageBegin, .. }
+    )
+}
+
 #[cfg(target_os = "windows")]
 impl Controller {
     fn refresh_within(&mut self, delay: Duration) {
@@ -1357,6 +1373,9 @@ impl Controller {
         raw: crate::platform::hook::Raw,
     ) -> Result<Option<Request>, AppError> {
         use crate::platform::hook::Raw;
+        if crate::screenshot::active() && screenshot_blocks_native_pointer(&raw) {
+            return Ok(None);
+        }
         let blocked = compositor_blocks_native_pointer(
             self.backend.as_ref().is_some_and(Backend::composing),
             &raw,
@@ -2044,6 +2063,7 @@ fn run_controller(
                 // lane: rules-spawn-screenshot
                 let result = match crate::screenshot::Kind::of(&command) {
                     Some(kind) => controller.screenshot(
+                        &app,
                         &sender,
                         kind,
                         shortcuts.config.screenshot_path.clone(),
@@ -2129,10 +2149,8 @@ fn run_controller(
             }
             #[cfg(target_os = "windows")]
             Ok(Request::Pointer) => {
-                // lane: rules-spawn-screenshot. No hot corners or pointer focus over the picker.
-                if crate::screenshot::active() {
-                    let _ = crate::platform::hook::drain();
-                } else if let Some(request) = controller.pointer(&app, &shortcuts.config) {
+                // lane: rules-spawn-screenshot. pointer_event filters events while capturing.
+                if let Some(request) = controller.pointer(&app, &shortcuts.config) {
                     let _ = sender.try_send(request);
                 }
                 if let Some(delay) = controller.refresh_soon.take() {
@@ -2166,8 +2184,8 @@ fn run_controller(
                     matches!(surface, Surface::Overview) && controller.preview_capable();
                 let session = controller.preview_session.begin(available);
                 let hotkeys = matches!(surface, Surface::Hotkeys)
-                    .then_some(shortcuts.config.shortcuts.as_slice());
-                match show_surface(&app, host, surface, session, hotkeys) {
+                    .then(|| shortcuts.registered_bindings());
+                match show_surface(&app, host, surface, session, hotkeys.as_deref()) {
                     Ok(host) => {
                         // Showing one surface hides the others.
                         controller.note_surface(Surface::Overview, None);
@@ -2360,6 +2378,56 @@ mod tests {
     use super::*;
     use crate::model::Monitor;
 
+    /// Enabled layout on monitors "a" (x 0..1000) and "b" (x 1000..2000), one window each
+    /// ("wa" focused, "wb").
+    pub(super) fn two_monitor_engine() -> Engine {
+        use crate::model::{Capabilities, NativeWindow, SystemSnapshot};
+        let mut engine = Engine::new(BackendStatus {
+            availability: BackendAvailability::Ready,
+            capabilities: Capabilities {
+                enumerate: true, placement: true, focus: true, minimize: true, clipping: true,
+                ..Capabilities::default()
+            },
+            ..BackendStatus::default()
+        });
+        let area = |x| Rect { x, y: 0, width: 1000, height: 800 };
+        engine.reconcile(SystemSnapshot {
+            monitors: [("a", 0), ("b", 1000)].into_iter().map(|(id, x)| Monitor {
+                id: id.into(), name: id.into(), bounds: area(x), work_area: area(x),
+                scale_factor: 1.0, primary: x == 0,
+            }).collect(),
+            windows: [("wa", "a", 0), ("wb", "b", 1000)].into_iter().map(|(id, m, x)| {
+                NativeWindow {
+                    id: id.into(), title: String::new(), app_name: String::new(),
+                    process_id: 1, monitor_id: m.into(), rect: area(x),
+                    minimized: false, minimized_by_manager: false, resizable: true,
+                }
+            }).collect(),
+            focused_window: Some("wa".into()),
+        }).unwrap();
+        engine.dispatch(Command::Enable).unwrap();
+        engine
+    }
+
+    /// A controller without a native backend. Tests must not reach `run`/`command`, which
+    /// would connect one.
+    pub(super) fn offline_controller(engine: Engine) -> Controller {
+        Controller {
+            trace: IpcTrace::NONE, backend: None, engine, errors: vec![],
+            config_error: None, window_rules: vec![], placements: Placements::new(),
+            refused: Placements::new(), animation: Animation::default(),
+            animation_duration: Duration::from_millis(160),
+            animations: Default::default(),
+            preview_session: PreviewSession::default(), gesture: None, window_drag: false,
+            hovered: None, in_corner: false, top_bar: true, native_drag: None,
+            native_move: None, ignored_foreground: None, refresh_soon: None,
+            autohide: false, pinned: BTreeSet::new(), revealed: BTreeSet::new(),
+            overview_host: None, commands_host: None,
+            #[cfg(target_os = "windows")]
+            input_gestures: Default::default(),
+        }
+    }
+
     #[test]
     fn open_surfaces_hold_native_focus_through_drop_resize_and_dismiss_handoff() {
         use crate::model::{Capabilities, NativeWindow, SystemSnapshot};
@@ -2548,6 +2616,30 @@ mod tests {
             Raw::MoveSize { hwnd: 1, start: false, moving: None },
         ] {
             assert!(!compositor_blocks_native_pointer(true, &raw));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn screenshot_pointer_gate_blocks_new_actions_but_keeps_ends_and_cleanup() {
+        use crate::{gestures::Swipe, platform::hook::Raw};
+        let swipe = |swipe| Raw::Swipe { x: 0, y: 0, swipe };
+        for raw in [
+            Raw::Grab { hwnd: 1, x: 0, y: 0 },
+            Raw::Move { x: 0, y: 0, pressed: true },
+            Raw::MoveSize { hwnd: 1, start: true, moving: Some(true) },
+            Raw::Wheel { x: 0, y: 0, delta: 120, horizontal: false, time: 0 },
+            swipe(Swipe::Drag(0.1)),
+            swipe(Swipe::PageBegin),
+        ] {
+            assert!(screenshot_blocks_native_pointer(&raw), "{raw:?}");
+        }
+        for raw in [
+            Raw::Release { x: 0, y: 0 }, Raw::Up, Raw::Windows,
+            Raw::MoveSize { hwnd: 1, start: false, moving: None },
+            swipe(Swipe::Release(0.0)), swipe(Swipe::Page(1)), swipe(Swipe::Cancel),
+        ] {
+            assert!(!screenshot_blocks_native_pointer(&raw), "{raw:?}");
         }
     }
 

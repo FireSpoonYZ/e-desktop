@@ -23,7 +23,7 @@ use windows_sys::Win32::{
 use super::hook::{Raw, down, mask_modifier, push};
 use crate::{
     config::WheelModifier,
-    gestures::{Contact, Frames, Slot, Touchpad, wheel_modifier_held},
+    gestures::{Contact, Frames, Slot, Swipe, Touchpad, wheel_modifier_held},
 };
 
 /// Re-register the touchpad after the configured finger count changed.
@@ -258,7 +258,14 @@ fn now_ms() -> u64 {
 
 impl Pad {
     fn sync(&mut self, window: HWND) {
-        self.swipe = None;
+        // The controller ends its swipe as well: the restarted recognizer never releases it.
+        if self.swipe.take().is_some() {
+            push(Raw::Swipe {
+                x: 0,
+                y: 0,
+                swipe: Swipe::Cancel,
+            });
+        }
         let wanted = FINGERS.load(Ordering::Acquire) != 0;
         if wanted == self.registered {
             return;

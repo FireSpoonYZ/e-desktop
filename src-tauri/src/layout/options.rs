@@ -282,6 +282,12 @@ impl Engine {
         state.options = options;
     }
 
+    /// Check the declared workspaces again at the next cleanup (after a layout restore
+    /// replaced the pages they were created on).
+    pub(super) fn rearm_named_pages(&mut self) {
+        self.layout_options.workspaces_pending = true;
+    }
+
     pub fn layout_options(&self) -> &LayoutOptions {
         &self.layout_options.options
     }
@@ -343,9 +349,12 @@ impl Engine {
                 .flat_map(|m| &m.pages)
                 .any(|p| p.columns.iter().any(|c| &c.id == column))
         });
+        // Rule and native width limits can hold a maximized column below the viewport width.
+        let maximized =
+            self.settled_column_width(m, &self.snapshot.monitors[m].pages[p].columns[c], full);
         let column = &mut self.snapshot.monitors[m].pages[p].columns[c];
         let restore = self.layout_options.maximized.remove(&column.id);
-        column.width = if column.width == full {
+        column.width = if column.width == maximized {
             // Already full width without a saved width (e.g. set by hand): use the default.
             restore.unwrap_or(default).min(full)
         } else {
@@ -355,6 +364,27 @@ impl Engine {
             full
         };
         self.ensure_visible(&id, false)
+    }
+
+    /// `column` left monitor `m` for monitor `t` under a fresh ID (`MoveColumnToMonitor`): a
+    /// maximized column keeps the width it returns to and fills the target viewport.
+    pub(super) fn carry_maximized_column(
+        &mut self,
+        old_id: &str,
+        column: &mut Column,
+        m: usize,
+        t: usize,
+    ) {
+        let Some(restore) = self.layout_options.maximized.remove(old_id) else {
+            return;
+        };
+        let full = self.snapshot.monitors[m].viewport.width;
+        if column.width == self.settled_column_width(m, column, full) {
+            column.width = self.snapshot.monitors[t].viewport.width;
+            self.layout_options
+                .maximized
+                .insert(column.id.clone(), restore);
+        }
     }
 
     fn active_page_position(&self) -> Result<(usize, usize), AppError> {
@@ -465,6 +495,8 @@ impl Engine {
             Ok((pm, pp, Some((pc, _)))) if (pm, pp) == (m, p) && pc != c => Some(pc),
             _ => None,
         });
+        // Fit and center by the widths cleanup will leave, not a request it will clamp.
+        self.settle_column_widths(m, p);
         let viewport = self.snapshot.monitors[m].viewport.width;
         let options = &self.layout_options.options;
         let page = &mut self.snapshot.monitors[m].pages[p];
@@ -779,6 +811,57 @@ mod tests {
         assert_eq!(column_width(&e, "1"), 600);
         e.dispatch(Command::ToggleFloating).unwrap();
         assert!(e.dispatch(Command::MaximizeColumn).is_err());
+    }
+
+    #[test]
+    fn maximize_column_restores_width_when_a_max_width_rule_caps_it() {
+        let mut e = engine("{}", &["1", "2"]);
+        e.set_window_rules(vec![
+            serde_json::from_str(r#"{"title":"3","maxWidth":800}"#).unwrap(),
+        ])
+        .unwrap();
+        let mut native = system(&["1", "2", "3"]);
+        native.focused_window = Some("3".into());
+        e.reconcile(native).unwrap();
+        e.dispatch(Command::SetColumnWidth { width: 450 }).unwrap();
+        e.dispatch(Command::MaximizeColumn).unwrap();
+        assert_eq!(column_width(&e, "3"), 800);
+        // The capped column is maximized: the toggle returns to the saved width.
+        e.dispatch(Command::MaximizeColumn).unwrap();
+        assert_eq!(column_width(&e, "3"), 450);
+        e.dispatch(Command::MaximizeColumn).unwrap();
+        assert_eq!(column_width(&e, "3"), 800);
+        // Resized by hand after maximizing: the toggle maximizes again from the new width.
+        e.dispatch(Command::SetColumnWidth { width: 500 }).unwrap();
+        e.dispatch(Command::MaximizeColumn).unwrap();
+        assert_eq!(column_width(&e, "3"), 800);
+        e.dispatch(Command::MaximizeColumn).unwrap();
+        assert_eq!(column_width(&e, "3"), 500);
+    }
+
+    #[test]
+    fn centering_uses_the_width_left_after_min_width_clamping() {
+        let mut e = engine(r#"{"centerFocusedColumn":"always"}"#, &["1", "2"]);
+        e.set_window_rules(vec![
+            serde_json::from_str(r#"{"title":"3","columnWidth":700,"minWidth":700}"#).unwrap(),
+        ])
+        .unwrap();
+        let mut native = system(&["1", "2", "3"]);
+        native.focused_window = Some("3".into());
+        e.reconcile(native).unwrap();
+        let t = e.dispatch(Command::SetColumnWidth { width: 100 }).unwrap();
+        assert_eq!(column_width(&e, "3"), 700);
+        let (m, p, column) = e.location("3").unwrap();
+        let page = &e.snapshot.monitors[m].pages[p];
+        let left: i32 = page.columns[..column.unwrap().0]
+            .iter()
+            .map(|c| c.width as i32)
+            .sum();
+        assert_eq!(page.viewport_x, left + (700 - 1200) / 2);
+        // The focused window is centered whole: not clipped and not hidden.
+        assert!(t.actions.iter().any(|a| matches!(a,
+            NativeAction::Placement { window_id, rect, clip: None, minimized: false }
+                if window_id == "3" && rect.x == 250 && rect.width == 700)));
     }
 
     #[test]

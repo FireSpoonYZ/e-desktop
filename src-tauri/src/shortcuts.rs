@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::config::{Config, ShortcutAction};
+use crate::config::{Config, ShortcutAction, ShortcutBinding};
 
 /// Callbacks carry only canonical keys; actions are read after a mapping is committed.
 pub struct Shortcuts {
@@ -26,6 +26,16 @@ impl Shortcuts {
             .iter()
             .find(|binding| binding.key == key)
             .map(|binding| &binding.action)
+    }
+
+    /// The configured bindings whose keys are registered: what the hotkey overlay lists.
+    pub fn registered_bindings(&self) -> Vec<ShortcutBinding> {
+        self.config
+            .shortcuts
+            .iter()
+            .filter(|binding| self.registered.contains(&binding.key))
+            .cloned()
+            .collect()
     }
 
     fn keys(&self) -> BTreeSet<String> {
@@ -121,7 +131,6 @@ pub fn normalize_key(key: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ShortcutBinding;
 
     fn config(keys: &[&str]) -> Config {
         Config {
@@ -215,6 +224,34 @@ mod tests {
         assert!(!shortcuts.available());
         assert_eq!(shortcuts.action("C"), None);
         assert_eq!(shortcuts.config, config(&["A", "B"]));
+    }
+
+    #[test]
+    fn registered_bindings_leave_out_keys_that_failed_to_register() {
+        // Startup: another program holds B, so B is neither added nor restored.
+        let mut shortcuts = Shortcuts::new(config(&["A", "B", "C"]));
+        assert!(shortcuts.registered_bindings().is_empty());
+        let result = shortcuts.replace(config(&["A", "B", "C"]), |key, _| {
+            if key == "B" {
+                Err("B taken".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.unwrap_err().contains("B taken"));
+        assert!(!shortcuts.available());
+        let keys: Vec<_> = shortcuts
+            .registered_bindings()
+            .into_iter()
+            .map(|binding| binding.key)
+            .collect();
+        assert_eq!(keys, ["A", "C"]);
+        // Once every key registers, the overlay lists the whole mapping in config order.
+        shortcuts
+            .replace(config(&["C", "B", "A"]), |_, _| Ok(()))
+            .unwrap();
+        assert!(shortcuts.available());
+        assert_eq!(shortcuts.registered_bindings(), shortcuts.config.shortcuts);
     }
 
     #[cfg(feature = "desktop")]

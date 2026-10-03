@@ -70,8 +70,8 @@ Windows 调试可执行文件：`target/debug/e-desktop.exe`。去掉 `--debug` 
 | `Ctrl+Alt+Shift+,/.` | 当前列移到左侧 / 右侧显示器的当前页面并跟随 |
 | `` Ctrl+Alt+` `` | 回到上一个聚焦的窗口（可跨页面和显示器） |
 | `Ctrl+Alt+P` | 当前显示器回到上一个页面 |
-| `Ctrl+Alt+M` | 切换当前列最大化：视口全宽 / 恢复原宽度（不同于布局全屏） |
-| `Ctrl+Alt+E` | 循环聚焦窗口在列内的预设高度（见[布局选项](docs/configuration.md#布局选项与命名页面)） |
+| `Ctrl+Alt+Shift+M` | 切换当前列最大化：视口全宽 / 恢复原宽度（不同于布局全屏） |
+| `Ctrl+Alt+Shift+E` | 循环聚焦窗口在列内的预设高度（见[布局选项](docs/configuration.md#布局选项与命名页面)） |
 | `Ctrl+Alt+W` | 切换当前列的标签显示：只显示一个窗口，上下聚焦切换标签（见[配置文档](docs/configuration.md#标签列)） |
 | `Ctrl+Alt+/` | 显示 / 关闭快捷键提示（首次启用平铺时自动显示一次） |
 | 概览中 `Ctrl+滚轮` / 触控板捏合 | 缩放概览 |
@@ -79,7 +79,7 @@ Windows 调试可执行文件：`target/debug/e-desktop.exe`。去掉 `--debug` 
 | `Win+Shift+滚轮`、`Win+横向滚轮` | 向左 / 右聚焦一列（仅 Windows） |
 | `Ctrl+Alt+S` | 截图：冻结画面后框选区域，保存 PNG 并复制到剪贴板（仅 Windows，见[配置文档](docs/configuration.md#正则窗口规则启动命令和截图)） |
 | `Ctrl+Alt+Shift+S` | 截取当前活动显示器 |
-| `Ctrl+Alt+X` | 截取当前焦点窗口 |
+| `Ctrl+Alt+Shift+X` | 截取当前焦点窗口 |
 
 全局快捷键可能与现有软件冲突，注册失败会显示具体组合；其余已注册组合仍可使用。此次测试机的 `Ctrl+Alt+L`、`Ctrl+Alt+R` 被占用，对应功能仍有命令面板入口，列宽操作已通过面板实测。支持通过 JSON 文件修改快捷键并自动热加载：只写需要覆盖、新增或删除（`unbind`）的组合，其余沿用默认值；尚无设置界面。在空页面或没有聚焦窗口时，先选择一个窗口再执行移动、列宽等动作。
 

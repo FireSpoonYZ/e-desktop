@@ -241,7 +241,7 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
   "centerFocusedColumn": "onOverflow",
   "alwaysCenterSingleColumn": true,
   "struts": { "left": 64, "right": 64, "top": 0, "bottom": 0 },
-  "workspaces": [{ "name": "chat", "monitor": "DISPLAY2" }, { "name": "web" }],
+  "workspaces": [{ "name": "chat", "monitor": "\\\\.\\DISPLAY2" }, { "name": "web" }],
   "windowRules": [{ "appName": "slack", "pageName": "chat" }],
   "shortcuts": [
     { "key": "Control+Alt+Shift+C", "action": { "type": "pageByName", "name": "chat" } },
@@ -254,7 +254,7 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
 | --- | --- | --- |
 | `presetColumnWidths` | 1/3、1/2、2/3 | `cycleWidth`（`Ctrl+Alt+R`）按数组顺序循环的列宽；`cycleWidthBack`（仅命令面板）反向循环。当前宽度等于某个预设时切到下一个，否则切到沿循环方向第一个更宽（反向时更窄）的预设 |
 | `defaultColumnWidth` | `{ "proportion": 0.5 }` | 新列的宽度；窗口规则的 `columnWidth` 优先 |
-| `presetWindowHeights` | 1/3、1/2、2/3 | `cycleWindowHeight`（`Ctrl+Alt+E`）把聚焦窗口在列内的高度循环设为这些值，同列其余窗口按原有比例分配剩余高度；列中只有一个窗口时不变 |
+| `presetWindowHeights` | 1/3、1/2、2/3 | `cycleWindowHeight`（`Ctrl+Alt+Shift+E`）把聚焦窗口在列内的高度循环设为这些值，同列其余窗口按原有比例分配剩余高度；列中只有一个窗口时不变 |
 | `centerFocusedColumn` | `"never"` | `never`：只滚动到聚焦列完整可见；`always`：聚焦列总是居中；`onOverflow`：聚焦列与焦点来源一侧的相邻列放不进同一屏时才居中 |
 | `alwaysCenterSingleColumn` | `false` | 页面只有一列时让它居中 |
 | `struts` | 全为 `0` | 从布局区域左、右、上、下各扣掉的逻辑像素（乘以该显示器的缩放），与固定顶栏占位叠加，再在其内留出 `gaps` |
@@ -264,11 +264,11 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
 
 居中设置在焦点变化和“确保焦点列可见”的滚动时生效（切换焦点、移动窗口、调整宽度等）；比视口还宽的列靠左对齐，不居中。`Ctrl+Alt+C` 的手动居中不受这些设置影响。
 
-`maximizeColumn`（`Ctrl+Alt+M`）把当前列切换为视口全宽，窗口仍在平铺中、保留间距和顶栏，不同于 `Ctrl+Alt+F` 的布局全屏；再次执行恢复切换前的宽度。若列已是全宽且没有记录的原宽度（例如手动设成全宽），恢复为 `defaultColumnWidth`。
+`maximizeColumn`（`Ctrl+Alt+Shift+M`）把当前列切换为视口全宽，窗口仍在平铺中、保留间距和顶栏，不同于 `Ctrl+Alt+F` 的布局全屏；再次执行恢复切换前的宽度。若列已是全宽且没有记录的原宽度（例如手动设成全宽），恢复为 `defaultColumnWidth`。
 
 ### 命名页面
 
-`workspaces` 中每项为 `{ "name": "名称", "monitor": "显示器名称或 ID" }`，`monitor` 可省略。名称不能为空白，不区分大小写且不能重复。启动时（以及修改了 `workspaces` 的配置重载后）为尚不存在的名称创建页面，按声明顺序排在该显示器的未命名页面之前；`monitor` 未写或找不到时放在主显示器上。启动时已有的窗口仍留在原来的未命名页面。
+`workspaces` 中每项为 `{ "name": "名称", "monitor": "显示器名称或 ID" }`，`monitor` 可省略。`monitor` 须与显示器的完整名称（不区分大小写）或 ID 完全一致：Windows 上名称形如 `\\.\DISPLAY2`，写进 JSON 时每个反斜杠都要转义，即 `"\\\\.\\DISPLAY2"`；只写 `DISPLAY2` 匹配不到。运行 `e-desktop-msg pages` 可以看到每块显示器的 `显示器 名称 (ID)`，快照中对应 `monitors[].monitor` 的 `name` 和 `id`，复制其中之一即可。名称不能为空白，不区分大小写且不能重复。启动时（以及修改了 `workspaces` 的配置重载后）为尚不存在的名称创建页面，按声明顺序排在该显示器的未命名页面之前；`monitor` 未写或找不到时放在主显示器上。启动时已有的窗口仍留在原来的未命名页面。
 
 带名称的页面即使为空也不会被自动回收；顶栏页面按钮显示名称而不是编号，概览、命令面板和顶栏位置也显示名称。命令：
 
@@ -287,8 +287,8 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
 
 | 快捷键 | 行为 |
 | --- | --- |
-| `Ctrl+Alt+M` | 切换当前列最大化（视口全宽 / 恢复原宽度） |
-| `Ctrl+Alt+E` | 循环聚焦窗口在列内的预设高度 |
+| `Ctrl+Alt+Shift+M` | 切换当前列最大化（视口全宽 / 恢复原宽度） |
+| `Ctrl+Alt+Shift+E` | 循环聚焦窗口在列内的预设高度 |
 
 ## 标签列
 
@@ -335,18 +335,18 @@ Windows 上，标签指示器是一条画在保留空间里的分段条：每段
 
 | 字段 | 覆盖的动画 |
 | --- | --- |
-| `workspaceSwitch` | 任一显示器的当前页面发生变化：切换或新增页面、把窗口移到其他页面并跟随、聚焦其他页面上的窗口 |
-| `viewMovement` | 横向视口移动：滚动、滑动一列、居中、方向聚焦和点选聚焦 |
-| `windowMovement` | 窗口换位：移动窗口或列、拖动窗口松手、移到其他页面（不跟随）、切换浮动或布局全屏 |
-| `windowResize` | 尺寸变化：循环列宽、设置或增减列宽和高度、恢复等高、拖动分界线松手 |
+| `workspaceSwitch` | 任一显示器的当前页面发生变化：切换或新增页面、回到上一个页面、把页面移到其他显示器、把窗口移到其他页面并跟随、聚焦其他页面上的窗口 |
+| `viewMovement` | 横向视口移动：滚动、滑动一列、居中、方向聚焦和点选聚焦、聚焦首列 / 末列、聚焦其他显示器或上一个窗口、触控板横向滑动及松手吸附 |
+| `windowMovement` | 窗口换位：移动窗口或列（含移到最前 / 最后、移到其他显示器）、并入或移出列、与相邻列交换窗口、拖动窗口松手、移到其他页面（不跟随）、切换浮动、布局全屏或标签列 |
+| `windowResize` | 尺寸变化：循环列宽（含反向）、循环窗口高度、列最大化、设置或增减列宽和高度、恢复等高、拖动分界线松手 |
 | `windowOpenClose` | 窗口出现或消失后的重排（含启用平铺、关闭窗口、刷新）；这类重排发生时如果已有动画在进行，沿用那段动画的时长 |
 | `overviewOpenClose` | 概览打开和关闭时缩略图的缩放 |
 
-每次布局变化只使用一个时长。页面发生变化时总是按 `workspaceSwitch`；没有列在表中的命令使用 `animationDurationMs`。布局动画仍然只在 Windows 上生效。
+每次布局变化只使用一个时长。页面发生变化时总是按 `workspaceSwitch`；没有列在表中的命令（暂停、页面命名、截图等本身不移动窗口的命令）使用 `animationDurationMs`。布局动画仍然只在 Windows 上生效。
 
 ### 快捷键提示
 
-`Ctrl+Alt+/`（动作 `{ "type": "hotkeyOverlay" }`）打开或关闭快捷键提示窗口，列出当前实际生效的全局快捷键：已经合并了配置中的覆盖和新增组合，`unbind` 删除的组合不再显示。条目按聚焦、移动窗口、视口、尺寸、窗口、工作区、界面、应用分组，同一动作的多个组合合并为一行；无法识别的动作显示动作类型和参数。
+`Ctrl+Alt+/`（动作 `{ "type": "hotkeyOverlay" }`）打开或关闭快捷键提示窗口，列出当前实际生效的全局快捷键：已经合并了配置中的覆盖和新增组合，`unbind` 删除的组合和被其他软件占用、注册失败的组合不显示。条目按聚焦、移动窗口、视口、尺寸、窗口、工作区、界面、应用分组，同一动作的多个组合合并为一行；无法识别的动作显示动作类型和参数。
 
 提示窗口显示在活动显示器中央，打开时获得键盘焦点，但不遮挡屏幕其他部分，鼠标仍可直接操作其他窗口。按 `Esc`、点击提示窗口或再按一次 `Ctrl+Alt+/` 关闭，焦点回到原来的窗口；点击其他窗口时提示窗口也会关闭，焦点留在被点击的窗口。
 
@@ -425,9 +425,9 @@ Windows 上，标签指示器是一条画在保留空间里的分段条：每段
 ```json
 {
   "windowRules": [
-    { "matches": [{ "appName": "^firefox$", "title": "(?i)picture-in-picture" }], "floating": true },
-    { "matches": [{ "appName": "^Code$" }, { "appName": "^WindowsTerminal$" }], "excludes": [{ "title": "设置" }], "openMaximized": true },
-    { "excludes": [{ "appName": "^explorer$" }], "maxWidth": 1600 }
+    { "matches": [{ "appName": "(?i)^firefox\\.exe$", "title": "(?i)picture-in-picture" }], "floating": true },
+    { "matches": [{ "appName": "(?i)^Code\\.exe$" }, { "appName": "(?i)^WindowsTerminal\\.exe$" }], "excludes": [{ "title": "设置" }], "openMaximized": true },
+    { "excludes": [{ "appName": "(?i)^explorer\\.exe$" }], "maxWidth": 1600 }
   ]
 }
 ```
@@ -435,6 +435,7 @@ Windows 上，标签指示器是一条画在保留空间里的分段条：每段
 - 同一对象里的条件必须都匹配；`matches` 中任一对象匹配、且 `excludes` 中没有对象匹配时规则才生效。省略或空的 `matches` 表示不额外限制，只写 `excludes` 即匹配其余所有窗口。
 - 旧的 `appName` / `title` 子串条件保留，与 `matches` / `excludes` 同时写时也必须满足。
 - 正则为非锚定搜索并区分大小写，与 niri 相同；需要整串匹配请写 `^…$`，不区分大小写请加 `(?i)`。语法见 Rust [regex](https://docs.rs/regex/latest/regex/#syntax) 库。
+- Windows 上 `appName` 是带扩展名的可执行文件名（如 `Code.exe`），整串匹配时要把 `.exe` 写进去；点号在正则里要写成 `\.`，放进 JSON 字符串再转义一次，即 `"^Code\\.exe$"`。X11 上 `appName` 是 WM_CLASS，没有扩展名；同一份配置要兼顾两边可写 `"(?i)^code(\\.exe)?$"`。可执行文件名的大小写因程序而异，建议加 `(?i)`。
 - 正则在加载配置时编译，写错的正则作为配置错误显示，并保留上次有效配置。`matches` / `excludes` 中的对象至少要有一个字段。
 
 新增的动作字段（同样只在窗口首次被发现时执行，多条规则按顺序合并，后面的覆盖前面的）：
@@ -458,7 +459,7 @@ Windows 上，标签指示器是一条画在保留空间里的分段条：每段
   "spawnAtStartup": [["C:\\Program Files\\Everything\\Everything.exe", "-startup"]],
   "shortcuts": [
     { "key": "Control+Alt+T", "action": { "type": "spawn", "command": ["wt.exe", "-d", "C:\\"] } },
-    { "key": "Control+Alt+E", "action": { "type": "spawnSh", "command": "start \"\" notepad && start calc" } }
+    { "key": "Control+Alt+Shift+T", "action": { "type": "spawnSh", "command": "start \"\" notepad && start calc" } }
   ]
 }
 ```
@@ -477,9 +478,9 @@ Windows 上，标签指示器是一条画在保留空间里的分段条：每段
 | --- | --- | --- |
 | `Ctrl+Alt+S` | `screenshot` | 冻结当前所有显示器的画面，拖动鼠标框选区域（可以跨显示器）。`Enter` 或空格确认，没有框选时截取鼠标所在的显示器；`Esc` 或右键取消。重新拖动即重新框选 |
 | `Ctrl+Alt+Shift+S` | `screenshotScreen` | 截取当前活动显示器 |
-| `Ctrl+Alt+X` | `screenshotWindow` | 截取当前前台窗口；命令面板或概览在最前面时截取布局中的焦点窗口 |
+| `Ctrl+Alt+Shift+X` | `screenshotWindow` | 截取当前前台窗口；命令面板或概览在最前面时截取布局中的焦点窗口 |
 
-命令面板中也有对应的三条命令，执行时先收起面板再截图；也可以用 `{ "type": "command", "command": { "type": "screenshot" } }` 等形式绑定。截图在暂停管理时同样可用，外部全屏程序暂停该显示器时也不会被拦截。
+命令面板中也有对应的三条命令，执行时先收起面板再截图；用快捷键截图时，打开着的概览、命令面板和快捷键提示同样先收起；也可以用 `{ "type": "command", "command": { "type": "screenshot" } }` 等形式绑定。截图在暂停管理时同样可用，外部全屏程序暂停该显示器时也不会被拦截。
 
 ```json
 { "screenshotPath": "D:\\截图\\%Y%m%d-%H%M%S.png" }

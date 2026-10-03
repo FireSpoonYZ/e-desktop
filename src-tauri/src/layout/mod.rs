@@ -657,7 +657,11 @@ impl Engine {
                     && self.snapshot.monitors[m].pages[p].id
                         == self.snapshot.monitors[m].active_page
                 {
-                    self.set_focus(&id, viewport_changed || previous.as_ref() != Some(&id))?;
+                    // lane: rules-spawn-screenshot. A window opening unfocused does not move the
+                    // view; apply_open_focus hands focus back or reveals it.
+                    let reveal = (viewport_changed || previous.as_ref() != Some(&id))
+                        && self.open_focus.get(&id) != Some(&false);
+                    self.set_focus(&id, reveal)?;
                 }
             }
         }
@@ -1703,8 +1707,15 @@ impl Engine {
                             },
                             half,
                         );
-                        let (_, rect) = tabbed::split_tab_bar(tile, monitor.monitor.scale_factor);
+                        let (_, below) = tabbed::split_tab_bar(tile, monitor.monitor.scale_factor);
                         for id in &column.windows {
+                            // lane: rules-spawn-screenshot. Each tab keeps its own height limits.
+                            let height = self.limit_tab_height(
+                                id,
+                                below.height,
+                                monitor.monitor.scale_factor,
+                            );
+                            let rect = Rect { height, ..below };
                             self.place(&mut actions, id, rect, outer, &uncovered, active, fullscreen);
                             if let Some(NativeAction::Placement {
                                 window_id,

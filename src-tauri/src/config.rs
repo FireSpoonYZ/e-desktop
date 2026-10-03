@@ -477,9 +477,9 @@ impl Config {
             ("Shift+Period", Command::MoveColumnToMonitor { direction: right }),
             ("Backquote", Command::FocusWindowPrevious),
             ("P", Command::FocusPagePrevious),
-            // lane: layout-options
-            ("M", Command::MaximizeColumn),
-            ("E", Command::CycleWindowHeight),
+            // lane: layout-options. Shift: other programs commonly hold Ctrl+Alt+M/E.
+            ("Shift+M", Command::MaximizeColumn),
+            ("Shift+E", Command::CycleWindowHeight),
         ] {
             bind(
                 format!("Control+Alt+{key}"),
@@ -499,7 +499,7 @@ impl Config {
         for (key, action) in [
             ("S", ShortcutAction::Screenshot {}),
             ("Shift+S", ShortcutAction::ScreenshotScreen {}),
-            ("X", ShortcutAction::ScreenshotWindow {}),
+            ("Shift+X", ShortcutAction::ScreenshotWindow {}),
         ] {
             bind(format!("Control+Alt+{key}"), action);
         }
@@ -754,6 +754,27 @@ mod tests {
         model::{Monitor, MonitorState, Page, Rect},
         shortcuts::Shortcuts,
     };
+
+    #[test]
+    fn defaults_avoid_ctrl_alt_e_m_x_held_by_other_programs() {
+        let builtin = Config::builtin_shortcuts();
+        let keys: Vec<_> = builtin.iter().map(|b| b.key.as_str()).collect();
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "duplicate default keys");
+        for old in ["Control+Alt+E", "Control+Alt+M", "Control+Alt+X"] {
+            assert!(!keys.contains(&old), "{old} is still a default");
+        }
+        let command = |command| ShortcutAction::Command { command };
+        for (key, action) in [
+            ("Control+Alt+Shift+E", command(Command::CycleWindowHeight)),
+            ("Control+Alt+Shift+M", command(Command::MaximizeColumn)),
+            ("Control+Alt+Shift+X", ShortcutAction::ScreenshotWindow {}),
+        ] {
+            let bound: Vec<_> = builtin.iter().filter(|b| b.key == key).collect();
+            assert_eq!(bound.len(), 1, "{key}");
+            assert_eq!(bound[0].action, action, "{key}");
+        }
+    }
 
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
@@ -1309,7 +1330,7 @@ mod spawn_screenshot_tests {
         for (key, action) in [
             ("Control+Alt+S", ShortcutAction::Screenshot {}),
             ("Control+Alt+Shift+S", ShortcutAction::ScreenshotScreen {}),
-            ("Control+Alt+X", ShortcutAction::ScreenshotWindow {}),
+            ("Control+Alt+Shift+X", ShortcutAction::ScreenshotWindow {}),
         ] {
             assert_eq!(
                 builtin

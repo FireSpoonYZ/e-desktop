@@ -12,6 +12,8 @@ use super::*;
 pub const LAYOUT_STATE_VERSION: u32 = 1;
 /// Quiet period after the last layout change before the state file is written.
 pub const SAVE_DELAY: Duration = Duration::from_secs(1);
+/// Longest wait between automatic retries after the state file could not be written.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Contents of `layout-state.json`. Model structs are stored whole, so fields added to them
 /// are saved and restored without changes here.
@@ -26,6 +28,9 @@ pub struct LayoutState {
     /// Stack height shares keyed by saved window id.
     #[serde(default)]
     pub height_weights: BTreeMap<WindowId, u32>,
+    /// Saved page ids whose `Page::name` is a user or configured name (`Snapshot::named_pages`).
+    #[serde(default)]
+    pub named_pages: Vec<PageId>,
 }
 
 impl LayoutState {
@@ -104,6 +109,7 @@ impl Engine {
             focused_window: self.snapshot.focused_window.clone(),
             active_monitor: self.snapshot.active_monitor.clone(),
             height_weights: self.height_weights.clone(),
+            named_pages: self.snapshot.named_pages.clone(),
         }
     }
 
@@ -156,7 +162,19 @@ impl Engine {
             ))
             .filter_map(|(w, c)| Some((w.native.id.clone(), current[c?].id.clone())))
             .collect();
-        if map.is_empty() {
+        // A named page is worth restoring even when none of its windows came back.
+        let named_page_matched = saved
+            .monitors
+            .iter()
+            .zip(&monitors)
+            .any(|(monitor, target)| {
+                target.is_some()
+                    && monitor
+                        .pages
+                        .iter()
+                        .any(|page| saved.named_pages.contains(&page.id))
+            });
+        if map.is_empty() && !named_page_matched {
             return Ok(0);
         }
         let moved: BTreeSet<WindowId> = map.values().cloned().collect();
@@ -167,6 +185,7 @@ impl Engine {
             .retain(|slot| !moved.contains(&slot.id));
         let mut displaced = vec![];
         let mut seen = BTreeSet::new();
+        let mut page_ids: BTreeMap<PageId, PageId> = BTreeMap::new();
         for (saved_monitor, target) in saved.monitors.iter().zip(&monitors) {
             let Some(m) = *target else {
                 continue;
@@ -183,6 +202,7 @@ impl Engine {
             for saved_page in &saved_monitor.pages {
                 let mut page = saved_page.clone();
                 page.id = self.id("page");
+                page_ids.insert(saved_page.id.clone(), page.id.clone());
                 if saved_page.id == saved_monitor.active_page {
                     active = page.id.clone();
                 }
@@ -204,6 +224,16 @@ impl Engine {
                             floating.push(id.clone());
                         }
                     }
+                    // The shown tab and the column's focus memory follow the new ids.
+                    column.active_tab = column
+                        .active_tab
+                        .as_ref()
+                        .and_then(|id| map.get(id))
+                        .filter(|id| tiled.contains(id))
+                        .cloned();
+                    if let Some(id) = &column.active_tab {
+                        self.column_focus.insert(column.id.clone(), id.clone());
+                    }
                     column.windows = tiled;
                 }
                 page.columns.retain(|column| !column.windows.is_empty());
@@ -223,6 +253,31 @@ impl Engine {
             monitor.pages = pages;
             monitor.active_page = active;
         }
+        // Restored names win over a surviving page that carries the same name.
+        let restored_named: Vec<PageId> = saved
+            .named_pages
+            .iter()
+            .filter_map(|id| page_ids.get(id).cloned())
+            .collect();
+        let restored_names: Vec<String> = self
+            .snapshot
+            .monitors
+            .iter()
+            .flat_map(|m| &m.pages)
+            .filter(|page| restored_named.contains(&page.id))
+            .map(|page| page.name.to_lowercase())
+            .collect();
+        let snapshot = &mut self.snapshot;
+        snapshot.named_pages.retain(|id| {
+            !snapshot
+                .monitors
+                .iter()
+                .flat_map(|m| &m.pages)
+                .any(|page| &page.id == id && restored_names.contains(&page.name.to_lowercase()))
+        });
+        snapshot.named_pages.extend(restored_named);
+        // Declared workspaces that the restored pages replaced are created again.
+        self.rearm_named_pages();
         let mut origins = BTreeMap::new();
         for window in placed {
             let Some(id) = map.get(&window.native.id) else {
@@ -291,7 +346,10 @@ impl Engine {
 pub struct LayoutStateFile {
     pub path: PathBuf,
     latest: Vec<u8>,
+    /// Set while `latest` is not on disk: when the next automatic write is attempted.
     due: Option<Instant>,
+    /// Backoff after failed writes; zero while the last write succeeded.
+    retry_delay: Duration,
     restore_attempted: bool,
 }
 
@@ -301,30 +359,43 @@ impl LayoutStateFile {
             path,
             latest: vec![],
             due: None,
+            retry_delay: Duration::ZERO,
             restore_attempted: false,
         }
     }
 
     /// Call after every controller step. Only a managed layout is saved, `SAVE_DELAY` after
-    /// its last change; once paused, a pending change is written at once.
+    /// its last change; once paused, a pending change is written at once. A failed write
+    /// stays pending and is retried with a growing delay.
     pub fn observe(&mut self, engine: &Engine, now: Instant) -> Result<(), String> {
         if !engine.snapshot().enabled {
-            return self.flush();
+            let retry_waiting =
+                !self.retry_delay.is_zero() && self.due.is_some_and(|due| now < due);
+            return if retry_waiting {
+                Ok(())
+            } else {
+                self.write(now)
+            };
         }
         let bytes = serde_json::to_vec(&engine.layout_state()).map_err(|e| e.to_string())?;
         if bytes != self.latest {
             self.latest = bytes;
-            self.due = Some(now + SAVE_DELAY);
+            self.due = Some(now + SAVE_DELAY.max(self.retry_delay));
         }
         if self.due.is_some_and(|due| now >= due) {
-            return self.flush();
+            return self.write(now);
         }
         Ok(())
     }
 
-    /// Write a pending change now (pause and quit).
+    /// Write a pending change now (quit), whatever the retry delay.
     pub fn flush(&mut self) -> Result<(), String> {
-        if self.due.take().is_none() {
+        self.write(Instant::now())
+    }
+
+    /// The pending state is cleared only once it is on disk.
+    fn write(&mut self, now: Instant) -> Result<(), String> {
+        if self.due.is_none() {
             return Ok(());
         }
         let write = || {
@@ -336,7 +407,18 @@ impl LayoutStateFile {
             std::fs::write(&temporary, &self.latest)?;
             std::fs::rename(&temporary, &self.path)
         };
-        write().map_err(|e: std::io::Error| e.to_string())
+        match write() {
+            Ok(()) => {
+                self.due = None;
+                self.retry_delay = Duration::ZERO;
+                Ok(())
+            }
+            Err(e) => {
+                self.retry_delay = (self.retry_delay * 2).clamp(SAVE_DELAY, MAX_RETRY_DELAY);
+                self.due = Some(now + self.retry_delay);
+                Err(e.to_string())
+            }
+        }
     }
 
     /// Restore once per process, on the first enable that sees monitors. A missing file is not
@@ -556,6 +638,181 @@ mod tests {
                 if window_id == "n2" && rect.x == 300 && rect.height == 480)));
     }
 
+    fn page_names(engine: &Engine, monitor: usize) -> Vec<(String, bool)> {
+        engine.snapshot().monitors[monitor]
+            .pages
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    engine.snapshot().named_pages.contains(&p.id),
+                )
+            })
+            .collect()
+    }
+
+    /// Page 1 named "chat" holds the chat window; page 2 named "notes" is empty.
+    fn saved_named_session() -> LayoutState {
+        let mut e = engine(SystemSnapshot {
+            monitors: vec![monitor("m1", r"\\.\DISPLAY1", 0)],
+            windows: vec![window("w1", "chat.exe", "Chat", 10, "m1")],
+            focused_window: Some("w1".into()),
+        });
+        e.dispatch(Command::Enable).unwrap();
+        e.dispatch(Command::SetPageName {
+            name: "chat".into(),
+        })
+        .unwrap();
+        let page2 = e.snapshot().monitors[0].pages[1].id.clone();
+        e.dispatch(Command::SwitchPage {
+            monitor_id: "m1".into(),
+            page_id: page2,
+        })
+        .unwrap();
+        e.dispatch(Command::SetPageName {
+            name: "notes".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            page_names(&e, 0),
+            [
+                ("chat".into(), true),
+                ("notes".into(), true),
+                ("Desktop 3".into(), false)
+            ]
+        );
+        let state = e.layout_state();
+        LayoutState::parse(&serde_json::to_vec(&state).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn restore_keeps_named_pages_under_new_page_ids() {
+        let saved = saved_named_session();
+        let mut e = engine(SystemSnapshot {
+            monitors: vec![monitor("h9", r"\\.\DISPLAY1", 0)],
+            windows: vec![window("n1", "chat.exe", "Chat", 20, "h9")],
+            focused_window: None,
+        });
+        assert_eq!(e.restore_layout(&saved).unwrap(), 1);
+        assert_eq!(
+            page_names(&e, 0),
+            [
+                ("chat".into(), true),
+                ("notes".into(), true),
+                ("Desktop 3".into(), false)
+            ]
+        );
+        let (m, p) = e.named_page("chat").unwrap();
+        assert_eq!(e.snapshot().monitors[m].pages[p].columns[0].windows, ["n1"]);
+        assert!(
+            e.named_page("notes").is_some(),
+            "an empty named page persists"
+        );
+        for id in &e.snapshot().named_pages {
+            assert!(
+                !saved.named_pages.contains(id),
+                "named pages carry the new ids"
+            );
+        }
+
+        // No saved window is running: the named pages still come back, and a declared
+        // workspace that the restored pages replaced is created again.
+        let mut e = engine(SystemSnapshot {
+            monitors: vec![monitor("h9", r"\\.\DISPLAY1", 0)],
+            windows: vec![window("k", "unknown.exe", "?", 1, "h9")],
+            focused_window: None,
+        });
+        e.set_layout_options(options::LayoutOptions::from(
+            &crate::config::Config::parse(br#"{"workspaces":[{"name":"web"},{"name":"chat"}]}"#)
+                .unwrap(),
+        ));
+        e.cleanup();
+        assert!(e.named_page("web").is_some() && e.named_page("chat").is_some());
+        assert_eq!(e.restore_layout(&saved).unwrap(), 0);
+        let names = page_names(&e, 0);
+        for name in ["chat", "notes", "web"] {
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|(n, named)| n == name && *named)
+                    .count(),
+                1,
+                "{name} in {names:?}"
+            );
+        }
+        assert!(
+            e.location("k").is_ok(),
+            "the unmatched window is placed again"
+        );
+    }
+
+    #[test]
+    fn restore_keeps_the_shown_tab_of_unfocused_tabbed_columns() {
+        let apps = ["t1", "t2", "u1", "u2", "c"];
+        let session = |prefix: &str, pid: u32| SystemSnapshot {
+            monitors: vec![monitor("m", "DISPLAY1", 0)],
+            windows: apps
+                .iter()
+                .map(|app| window(&format!("{prefix}{app}"), app, app, pid, "m"))
+                .collect(),
+            focused_window: None,
+        };
+        let mut e = engine(session("w", 1));
+        e.dispatch(Command::Enable).unwrap();
+        for (second, first) in [("wt2", "wt1"), ("wu2", "wu1")] {
+            e.dispatch(Command::FocusWindow {
+                window_id: second.into(),
+            })
+            .unwrap();
+            e.dispatch(Command::MoveWindow {
+                direction: Direction::Left,
+            })
+            .unwrap();
+            e.dispatch(Command::ToggleColumnTabbedDisplay).unwrap();
+            let (m, p, c) = e.location(first).unwrap();
+            let column = &e.snapshot().monitors[m].pages[p].columns[c.unwrap().0];
+            assert_eq!(column.windows, [first, second]);
+        }
+        e.dispatch(Command::FocusWindow {
+            window_id: "wc".into(),
+        })
+        .unwrap();
+        let tabs = |e: &Engine| -> Vec<Option<String>> {
+            e.snapshot().monitors[0].pages[0]
+                .columns
+                .iter()
+                .map(|c| c.active_tab.clone())
+                .collect()
+        };
+        assert_eq!(tabs(&e), [Some("wt2".into()), Some("wu2".into()), None]);
+        let saved = LayoutState::parse(&serde_json::to_vec(&e.layout_state()).unwrap()).unwrap();
+
+        let mut restarted = engine(session("n", 2));
+        assert_eq!(restarted.restore_layout(&saved).unwrap(), 5);
+        assert_eq!(
+            tabs(&restarted),
+            [Some("nt2".into()), Some("nu2".into()), None]
+        );
+        assert_eq!(restarted.snapshot().focused_window.as_deref(), Some("nc"));
+        // The column focus memory follows: entering the column lands on its shown tab.
+        restarted.dispatch(Command::Enable).unwrap();
+        assert_eq!(
+            tabs(&restarted),
+            [Some("nt2".into()), Some("nu2".into()), None]
+        );
+        restarted
+            .dispatch(Command::FocusWindow {
+                window_id: "nu1".into(),
+            })
+            .unwrap();
+        restarted
+            .dispatch(Command::FocusDirection {
+                direction: Direction::Left,
+            })
+            .unwrap();
+        assert_eq!(restarted.snapshot().focused_window.as_deref(), Some("nt2"));
+    }
+
     #[test]
     fn window_matching_prefers_live_process_and_title_and_uses_each_window_once() {
         let saved = [
@@ -724,5 +981,71 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let mut missing = LayoutStateFile::new(path);
         assert_eq!(missing.restore(&mut untouched, true).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_saves_stay_pending_and_retry_with_backoff_pause_and_quit() {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/layout-state-tests")
+            .join(format!("retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        // A file where the state directory should be makes every write fail.
+        let blocker = directory.join("blocked");
+        std::fs::write(&blocker, b"").unwrap();
+        let path = blocker.join("layout-state.json");
+        let unblock = || {
+            std::fs::remove_file(&blocker).unwrap();
+            std::fs::create_dir_all(&blocker).unwrap();
+        };
+        let block = || {
+            std::fs::remove_dir_all(&blocker).unwrap();
+            std::fs::write(&blocker, b"").unwrap();
+        };
+        let mut e = engine(SystemSnapshot {
+            monitors: vec![monitor("m", "", 0)],
+            windows: vec![
+                window("a", "one.exe", "One", 1, "m"),
+                window("b", "two.exe", "Two", 2, "m"),
+            ],
+            focused_window: Some("a".into()),
+        });
+        e.dispatch(Command::Enable).unwrap();
+        let mut file = LayoutStateFile::new(path.clone());
+        let start = Instant::now();
+        file.observe(&e, start).unwrap();
+        assert!(file.observe(&e, start + SAVE_DELAY).is_err());
+        // Unchanged layout: the failed write stays pending but waits for the backoff.
+        file.observe(&e, start + SAVE_DELAY).unwrap();
+        let retry = start + SAVE_DELAY * 2;
+        assert!(file.observe(&e, retry).is_err(), "retried after the delay");
+        file.observe(&e, retry + SAVE_DELAY).unwrap();
+        assert!(
+            file.observe(&e, retry + SAVE_DELAY * 2).is_err(),
+            "the delay doubles"
+        );
+        // Quit writes the pending layout once the fault is gone.
+        unblock();
+        file.flush().unwrap();
+        assert!(path.exists());
+        file.flush().unwrap();
+
+        // Pausing after a failed write retries once the backoff has passed.
+        block();
+        e.dispatch(Command::MoveWindow {
+            direction: Direction::Right,
+        })
+        .unwrap();
+        let later = retry + SAVE_DELAY * 10;
+        file.observe(&e, later).unwrap();
+        assert!(file.observe(&e, later + SAVE_DELAY).is_err());
+        e.dispatch(Command::Disable).unwrap();
+        unblock();
+        file.observe(&e, later + SAVE_DELAY).unwrap();
+        assert!(!path.exists(), "waits for the retry delay while paused");
+        file.observe(&e, later + SAVE_DELAY * 2).unwrap();
+        let written = LayoutState::parse(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.monitors[0].pages[0].columns[0].windows, ["b", "a"]);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

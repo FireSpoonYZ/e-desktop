@@ -180,8 +180,15 @@ pub enum Swipe {
     Drag(f64),
     /// The horizontal swipe ended; finger velocity in pad widths per second.
     Release(f64),
-    /// A vertical swipe ended past the threshold: 1 the page below (fingers moved up), -1 above.
+    /// The swipe locked onto the vertical axis: it begins here (the first `Drag` begins a
+    /// horizontal one).
+    PageBegin,
+    /// The vertical swipe ended: 1 the page below (fingers moved up), -1 above, 0 short of the
+    /// threshold.
     Page(i32),
+    /// The recognizer restarted mid-swipe (touchpad settings changed, management paused); no
+    /// release follows for the swipe in progress.
+    Cancel,
 }
 
 /// Motion that decides a swipe's axis.
@@ -274,7 +281,7 @@ impl Touchpad {
                         start: start.1,
                         last: y,
                     };
-                    None
+                    Some(Swipe::PageBegin)
                 }
             }
             Phase::Horizontal { last, samples } => {
@@ -311,8 +318,14 @@ impl Touchpad {
                 };
                 Some(Swipe::Release(velocity))
             }
-            Phase::Vertical { start, last } if (last - start).abs() >= PAGE_DISTANCE => {
-                Some(Swipe::Page(if last < start { 1 } else { -1 }))
+            Phase::Vertical { start, last } => {
+                Some(Swipe::Page(if (last - start).abs() < PAGE_DISTANCE {
+                    0
+                } else if last < start {
+                    1
+                } else {
+                    -1
+                }))
             }
             _ => None,
         }
@@ -562,7 +575,11 @@ mod tests {
     fn vertical_swipe_switches_pages_on_release_past_the_threshold() {
         let mut pad = Touchpad::new(4);
         pad.frame(&fingers(4, 0.3, 0.6), 0);
-        assert_eq!(pad.frame(&fingers(4, 0.31, 0.5), 8), None, "vertical lock");
+        assert_eq!(
+            pad.frame(&fingers(4, 0.31, 0.5), 8),
+            Some(Swipe::PageBegin),
+            "vertical lock begins the swipe"
+        );
         assert_eq!(
             pad.frame(&fingers(4, 0.31, 0.4), 16),
             None,
@@ -571,12 +588,22 @@ mod tests {
         assert_eq!(pad.frame(&fingers(3, 0.31, 0.4), 24), Some(Swipe::Page(1)));
         pad.frame(&[], 32);
         pad.frame(&fingers(4, 0.3, 0.3), 100);
-        pad.frame(&fingers(4, 0.3, 0.45), 108);
+        assert_eq!(
+            pad.frame(&fingers(4, 0.3, 0.45), 108),
+            Some(Swipe::PageBegin)
+        );
         assert_eq!(pad.frame(&[], 116), Some(Swipe::Page(-1)));
-        // Short of the threshold: nothing.
+        // Short of the threshold: the swipe still ends, without a page.
         pad.frame(&fingers(4, 0.3, 0.3), 200);
-        pad.frame(&fingers(4, 0.3, 0.36), 208);
-        assert_eq!(pad.frame(&[], 216), None);
+        assert_eq!(
+            pad.frame(&fingers(4, 0.3, 0.36), 208),
+            Some(Swipe::PageBegin)
+        );
+        assert_eq!(pad.frame(&[], 216), Some(Swipe::Page(0)));
+        // Below the axis lock nothing began, so nothing ends.
+        pad.frame(&fingers(4, 0.3, 0.3), 300);
+        pad.frame(&fingers(4, 0.3, 0.32), 308);
+        assert_eq!(pad.frame(&[], 316), None);
     }
 
     #[test]
