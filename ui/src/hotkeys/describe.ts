@@ -52,7 +52,7 @@ function describeCommand(command: Fields): [string, string] {
     case 'scroll': return ['视口', `滚动 ${text(command.delta)} 物理像素`];
     case 'slideColumn': return ['视口', `向${direction(command.direction)}滑动一列`];
     case 'centerFocused': return ['视口', '居中当前窗口'];
-    case 'cycleWidth': return ['尺寸', '循环列宽：1/3、1/2、2/3'];
+    case 'cycleWidth': return ['尺寸', '循环预设列宽'];
     case 'setColumnWidth': return ['尺寸', `当前列宽设为 ${text(command.width)} 物理像素`];
     case 'setWindowColumnWidth': return ['尺寸', `列宽设为 ${text(command.width)} 物理像素`];
     case 'adjustColumnWidth': return ['尺寸', pixels(command.delta, '增加当前列宽', '减少当前列宽')];
@@ -64,6 +64,34 @@ function describeCommand(command: Fields): [string, string] {
     case 'refresh': return ['应用', '刷新窗口'];
     case 'enable': return ['应用', '启用平铺'];
     case 'disable': return ['应用', '暂停并还原'];
+    // Commands added alongside the overlay.
+    case 'consumeOrExpelWindow': return ['移动窗口', `窗口并入或移出${direction(command.direction)}侧列`];
+    case 'consumeWindowIntoColumn': return ['移动窗口', '右侧列首个窗口并入当前列'];
+    case 'expelWindowFromColumn': return ['移动窗口', '当前窗口移出为右侧新列'];
+    case 'moveColumn': return ['移动窗口', `当前列向${direction(command.direction)}移`];
+    case 'moveColumnToFirst': return ['移动窗口', '当前列移到最前'];
+    case 'moveColumnToLast': return ['移动窗口', '当前列移到最后'];
+    case 'swapWindow': return ['移动窗口', `与${direction(command.direction)}侧列交换窗口`];
+    case 'focusColumnFirst': return ['聚焦', '聚焦第一列'];
+    case 'focusColumnLast': return ['聚焦', '聚焦最后一列'];
+    case 'focusWindowOrPage': return ['聚焦', `向${direction(command.direction)}聚焦窗口或页面`];
+    case 'focusColumnOrMonitor': return ['聚焦', `向${direction(command.direction)}聚焦列或显示器`];
+    case 'focusMonitor': return ['聚焦', `聚焦${direction(command.direction)}侧显示器`];
+    case 'focusWindowPrevious': return ['聚焦', '回到上一个窗口'];
+    case 'moveColumnToMonitor': return ['工作区', `当前列移到${direction(command.direction)}侧显示器`];
+    case 'moveWindowToMonitor': return ['工作区', `当前窗口移到${direction(command.direction)}侧显示器`];
+    case 'movePageToMonitor': return ['工作区', `当前页面移到${direction(command.direction)}侧显示器`];
+    case 'focusPagePrevious': return ['工作区', '回到上一个页面'];
+    case 'cycleWidthBack': return ['尺寸', '反向循环预设列宽'];
+    case 'cycleWindowHeight': return ['尺寸', '循环预设窗口高度'];
+    case 'maximizeColumn': return ['尺寸', '切换列最大化'];
+    case 'setPageName': return ['工作区', `当前页面命名为 ${text(command.name)}`];
+    case 'unsetPageName': return ['工作区', '取消页面命名'];
+    case 'toggleColumnTabbedDisplay': return ['窗口', '切换标签列'];
+    case 'snapViewport': return ['视口', '视图对齐到最近的列'];
+    case 'screenshot': return ['应用', '框选截图'];
+    case 'screenshotScreen': return ['应用', '截取当前显示器'];
+    case 'screenshotWindow': return ['应用', '截取当前窗口'];
     default: return ['其他', fallback('命令 ', command)];
   }
 }
