@@ -100,6 +100,8 @@ impl Engine {
                         .minimized_slots
                         .iter()
                         .any(|slot| slot.page_id == page.id)
+                    // lane: layout-options
+                    || self.snapshot.named_pages.contains(&page.id)
                 {
                     self.append_hotplug_page(receiver, page);
                 }

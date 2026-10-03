@@ -163,6 +163,10 @@ pub struct Snapshot {
     /// rectangle this manager itself just placed. Empty when nothing is covered.
     #[serde(default)]
     pub suspended_monitors: Vec<MonitorId>,
+    // lane: layout-options
+    /// Pages carrying a user or configured name in `Page::name`; they persist while empty.
+    #[serde(default)]
+    pub named_pages: Vec<PageId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +328,19 @@ pub enum Command {
     FocusWindowPrevious,
     /// Return the active monitor to the page it showed before.
     FocusPagePrevious,
+    // lane: layout-options
+    /// Cycle the focused column backwards through `presetColumnWidths`.
+    CycleWidthBack,
+    /// Set the focused window's height to the next `presetWindowHeights` entry; the rest of
+    /// its column shares the remaining height.
+    CycleWindowHeight,
+    /// Toggle the focused column between the full viewport width and its previous width.
+    MaximizeColumn,
+    /// Name the active page of the active monitor; the name moves off any other page.
+    SetPageName {
+        name: String,
+    },
+    UnsetPageName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

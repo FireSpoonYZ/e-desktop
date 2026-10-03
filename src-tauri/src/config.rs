@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    layout::options::{CenterFocusedColumn, NamedWorkspace, PresetSize, Struts},
     model::{Command, Direction, Snapshot},
     rules::WindowRule,
 };
@@ -33,6 +34,20 @@ pub struct Config {
     pub focus_border_color: Option<String>,
     /// Windows 11 corner preference. `system` does not override DWM.
     pub window_corners: WindowCorners,
+    // lane: layout-options
+    /// `CycleWidth` presets: proportion of the viewport or fixed logical window width.
+    pub preset_column_widths: Vec<PresetSize>,
+    /// Width of new columns; a window rule `columnWidth` wins.
+    pub default_column_width: PresetSize,
+    /// `CycleWindowHeight` presets; a proportion is of the column height.
+    pub preset_window_heights: Vec<PresetSize>,
+    pub center_focused_column: CenterFocusedColumn,
+    /// Center the only column of a page, whatever `center_focused_column` says.
+    pub always_center_single_column: bool,
+    /// Logical pixels removed from each edge of the layout area.
+    pub struts: Struts,
+    /// Named pages created at startup that are kept while empty.
+    pub workspaces: Vec<NamedWorkspace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +104,13 @@ pub enum ShortcutAction {
     },
     /// Removes the built-in binding for this key; dropped before registration.
     Unbind {},
+    // lane: layout-options
+    /// Focus the page named `name`, or move the focused window there.
+    PageByName {
+        name: String,
+        #[serde(default)]
+        move_window: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +241,14 @@ enum StrictCommand {
     },
     FocusWindowPrevious {},
     FocusPagePrevious {},
+    // lane: layout-options
+    CycleWidthBack {},
+    CycleWindowHeight {},
+    MaximizeColumn {},
+    SetPageName {
+        name: String,
+    },
+    UnsetPageName {},
 }
 
 impl Default for Config {
@@ -236,6 +266,14 @@ impl Default for Config {
             top_bar: true,
             focus_border_color: Some("#7fc8ff".into()),
             window_corners: WindowCorners::System,
+            // lane: layout-options
+            preset_column_widths: crate::layout::options::default_preset_sizes(),
+            default_column_width: PresetSize::Proportion(0.5),
+            preset_window_heights: crate::layout::options::default_preset_sizes(),
+            center_focused_column: CenterFocusedColumn::Never,
+            always_center_single_column: false,
+            struts: Struts::default(),
+            workspaces: vec![],
         }
     }
 }
@@ -361,6 +399,9 @@ impl Config {
             ("Shift+Period", Command::MoveColumnToMonitor { direction: right }),
             ("Backquote", Command::FocusWindowPrevious),
             ("P", Command::FocusPagePrevious),
+            // lane: layout-options
+            ("M", Command::MaximizeColumn),
+            ("E", Command::CycleWindowHeight),
         ] {
             bind(
                 format!("Control+Alt+{key}"),
@@ -389,6 +430,7 @@ impl Config {
             rule.validate()
                 .map_err(|e| format!("窗口规则 {}：{}", index + 1, e.message))?;
         }
+        crate::layout::options::validate(&config)?; // lane: layout-options
         let mut keys = HashSet::new();
         for binding in &config.shortcuts {
             if binding.key.trim().is_empty() || !keys.insert(&binding.key) {
@@ -465,6 +507,11 @@ impl ShortcutAction {
                     },
                 });
             }
+            // lane: layout-options
+            Self::PageByName { name, move_window } => {
+                return crate::layout::options::resolve_page_by_name(snapshot, name, *move_window)
+                    .map(|command| Self::Command { command });
+            }
             _ => return Some(self.clone()),
         };
         let monitor = snapshot
@@ -535,7 +582,8 @@ pub fn foreground_blocks_shortcut(action: &ShortcutAction, suspended: &[String])
         | ShortcutAction::Commands {}
         | ShortcutAction::Page { .. }
         | ShortcutAction::RelativePage { .. }
-        | ShortcutAction::Scroll { .. } => true,
+        | ShortcutAction::Scroll { .. }
+        | ShortcutAction::PageByName { .. } => true, // lane: layout-options
         ShortcutAction::Command { command } => !explicit_live_target(command, suspended),
     }
 }
@@ -577,7 +625,7 @@ mod tests {
     #[test]
     fn defaults_empty_mapping_and_strict_schema() {
         assert_eq!(Config::parse(b"{}").unwrap(), Config::default());
-        assert_eq!(Config::builtin_shortcuts().len(), 62);
+        assert_eq!(Config::builtin_shortcuts().len(), 64);
         assert!(
             Config::parse(br#"{"shortcuts":[]}"#)
                 .unwrap()
@@ -641,7 +689,7 @@ mod tests {
                 .map(|b| b.action.clone())
         };
         assert_eq!(resolve("{}").shortcuts, Config::builtin_shortcuts());
-        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 62);
+        assert_eq!(resolve(r#"{"shortcuts":[]}"#).shortcuts.len(), 64);
         let config = resolve(
             r#"{"shortcuts":[
                 {"key":"Control+Alt+L","action":{"type":"unbind"}},
@@ -649,7 +697,7 @@ mod tests {
                 {"key":"Control+Alt+O","action":{"type":"quit"}}
             ]}"#,
         );
-        assert_eq!(config.shortcuts.len(), 62);
+        assert_eq!(config.shortcuts.len(), 64);
         assert_eq!(action(&config, "Control+Alt+L"), None);
         assert_eq!(action(&config, "Control+Alt+Semicolon"), Some(focus_right));
         assert_eq!(

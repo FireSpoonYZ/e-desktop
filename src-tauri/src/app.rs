@@ -403,10 +403,12 @@ impl Controller {
 
     fn connect(&mut self) -> Result<(), AppError> {
         let gaps = self.engine.snapshot().gaps;
+        let layout_options = self.engine.layout_options().clone(); // lane: layout-options
         let backend = Backend::new()?;
         let mut engine = Engine::new(backend.status());
         engine.set_window_rules(self.window_rules.clone())?;
         engine.set_gaps(gaps);
+        engine.set_layout_options(layout_options);
         self.engine = engine;
         self.backend = Some(backend);
         Ok(())
@@ -532,6 +534,12 @@ impl Controller {
                     width: area.width.max(1),
                     height: area.height.saturating_sub(top).max(1),
                 };
+                // lane: layout-options: struts shrink the area inside the bar, before gaps.
+                let usable = crate::layout::options::apply_struts(
+                    usable,
+                    &self.engine.layout_options().struts,
+                    monitor.scale_factor,
+                );
                 (
                     monitor.id.clone(),
                     inset_gap(usable, half_gap(gaps, monitor.scale_factor)),
@@ -1680,6 +1688,9 @@ fn reload_config(
                     .set_window_rules(shortcuts.config.window_rules.clone())
                     .map_err(|e| e.to_string())?;
                 controller.engine.set_gaps(shortcuts.config.gaps);
+                controller
+                    .engine
+                    .set_layout_options((&shortcuts.config).into()); // lane: layout-options
                 controller.top_bar = shortcuts.config.top_bar;
                 if !controller.top_bar {
                     controller.revealed.clear();

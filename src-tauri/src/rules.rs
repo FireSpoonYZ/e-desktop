@@ -12,15 +12,24 @@ pub struct WindowRule {
     pub column_width: Option<u32>,
     pub monitor_id: Option<String>,
     pub page_index: Option<usize>,
+    // lane: layout-options
+    /// Target named page (case-insensitive); wins over `monitorId` and `pageIndex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_name: Option<String>,
 }
 
 impl WindowRule {
     pub fn validate(&self) -> Result<(), AppError> {
-        let message = if [&self.app_name, &self.title, &self.monitor_id]
-            .into_iter()
-            .any(|text| text.as_ref().is_some_and(|text| text.trim().is_empty()))
+        let message = if [
+            &self.app_name,
+            &self.title,
+            &self.monitor_id,
+            &self.page_name,
+        ]
+        .into_iter()
+        .any(|text| text.as_ref().is_some_and(|text| text.trim().is_empty()))
         {
-            Some("Window rule match text and monitorId must not be blank")
+            Some("Window rule match text, monitorId and pageName must not be blank")
         } else if self.column_width == Some(0) {
             Some("Window rule columnWidth must be greater than zero")
         } else if self.page_index == Some(0) {
@@ -29,6 +38,7 @@ impl WindowRule {
             && self.column_width.is_none()
             && self.monitor_id.is_none()
             && self.page_index.is_none()
+            && self.page_name.is_none()
         {
             Some("Window rule must have at least one action")
         } else {

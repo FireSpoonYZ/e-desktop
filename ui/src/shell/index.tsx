@@ -85,7 +85,7 @@ export function PageRail({ snapshot, onCommand, monitorId, busy = false }: PageR
         aria-label={`第 ${index + 1} 页：${page.name}`} title={`${index + 1} · ${page.name}`}
         disabled={blocked}
         onClick={() => runCommand(onCommand, { type: 'switchPage', monitorId: monitor.monitor.id, pageId: page.id })}>
-        {index + 1}
+        {snapshot.namedPages?.includes(page.id) ? page.name : index + 1}
       </button>)}
       {!monitor?.pages.length && <span className="shell-rail-empty" role="status">
         {!ready ? backendNotice(snapshot) : monitor ? '无页面' : '无显示器'}

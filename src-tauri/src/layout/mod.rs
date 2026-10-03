@@ -6,6 +6,7 @@ use crate::rules::WindowRule;
 pub mod edges;
 mod layout_actions; // lane: layout-actions
 mod monitors;
+pub mod options; // lane: layout-options
 mod pointer;
 pub use pointer::top_band;
 mod rules;
@@ -65,6 +66,8 @@ pub struct Engine {
     previous_pages: BTreeMap<MonitorId, PageId>,
     /// Native focus left behind when FocusMonitor activated an empty page.
     stale_native_focus: Option<WindowId>,
+    // lane: layout-options
+    layout_options: options::LayoutState,
 }
 
 fn invalid(message: &str) -> AppError {
@@ -227,6 +230,7 @@ impl Engine {
             focus_history: vec![],
             previous_pages: BTreeMap::new(),
             stale_native_focus: None,
+            layout_options: Default::default(), // lane: layout-options
         }
     }
 
@@ -302,6 +306,7 @@ impl Engine {
             | Command::SetWindowColumnWidth { window_id, .. }
             | Command::SetFloatingRect { window_id, .. }
             | Command::CloseWindow { window_id } => win(window_id),
+            // lane: layout-options adds CycleWidthBack, CycleWindowHeight and MaximizeColumn.
             Command::FocusDirection { .. }
             | Command::MoveWindow { .. }
             | Command::CycleWidth
@@ -311,7 +316,10 @@ impl Engine {
             | Command::ResetWindowHeights
             | Command::CenterFocused
             | Command::ToggleFloating
-            | Command::ToggleFullscreen => {
+            | Command::ToggleFullscreen
+            | Command::CycleWidthBack
+            | Command::CycleWindowHeight
+            | Command::MaximizeColumn => {
                 self.snapshot.focused_window.as_deref().is_some_and(win)
             }
             _ => false,
@@ -674,7 +682,7 @@ impl Engine {
         } else {
             let viewport_width = self.snapshot.monitors[m].viewport.width;
             let width = width
-                .unwrap_or((viewport_width / 2).max(1))
+                .unwrap_or_else(|| self.default_column_width(m))
                 .min(viewport_width);
             let column = self.column(id.into(), width);
             self.snapshot.monitors[m].pages[p].columns.push(column);
@@ -889,11 +897,13 @@ impl Engine {
 
     fn cleanup(&mut self) {
         self.sync_minimized();
+        self.ensure_named_pages(); // lane: layout-options
         let parked: BTreeSet<PageId> = self
             .minimized_slots
             .iter()
             .map(|slot| slot.page_id.clone())
             .collect();
+        let named: BTreeSet<PageId> = self.snapshot.named_pages.iter().cloned().collect();
         let gaps = self.snapshot.gaps;
         for m in 0..self.snapshot.monitors.len() {
             let monitor = &mut self.snapshot.monitors[m];
@@ -911,7 +921,10 @@ impl Engine {
                 page.columns.retain(|c| !c.windows.is_empty());
             }
             // A page whose tiled windows are all user-minimized is not a disposable empty tail.
-            let disposable = |page: &Page| empty(page) && !parked.contains(&page.id);
+            // Named pages persist while empty (niri).
+            let disposable = |page: &Page| {
+                empty(page) && !parked.contains(&page.id) && !named.contains(&page.id)
+            };
             let last = monitor.pages.last().map(|p| p.id.clone());
             monitor.pages.retain(|p| {
                 !disposable(p) || p.id == monitor.active_page || Some(&p.id) == last.as_ref()
@@ -931,7 +944,9 @@ impl Engine {
                 monitor.active_page = monitor.pages[0].id.clone();
             }
             for (i, page) in monitor.pages.iter_mut().enumerate() {
-                page.name = format!("Desktop {}", i + 1);
+                if !named.contains(&page.id) {
+                    page.name = format!("Desktop {}", i + 1);
+                }
                 page.viewport_x =
                     clamp_scroll_relaxed(page, monitor.viewport.width, page.viewport_x as i64);
             }
@@ -945,6 +960,9 @@ impl Engine {
             .collect();
         self.page_focus
             .retain(|page, window| valid.get(page).is_some_and(|ids| ids.contains(window)));
+        self.snapshot
+            .named_pages
+            .retain(|page| valid.contains_key(page));
         self.height_weights
             .retain(|id, _| self.snapshot.windows.iter().any(|w| &w.native.id == id));
         let snapshot = &self.snapshot;
@@ -985,6 +1003,7 @@ impl Engine {
 
     fn set_focus(&mut self, id: &str, ensure_visible: bool) -> Result<(), AppError> {
         let (m, p, _) = self.location(id)?;
+        let previous = self.snapshot.focused_window.clone();
         self.snapshot.monitors[m].active_page = self.snapshot.monitors[m].pages[p].id.clone();
         self.snapshot.active_monitor = Some(self.snapshot.monitors[m].monitor.id.clone());
         self.snapshot.focused_window = Some(id.into());
@@ -1006,7 +1025,7 @@ impl Engine {
         }
         // A suspended monitor keeps its scroll; revealing would reflow under the covering window.
         if ensure_visible && !self.monitor_suspended(m) {
-            self.ensure_visible(id, false)?;
+            self.reveal(id, false, previous.as_deref())?;
         }
         Ok(())
     }
@@ -1076,27 +1095,8 @@ impl Engine {
     }
 
     fn ensure_visible(&mut self, id: &str, center: bool) -> Result<(), AppError> {
-        let (m, p, column) = self.location(id)?;
-        let Some((c, _)) = column else {
-            return Ok(());
-        };
-        let viewport = self.snapshot.monitors[m].viewport.width as i64;
-        let page = &mut self.snapshot.monitors[m].pages[p];
-        let left: i64 = page.columns[..c].iter().map(|c| c.width as i64).sum();
-        let width = page.columns[c].width as i64;
-        let x = page.viewport_x as i64;
-        let target = if center {
-            left + (width - viewport) / 2
-        } else if left < x || width >= viewport {
-            left
-        } else if left + width > x + viewport {
-            left + width - viewport
-        } else {
-            x
-        };
-        // Keep an already visible column in place, including explicit centering/queue gaps.
-        page.viewport_x = clamp_scroll_relaxed(page, viewport as u32, target);
-        Ok(())
+        // lane: layout-options: centerFocusedColumn / alwaysCenterSingleColumn.
+        self.reveal(id, center, None)
     }
 
     pub fn dispatch(&mut self, command: Command) -> Result<Transition, AppError> {
@@ -1312,22 +1312,8 @@ impl Engine {
                 self.cleanup();
                 self.ensure_visible(&id, false)?;
             }
-            Command::CycleWidth => {
-                let (id, m, p, c, _) = self.sizing_target()?;
-                let viewport = self.snapshot.monitors[m].viewport.width;
-                // niri preset-column-widths: 1/3, 1/2, 2/3; full width stays on ToggleFullscreen.
-                let presets = [
-                    (viewport / 3).max(1),
-                    (viewport / 2).max(1),
-                    ((viewport as u64 * 2 / 3) as u32).max(1),
-                ];
-                let width = &mut self.snapshot.monitors[m].pages[p].columns[c].width;
-                *width = presets
-                    .into_iter()
-                    .find(|preset| preset > width)
-                    .unwrap_or(presets[0]);
-                self.ensure_visible(&id, false)?;
-            }
+            // lane: layout-options: presetColumnWidths.
+            Command::CycleWidth => self.cycle_column_width(true)?,
             Command::SetColumnWidth { width } => {
                 if width == 0 {
                     return Err(invalid("Column width must be positive"));
@@ -1542,6 +1528,12 @@ impl Engine {
                     return Ok(actions);
                 }
             }
+            // lane: layout-options
+            Command::CycleWidthBack => self.cycle_column_width(false)?,
+            Command::CycleWindowHeight => self.cycle_window_height()?,
+            Command::MaximizeColumn => self.toggle_maximize_column()?,
+            Command::SetPageName { name } => self.set_page_name(&name)?,
+            Command::UnsetPageName => self.unset_page_name()?,
             Command::Enable | Command::Disable | Command::Refresh => unreachable!(),
         }
         self.cleanup();

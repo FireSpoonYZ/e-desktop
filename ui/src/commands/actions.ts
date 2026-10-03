@@ -74,6 +74,13 @@ export function commandActions(snapshot: Snapshot, query: string): Action[] {
   }
   add('聚焦上一个窗口 Previous window', { type: 'focusWindowPrevious' }, focusable);
   add('回到上一个页面 Previous page', { type: 'focusPagePrevious' }, managed);
+  // lane: layout-options
+  add('反向切换列宽 Width back', { type: 'cycleWidthBack' }, sizable);
+  add('切换窗口高度 Height presets', { type: 'cycleWindowHeight' }, sizable, '当前聚焦窗口 · 循环预设高度');
+  add('切换列最大化 Maximize column', { type: 'maximizeColumn' }, sizable, '当前聚焦列 · 视口全宽 / 恢复原宽度');
+  const pageName = /^\s*(?:命名|name)\s+(.+)$/iu.exec(query)?.[1].trim();
+  if (pageName) add(`命名当前页面为 ${pageName} Name page`, { type: 'setPageName', name: pageName }, managed, '当前显示器的活动页面');
+  add('取消页面命名 Unset page name', { type: 'unsetPageName' }, managed, '当前显示器的活动页面');
   const words = query.normalize('NFKC').toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
   return actions.filter(({ label, detail }) => {
     const text = `${label} ${detail}`.normalize('NFKC').toLocaleLowerCase();

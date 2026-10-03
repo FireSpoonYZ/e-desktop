@@ -226,3 +226,66 @@ Windows 上，游戏、视频等外部应用覆盖整个显示器时，该显示
 显示器方向按显示器矩形计算：只考虑在该方向上与当前显示器有重叠的显示器，取中心最近的一个；该方向没有显示器时不执行。列与窗口的移动动作只适用于平铺窗口，浮动窗口上执行时报错，与“移动窗口”一致；布局全屏的窗口可以移动。动作结束后焦点窗口滚动到完整可见。焦点和页面历史只保存在本次运行内。
 
 `focusMonitor` 移到空页面时没有窗口可以接收原生焦点，键盘输入仍然交给原来的窗口，直到点击或聚焦其他窗口；在此之前刷新不会把活动显示器拉回原处。目标显示器因外部全屏暂停时，这些动作不执行。
+
+## 布局选项与命名页面
+
+<!-- lane: layout-options -->
+
+以下选项参照 niri 的 `layout` 与 `workspace` 配置，保存后随配置热加载生效；已有列的宽度不会因重载而改变。
+
+```json
+{
+  "presetColumnWidths": [{ "proportion": 0.33333 }, { "proportion": 0.5 }, { "proportion": 0.66667 }, { "fixed": 1280 }],
+  "defaultColumnWidth": { "proportion": 0.5 },
+  "presetWindowHeights": [{ "proportion": 0.33333 }, { "proportion": 0.5 }, { "proportion": 0.66667 }],
+  "centerFocusedColumn": "onOverflow",
+  "alwaysCenterSingleColumn": true,
+  "struts": { "left": 64, "right": 64, "top": 0, "bottom": 0 },
+  "workspaces": [{ "name": "chat", "monitor": "DISPLAY2" }, { "name": "web" }],
+  "windowRules": [{ "appName": "slack", "pageName": "chat" }],
+  "shortcuts": [
+    { "key": "Control+Alt+Shift+C", "action": { "type": "pageByName", "name": "chat" } },
+    { "key": "Control+Alt+Shift+W", "action": { "type": "pageByName", "name": "web", "moveWindow": true } }
+  ]
+}
+```
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `presetColumnWidths` | 1/3、1/2、2/3 | `cycleWidth`（`Ctrl+Alt+R`）按数组顺序循环的列宽；`cycleWidthBack`（仅命令面板）反向循环。当前宽度等于某个预设时切到下一个，否则切到沿循环方向第一个更宽（反向时更窄）的预设 |
+| `defaultColumnWidth` | `{ "proportion": 0.5 }` | 新列的宽度；窗口规则的 `columnWidth` 优先 |
+| `presetWindowHeights` | 1/3、1/2、2/3 | `cycleWindowHeight`（`Ctrl+Alt+E`）把聚焦窗口在列内的高度循环设为这些值，同列其余窗口按原有比例分配剩余高度；列中只有一个窗口时不变 |
+| `centerFocusedColumn` | `"never"` | `never`：只滚动到聚焦列完整可见；`always`：聚焦列总是居中；`onOverflow`：聚焦列与焦点来源一侧的相邻列放不进同一屏时才居中 |
+| `alwaysCenterSingleColumn` | `false` | 页面只有一列时让它居中 |
+| `struts` | 全为 `0` | 从布局区域左、右、上、下各扣掉的逻辑像素（乘以该显示器的缩放），与固定顶栏占位叠加，再在其内留出 `gaps` |
+| `workspaces` | `[]` | 命名页面，见下文 |
+
+预设和 `defaultColumnWidth` 的每一项只能是 `{ "proportion": 比例 }` 或 `{ "fixed": 逻辑像素 }` 之一：比例须大于 0 且不超过 1，列宽相对扣掉间距后的视口宽度，窗口高度相对列高；`fixed` 是窗口本身的宽或高（正整数逻辑像素，乘以缩放后再加上两侧间距），超过视口时夹到视口大小。预设数组不能为空。比例、像素或字段名不合法时整个配置报错，保留上次有效配置。
+
+居中设置在焦点变化和“确保焦点列可见”的滚动时生效（切换焦点、移动窗口、调整宽度等）；比视口还宽的列靠左对齐，不居中。`Ctrl+Alt+C` 的手动居中不受这些设置影响。
+
+`maximizeColumn`（`Ctrl+Alt+M`）把当前列切换为视口全宽，窗口仍在平铺中、保留间距和顶栏，不同于 `Ctrl+Alt+F` 的布局全屏；再次执行恢复切换前的宽度。若列已是全宽且没有记录的原宽度（例如手动设成全宽），恢复为 `defaultColumnWidth`。
+
+### 命名页面
+
+`workspaces` 中每项为 `{ "name": "名称", "monitor": "显示器名称或 ID" }`，`monitor` 可省略。名称不能为空白，不区分大小写且不能重复。启动时（以及修改了 `workspaces` 的配置重载后）为尚不存在的名称创建页面，按声明顺序排在该显示器的未命名页面之前；`monitor` 未写或找不到时放在主显示器上。启动时已有的窗口仍留在原来的未命名页面。
+
+带名称的页面即使为空也不会被自动回收；顶栏页面按钮显示名称而不是编号，概览、命令面板和顶栏位置也显示名称。命令：
+
+| 命令 | 行为 |
+| --- | --- |
+| `{ "type": "setPageName", "name": "..." }` | 给活动显示器的当前页面命名；其他页面已用这个名称时，那个页面的名称被取消 |
+| `{ "type": "unsetPageName" }` | 取消当前页面的名称；之后若为空且不是当前页面，按普通页面回收 |
+
+命令面板中输入 `命名 名称` 或 `name 名称` 会出现“命名当前页面为 名称”的条目，另有“取消页面命名”。暂停管理时这两个命令与其他布局命令一样不执行。
+
+快捷键动作 `{ "type": "pageByName", "name": "...", "moveWindow": false }` 在执行时按名称查找页面：`moveWindow` 为 false 时切换到该页面（可在另一块显示器上），为 true 时把聚焦窗口移到该页面并跟随。名称不存在时不执行。
+
+窗口规则可增加 `pageName`：新窗口打开到该命名页面，优先于 `monitorId` 与 `pageIndex`；名称不存在时按 `monitorId` / `pageIndex` 的规则回退。与 `pageIndex` 一样，打开到后台页面不会切页或抢焦点。
+
+默认新增快捷键：
+
+| 快捷键 | 行为 |
+| --- | --- |
+| `Ctrl+Alt+M` | 切换当前列最大化（视口全宽 / 恢复原宽度） |
+| `Ctrl+Alt+E` | 循环聚焦窗口在列内的预设高度 |

@@ -79,6 +79,9 @@ export interface Snapshot {
   animationDurationMs: number;
   /** Monitors paused while a foreign window covers the full display. */
   suspendedMonitors: MonitorId[];
+  // lane: layout-options
+  /** 带名称的页面（名称在 Page.name 中）；为空时也保留。 */
+  namedPages?: PageId[];
 }
 export type Direction = 'left' | 'right' | 'up' | 'down';
 export type Command =
@@ -121,7 +124,13 @@ export type Command =
   | { type: 'moveWindowToMonitor'; direction: Direction }
   | { type: 'movePageToMonitor'; direction: Direction }
   | { type: 'focusWindowPrevious' }
-  | { type: 'focusPagePrevious' };
+  | { type: 'focusPagePrevious' }
+  // lane: layout-options
+  | { type: 'cycleWidthBack' }
+  | { type: 'cycleWindowHeight' }
+  | { type: 'maximizeColumn' }
+  | { type: 'setPageName'; name: string }
+  | { type: 'unsetPageName' };
 export type ErrorCode = 'notImplemented' | 'unsupportedSession' | 'backendUnavailable' | 'permissionRequired' | 'windowGone' | 'operationDenied' | 'invalidCommand';
 export interface AppError { code: ErrorCode; message: string; windowId: WindowId | null }
 export type NativeAction =

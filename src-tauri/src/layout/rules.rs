@@ -45,6 +45,7 @@ impl Engine {
             matched.column_width = rule.column_width.or(matched.column_width);
             matched.monitor_id = rule.monitor_id.clone().or(matched.monitor_id);
             matched.page_index = rule.page_index.or(matched.page_index);
+            matched.page_name = rule.page_name.clone().or(matched.page_name); // lane: layout-options
         }
         let source = self.monitor_index(&native.monitor_id)?;
         let m = matched
@@ -65,6 +66,12 @@ impl Engine {
                     .position(|p| p.id == monitor.active_page)
                     .unwrap()
             });
+        // lane: layout-options: an existing named page wins; a missing one falls back.
+        let (m, p) = matched
+            .page_name
+            .as_deref()
+            .and_then(|name| self.named_page(name))
+            .unwrap_or((m, p));
         if !native.resizable && matched.floating != Some(true) {
             self.size_floating.insert(id.into());
         }
