@@ -1374,6 +1374,7 @@ impl Engine {
                 let monitor = &mut self.snapshot.monitors[m];
                 let view = monitor.viewport.width;
                 let snap = snap_distance(monitor.monitor.scale_factor, view);
+                let gap = 2 * half_gap(self.snapshot.gaps, monitor.monitor.scale_factor);
                 let page = monitor
                     .pages
                     .iter_mut()
@@ -1382,14 +1383,49 @@ impl Engine {
                 if edge as usize > page.columns.len() {
                     return Err(invalid("Column boundary does not exist"));
                 }
-                let (widths, x) = edges::drag_edge(
-                    &widths(page),
+                let edge = edge as usize;
+                let original_widths = widths(page);
+                let original_x = i64::from(page.viewport_x);
+                let (mut widths, mut x) = edges::drag_edge(
+                    &original_widths,
                     view,
-                    page.viewport_x as i64,
-                    edge as usize,
+                    original_x,
+                    edge,
                     delta as i64,
                     snap,
                 );
+                if delta != 0 && edge > 0 && edge < widths.len() {
+                    let half = view / 2;
+                    let left_full = edges::edge_position(&original_widths, original_x, edge - 1) >= 0;
+                    let right_full = edges::edge_position(&original_widths, original_x, edge + 1)
+                        <= i64::from(view);
+                    let clipped = match (left_full, right_full) {
+                        (true, false) if widths[edge - 1] == half => Some(edge),
+                        (false, true) if widths[edge] == half => Some(edge - 1),
+                        _ => None,
+                    };
+                    if let Some(clipped) = clipped {
+                        // At the middle snap, bring the clipped neighbour fully on screen too,
+                        // but only if both columns' real minimums allow the half-width split.
+                        let can_split = page.columns[edge - 1..=edge].iter().all(|column| {
+                            column
+                                .windows
+                                .iter()
+                                .filter_map(|id| self.min_widths.get(id))
+                                .max()
+                                .map_or(0, |width| width + gap)
+                                <= half
+                        });
+                        if widths[clipped] > half
+                            && edges::edge_position(&widths, x, edge) == i64::from(half)
+                            && can_split
+                        {
+                            widths[clipped] = half;
+                            x = edges::edge_position(&widths, 0, edge) - i64::from(half);
+                            x = edges::clamp_x_relaxed(&widths, view, x);
+                        }
+                    }
+                }
                 for (column, width) in page.columns.iter_mut().zip(widths) {
                     column.width = width;
                 }

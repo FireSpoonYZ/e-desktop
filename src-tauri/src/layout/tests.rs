@@ -1653,6 +1653,17 @@ fn full_width_column_drag_shrinks_without_dropping_a_real_minimum() {
     e.set_min_widths(BTreeMap::from([("1".into(), view + 500)]));
     drag(&mut e, 1, -((view / 2) as i32));
     assert_eq!(width_x(&e).0, view);
+    // A smaller accepted native frame invalidates the stale backend constraint.
+    // The refreshed map then permits both the splitter preview/commit and explicit width.
+    e.set_min_widths(BTreeMap::new());
+    let mut preview = e.clone();
+    drag(&mut preview, 1, -((view / 2) as i32));
+    assert_eq!(width_x(&preview).0, view / 2);
+    drag(&mut e, 1, -((view / 2) as i32));
+    assert_eq!(width_x(&e).0, view / 2);
+    e.dispatch(Command::SetColumnWidth { width: view }).unwrap();
+    e.dispatch(Command::SetColumnWidth { width: view / 2 }).unwrap();
+    assert_eq!(width_x(&e).0, view / 2);
     // Shared boundary between two on-screen columns still trades width.
     let mut e = engine();
     drag(&mut e, 1, 80);
@@ -1663,6 +1674,154 @@ fn full_width_column_drag_shrinks_without_dropping_a_real_minimum() {
         .collect();
     assert_eq!(widths, vec![680, 520, 600]);
     assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
+}
+
+#[test]
+fn shared_edge_middle_snap_resizes_both_full_columns_and_matches_preview() {
+    // Exercise both screen edges, with an untouched column before or after the pair.
+    for pair in 0..=1 {
+        for mirror in [false, true] {
+            let mut e = engine();
+            let view = e.snapshot.monitors[0].viewport.width;
+            let half = view / 2;
+            let page = &mut e.snapshot.monitors[0].pages[0];
+            let far = page.columns[2 - 2 * pair].width;
+            for column in &mut page.columns[pair..=pair + 1] {
+                column.width = view;
+            }
+            let prefix = if pair == 0 { 0 } else { far };
+            page.viewport_x = (prefix + if mirror { view } else { 0 }) as i32;
+            let command = Command::DragEdge {
+                monitor_id: "a".into(),
+                edge: (pair + 1) as u32,
+                delta: if mirror { half as i32 } else { -(half as i32) },
+            };
+            let before = serde_json::to_value(e.snapshot()).unwrap();
+            let scene = e.scene(command.clone(), "a", &[]).unwrap();
+            assert_eq!(serde_json::to_value(e.snapshot()).unwrap(), before);
+            assert_eq!(scene.tiles.len(), 2);
+            for (i, tile) in scene.tiles.iter().enumerate() {
+                assert_eq!(tile.title, (pair + i + 1).to_string());
+                assert_eq!(tile.label, "50%");
+                assert_eq!((tile.rect.x, tile.rect.width), ((i as u32 * half) as i32, half));
+            }
+            let mut preview = e.clone();
+            let preview_actions = preview.dispatch(command.clone()).unwrap().actions;
+            let committed = e.dispatch(command).unwrap();
+            assert_eq!(serde_json::to_value(preview.snapshot()).unwrap(),
+                serde_json::to_value(e.snapshot()).unwrap());
+            assert_eq!(serde_json::to_value(&preview_actions).unwrap(),
+                serde_json::to_value(&committed.actions).unwrap());
+            let page = &e.snapshot.monitors[0].pages[0];
+            assert_eq!(page.columns[pair].width, half);
+            assert_eq!(page.columns[pair + 1].width, half);
+            assert_eq!(page.columns[2 - 2 * pair].width, far);
+            assert_eq!(page.viewport_x, prefix as i32);
+            for (i, tile) in scene.tiles.iter().enumerate() {
+                let id = (pair + i + 1).to_string();
+                let (rect, clip, minimized) = placement(&committed.actions, &id);
+                assert_eq!(rect.width, half);
+                assert_eq!(clip, None);
+                assert!(!minimized);
+                assert_eq!(tile.rect, Rect {
+                    x: rect.x - scene.area.x,
+                    y: rect.y - scene.area.y,
+                    ..rect
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_edge_middle_snap_respects_both_minimums_including_gaps() {
+    for mirror in [false, true] {
+        for constrained in 0..=1 {
+            for gap in [0, 12] {
+                for excess in [0, 1] {
+                    let mut e = engine();
+                    e.set_gaps(gap);
+                    let view = e.snapshot.monitors[0].viewport.width;
+                    let half = view / 2;
+                    let page = &mut e.snapshot.monitors[0].pages[0];
+                    page.columns[0].width = view;
+                    page.columns[1].width = view;
+                    page.viewport_x = if mirror { view as i32 } else { 0 };
+                    e.set_min_widths(BTreeMap::from([
+                        ((constrained + 1).to_string(), half - gap + excess),
+                    ]));
+                    e.dispatch(Command::DragEdge {
+                        monitor_id: "a".into(),
+                        edge: 1,
+                        delta: if mirror { half as i32 } else { -(half as i32) },
+                    }).unwrap();
+                    let page = &e.snapshot.monitors[0].pages[0];
+                    if excess == 0 {
+                        assert_eq!(widths(page), [half, half, 600]);
+                        assert_eq!(page.viewport_x, 0);
+                    } else {
+                        let visible = usize::from(mirror);
+                        let mut expected = vec![view, view, 600];
+                        expected[visible] = half + u32::from(constrained == visible);
+                        assert_eq!(widths(page), expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_edge_non_middle_drag_and_other_visible_boundaries_keep_their_width_rules() {
+    for mirror in [false, true] {
+        let mut e = engine();
+        let view = e.snapshot.monitors[0].viewport.width;
+        let page = &mut e.snapshot.monitors[0].pages[0];
+        page.columns[0].width = view;
+        page.columns[1].width = view;
+        page.viewport_x = if mirror { view as i32 } else { 0 };
+        e.dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: if mirror { 200 } else { -200 },
+        }).unwrap();
+        let page = &e.snapshot.monitors[0].pages[0];
+        assert_eq!(widths(page), if mirror {
+            vec![view, view - 200, 600]
+        } else {
+            vec![view - 200, view, 600]
+        });
+        assert_eq!(page.viewport_x, if mirror { view as i32 - 200 } else { 0 });
+    }
+    // Merely clicking an already-centered edge must not resize its clipped neighbour.
+    for mirror in [false, true] {
+        let mut e = engine();
+        let view = e.snapshot.monitors[0].viewport.width;
+        let page = &mut e.snapshot.monitors[0].pages[0];
+        page.columns[0].width = if mirror { view } else { view / 2 };
+        page.columns[1].width = if mirror { view / 2 } else { view };
+        page.viewport_x = if mirror { (view / 2) as i32 } else { 0 };
+        let before = (widths(page), page.viewport_x);
+        e.dispatch(Command::DragEdge {
+            monitor_id: "a".into(),
+            edge: 1,
+            delta: 0,
+        }).unwrap();
+        let page = &e.snapshot.monitors[0].pages[0];
+        assert_eq!((widths(page), page.viewport_x), before);
+    }
+    let mut e = engine();
+    for column in &mut e.snapshot.monitors[0].pages[0].columns {
+        column.width = 400;
+    }
+    e.dispatch(Command::DragEdge {
+        monitor_id: "a".into(),
+        edge: 1,
+        delta: 200,
+    }).unwrap();
+    let page = &e.snapshot.monitors[0].pages[0];
+    assert_eq!(widths(page), [600, 200, 400]);
+    assert_eq!(page.viewport_x, 0);
 }
 
 #[test]

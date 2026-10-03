@@ -72,8 +72,8 @@ struct Entry {
     region_box: Option<RECT>,
     /// A partial window has been placed below neighbouring monitors' windows.
     at_bottom: bool,
-    /// Smallest visible width the window accepted (window DPI, width), learned when Windows
-    /// kept it wider than a placement asked (WM_GETMINMAXINFO cannot be read from outside).
+    /// Observed width constraint (window DPI, visible width), valid until a smaller normal
+    /// frame is accepted or DPI changes. A refused/no-op placement alone is not a minimum.
     min_width: Option<(u32, u32)>,
     /// Visible rectangle last applied by this manager. Still matching it is our geometry,
     /// even when that rectangle fills the monitor bounds.
@@ -304,6 +304,39 @@ fn copy_region(source: &Region) -> Result<Region, AppError> {
     }
     Ok(r)
 }
+/// A smaller accepted normal frame disproves a cached minimum; it does not establish a new one.
+/// Constraints are DPI-local: changing DPI does not prove that the app scales its minimum.
+fn invalidate_min_width(minimum: &mut Option<(u32, u32)>, dpi: u32, accepted_width: Option<u32>) {
+    if minimum.is_some_and(|(known_dpi, width)| {
+        dpi == 0
+            || known_dpi != dpi
+            || accepted_width.is_some_and(|accepted| accepted > 0 && accepted < width)
+    }) {
+        *minimum = None;
+    }
+}
+
+/// Learn only a width-only clamp that actually resized and held across the existing two
+/// placements. An unchanged frame may just be an app temporarily ignoring SetWindowPos.
+fn constrained_width(
+    before: Option<Rect>,
+    first: Option<Rect>,
+    actual: Rect,
+    requested: Rect,
+    dpis: [u32; 3],
+) -> Option<u32> {
+    (dpis[0] != 0
+        && dpis.iter().all(|dpi| *dpi == dpis[0])
+        && before.is_some_and(|before| before.width > 0 && before.width != actual.width)
+        && first == Some(actual)
+        && actual.x == requested.x
+        && actual.y == requested.y
+        && actual.height == requested.height
+        && actual.height > 0
+        && actual.width > requested.width)
+        .then_some(actual.width)
+}
+
 /// Use a measured border while DWM cannot report it (minimized or region-clipped).
 fn scaled_pad(pad: [i32; 4], from: u32, to: u32) -> [i32; 4] {
     pad.map(|p| {
@@ -372,15 +405,14 @@ impl Backend {
         let id = monitor_id(unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) });
         foreground_paused(&id, &self.full_display)
     }
-    /// Learned minimum visible widths at each window's current DPI.
+    /// Learned minimum visible widths only at the DPI where the clamp was observed.
     pub fn min_widths(&self) -> BTreeMap<String, u32> {
         self.entries
             .iter()
             .filter_map(|(id, e)| {
                 let (dpi, width) = e.min_width?;
                 let now = unsafe { GetDpiForWindow(e.hwnd as HWND) };
-                let scaled = u64::from(width) * u64::from(now.max(1)) / u64::from(dpi.max(1));
-                Some((id.clone(), scaled as u32))
+                (now != 0 && now == dpi).then(|| (id.clone(), width))
             })
             .collect()
     }
@@ -682,6 +714,14 @@ impl Backend {
                 (Some(pad), _) | (None, Some(pad)) => inset(outer, pad),
                 (None, None) => dwm_frame(h).unwrap_or(outer),
             };
+            let visible = rect(r);
+            let accepted_width =
+                (!minimized && !zoomed && visible.height > 0).then_some(visible.width);
+            invalidate_min_width(
+                &mut self.entries.get_mut(&id).unwrap().min_width,
+                dpi,
+                accepted_width,
+            );
             let mut title = vec![0u16; 32768];
             let n = unsafe { GetWindowTextW(h, title.as_mut_ptr(), title.len() as i32) }.max(0)
                 as usize;
@@ -1023,7 +1063,7 @@ impl Backend {
             let outer = outset(r, pad);
             let current = outer_frame(h);
             if !sink && current.is_some_and(|current| same_rect(current, outer)) {
-                return Ok(outer);
+                return Ok((outer, current));
             }
             // Sliding a fixed-size window should not trigger resize work or synchronous
             // repainting of the neighbouring windows it uncovers.
@@ -1046,19 +1086,23 @@ impl Backend {
                         | if no_size { SWP_NOSIZE } else { 0 },
                 )
             } != 0)
-                .then_some(outer)
+                .then_some((outer, current))
                 .ok_or_else(|| failed("SetWindowPos", Some(id)))
         };
-        let mut outer = position(pad)?;
+        let before_dpi = unsafe { GetDpiForWindow(h) };
+        let initial_pad = pad;
+        let (mut outer, before) = position(pad)?;
         // Crossing into a monitor with different scaling makes the app resize itself
         // (WM_DPICHANGED) and changes the invisible border. A column peeking in at the screen
         // edge does this when most of it lies on the neighbouring monitor. Place once more
         // with the new DPI's border: the window is already there, so the size now holds.
-        let resized = outer_frame(h).is_some_and(|actual| !same_rect(actual, outer));
+        let first = outer_frame(h);
+        let first_dpi = unsafe { GetDpiForWindow(h) };
+        let resized = first.is_some_and(|actual| !same_rect(actual, outer));
         let new_pad = self.measure_pad(id, h).unwrap_or(pad);
         if resized || new_pad != pad {
             pad = new_pad;
-            outer = position(pad)?;
+            outer = position(pad)?.0;
         }
         self.entries.get_mut(id).unwrap().placed_pad = Some(pad);
         let actual = outer_frame(h).ok_or_else(|| failed("GetWindowRect", Some(id)))?;
@@ -1084,12 +1128,20 @@ impl Backend {
         let entry = self.entries.get_mut(id).unwrap();
         entry.minimized = false;
         entry.at_bottom = partial;
-        if !same_rect(actual, outer) {
-            let visible = inset(actual, pad);
-            let width = visible.right - visible.left;
-            if width > r.right - r.left {
-                let dpi = unsafe { GetDpiForWindow(h) };
-                self.entries.get_mut(id).unwrap().min_width = Some((dpi, width as u32));
+        let dpi = unsafe { GetDpiForWindow(h) };
+        let accepted = same_rect(actual, outer);
+        invalidate_min_width(&mut entry.min_width, dpi, accepted.then_some(target.width));
+        if !accepted {
+            if initial_pad == pad {
+                if let Some(width) = constrained_width(
+                    before.map(|r| rect(inset(r, pad))),
+                    first.map(|r| rect(inset(r, pad))),
+                    rect(inset(actual, pad)),
+                    target,
+                    [before_dpi, first_dpi, dpi],
+                ) {
+                    entry.min_width = Some((dpi, width));
+                }
             }
             return Err(error(
                 ErrorCode::OperationDenied,
@@ -1259,6 +1311,88 @@ impl Drop for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smaller_accepted_width_invalidates_stale_minimum_only() {
+        let mut minimum = Some((96, 1920));
+        invalidate_min_width(&mut minimum, 96, Some(960));
+        assert_eq!(minimum, None);
+
+        let mut minimum = Some((96, 800));
+        for width in [None, Some(0), Some(800), Some(960)] {
+            // No accepted normal frame (iconic/zoomed), invalid size, or a width that
+            // still fits the genuine constraint cannot disprove it.
+            invalidate_min_width(&mut minimum, 96, width);
+            assert_eq!(minimum, Some((96, 800)));
+        }
+    }
+
+    #[test]
+    fn minimum_is_invalidated_not_scaled_across_dpi_changes() {
+        for (from, to) in [(144, 96), (96, 144), (96, 0)] {
+            let mut minimum = Some((from, 800));
+            invalidate_min_width(&mut minimum, to, None);
+            assert_eq!(minimum, None);
+            // Returning to the old DPI must not resurrect the obsolete constraint.
+            invalidate_min_width(&mut minimum, from, Some(800));
+            assert_eq!(minimum, None);
+        }
+    }
+
+    #[test]
+    fn minimum_learning_requires_a_stable_width_only_resize_at_one_dpi() {
+        let requested = Rect {
+            x: -1920,
+            y: 0,
+            width: 600,
+            height: 1032,
+        };
+        let actual = Rect {
+            width: 800,
+            ..requested
+        };
+        let before = Rect {
+            width: 1920,
+            ..requested
+        };
+        let learn =
+            |before, first, actual, dpis| constrained_width(before, first, actual, requested, dpis);
+        assert_eq!(
+            learn(Some(before), Some(actual), actual, [96; 3]),
+            Some(800)
+        );
+        assert_eq!(
+            learn(Some(actual), Some(actual), actual, [96; 3]),
+            None,
+            "unchanged refused width is not evidence of a minimum"
+        );
+        assert_eq!(
+            learn(Some(before), Some(before), actual, [96; 3]),
+            None,
+            "a transient readback does not establish a minimum"
+        );
+        assert_eq!(learn(None, Some(actual), actual, [96; 3]), None);
+        for mismatch in [
+            Rect {
+                x: actual.x + 1,
+                ..actual
+            },
+            Rect {
+                height: actual.height + 1,
+                ..actual
+            },
+        ] {
+            assert_eq!(learn(Some(before), Some(mismatch), mismatch, [96; 3]), None);
+        }
+        for dpis in [[144, 96, 96], [96, 96, 144], [0; 3]] {
+            assert_eq!(learn(Some(before), Some(actual), actual, dpis), None);
+        }
+        assert_eq!(
+            learn(Some(before), Some(requested), requested, [96; 3]),
+            None
+        );
+    }
+
     #[test]
     fn clipped_border_scales_without_unmasking_the_window() {
         assert_eq!(scaled_pad([9, 0, 9, 9], 144, 96), [6, 0, 6, 6]);
