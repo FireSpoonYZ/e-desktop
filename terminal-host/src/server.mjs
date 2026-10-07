@@ -43,7 +43,8 @@ export function terminalInput(data, encoding, platform = process.platform) {
 }
 const sessionInfo = s => ({ id: s.id, title: s.title, profileId: s.profileId, cwd: s.cwd,
   cols: s.cols, rows: s.rows, status: s.status, ...(s.exitCode !== undefined ? { exitCode: s.exitCode } : {}),
-  ownerClientId: s.owner?.clientId ?? null });
+  ownerClientId: s.owner?.clientId ?? null,
+  displayMode: s.requestedDisplayMode === 'desktop' ? 'desktop' : s.desktopSize ? 'phone' : 'auto' });
 
 export function pairingAddresses(boundAddress, interfaces = networkInterfaces()) {
   if (!['0.0.0.0', '::'].includes(boundAddress)) return [boundAddress];
@@ -87,12 +88,53 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
     return s;
   }
   function running(s) { if (s.status !== 'running') fail('EXITED', 'Terminal has exited'); }
-  function resize(s, cols, rows) {
+  function publishSnapshot(s) {
+    event({ event: 'terminal.snapshot', sessionId: s.id,
+      snapshot: s.emulator.getSnapshot(s.seq), displayMode: sessionInfo(s).displayMode }, s);
+  }
+  function resize(s, cols, rows, display = {}) {
     running(s);
     cols = size(cols, undefined, 400); rows = size(rows, undefined, 200);
     s.pty.resize(cols, rows);
     s.emulator.resize(cols, rows); s.cols = cols; s.rows = rows;
-    event({ event: 'terminal.snapshot', sessionId: s.id, snapshot: s.emulator.getSnapshot(s.seq) }, s);
+    Object.assign(s, display);
+    publishSnapshot(s);
+  }
+  function displayOptions(p) {
+    if (p.displayMode !== undefined && !['auto', 'desktop'].includes(p.displayMode))
+      fail('INVALID_PARAMS', 'displayMode must be auto or desktop');
+    let viewport;
+    if (p.viewport !== undefined) {
+      if (!p.viewport || typeof p.viewport !== 'object' || Array.isArray(p.viewport))
+        fail('INVALID_PARAMS', 'Invalid viewport');
+      viewport = { cols: Math.max(20, size(p.viewport.cols, undefined, 400)),
+        rows: Math.max(8, size(p.viewport.rows, undefined, 200)) };
+    }
+    return { displayMode: p.displayMode, viewport };
+  }
+  function subscribed(c, s, subscriptionId) {
+    const id = string(subscriptionId, 'subscriptionId', 128);
+    if (!c.subscriptions.has(s.id) || c.subscriptions.get(s.id) !== id)
+      fail('NOT_SUBSCRIBED', 'Current terminal subscription required');
+  }
+  function applyDisplay(c, s, options = {}) {
+    const previous = s.mobileViewports.get(c);
+    const mode = options.displayMode ?? s.requestedDisplayMode;
+    const viewport = options.viewport ?? previous?.viewport;
+    // The host retains the pre-fit desktop grid across disconnects, matching
+    // Orca's default indefinite mobile-fit hold; only an explicit restore clears it.
+    const desktopSize = mode === 'desktop' ? undefined
+      : viewport ? s.desktopSize ?? { cols: s.cols, rows: s.rows } : s.desktopSize;
+    const target = mode === 'desktop' ? s.desktopSize
+      : viewport;
+    const display = { requestedDisplayMode: mode, desktopSize };
+    if (target && (target.cols !== s.cols || target.rows !== s.rows))
+      resize(s, target.cols, target.rows, display);
+    else { Object.assign(s, display); publishSnapshot(s); }
+    if (previous) {
+      if (options.displayMode !== undefined) previous.displayMode = options.displayMode;
+      if (options.viewport) previous.viewport = options.viewport;
+    }
   }
   function publishExit(s) {
     if (!s.exitResult || s.status === 'exited') return;
@@ -103,7 +145,10 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
   function disconnect(c) {
     connections.delete(c);
     c.auth = false;
-    for (const s of sessions.values()) if (s.owner === c) { s.owner = null; s.pty.setOwner(null); control(s); }
+    for (const s of sessions.values()) {
+      s.mobileViewports.delete(c);
+      if (s.owner === c) { s.owner = null; s.pty.setOwner(null); control(s); }
+    }
   }
   async function dispatch(c, method, p) {
     if (method === 'auth') {
@@ -123,7 +168,7 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
         previous.ws.close(1000, 'Connection replaced');
       }
       c.auth = true; c.admin = isAdmin; c.deviceId = device?.id; c.clientId = clientId; c.clientType = p.clientType;
-      return { protocolVersion: 1, hostName: hostname() };
+      return { protocolVersion: 1, hostName: hostname(), capabilities: { terminalDisplayMode: true } };
     }
     if (method === 'pair') {
       if (c.local || c.auth) fail('FORBIDDEN', 'Pair on an unauthenticated remote connection');
@@ -180,7 +225,8 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
         catch { fail('INVALID_PARAMS', 'cwd must be an existing directory'); }
         const cols = size(p.cols, 80, 400), rows = size(p.rows, 24, 200);
         const s = { id: randomUUID(), title: profile.name, profileId: profile.id, cwd, cols, rows,
-          status: 'running', owner: null, seq: 0, queuedBytes: 0, paused: false };
+          status: 'running', owner: null, seq: 0, queuedBytes: 0, paused: false,
+          requestedDisplayMode: 'auto', desktopSize: undefined, mobileViewports: new Map() };
         s.emulator = new HeadlessEmulator(cols, rows, reply => {
           if (s.status === 'running') s.pty.write(reply);
         });
@@ -234,24 +280,41 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
       }
       case 'terminal.subscribe': {
         const s = getSession(p);
-        const snapshot = s.emulator.getSnapshot(s.seq);
+        const options = displayOptions(p);
         const subscriptionId = p.subscriptionId === undefined ? undefined : string(p.subscriptionId, 'subscriptionId', 128);
         c.subscriptions.set(s.id, subscriptionId);
-        return { session: sessionInfo(s), snapshot };
+        if (c.clientType === 'mobile') {
+          s.mobileViewports.set(c, { ...options, subscriptionId });
+          // Observers may measure their screen, but only the input owner changes the PTY.
+          if (s.owner === c && s.status === 'running') applyDisplay(c, s, options);
+        }
+        return { session: sessionInfo(s), snapshot: s.emulator.getSnapshot(s.seq) };
       }
       case 'terminal.unsubscribe': {
         const sessionId = string(p.sessionId, 'sessionId');
         const subscriptionId = p.subscriptionId === undefined ? undefined : string(p.subscriptionId, 'subscriptionId', 128);
-        if (c.subscriptions.get(sessionId) === subscriptionId) c.subscriptions.delete(sessionId);
+        if (c.subscriptions.has(sessionId) && c.subscriptions.get(sessionId) === subscriptionId) {
+          c.subscriptions.delete(sessionId); sessions.get(sessionId)?.mobileViewports.delete(c);
+        }
         return {};
+      }
+      case 'terminal.displayModeSet': {
+        const s = getSession(p); owned(c, s); running(s);
+        subscribed(c, s, p.subscriptionId);
+        if (p.displayMode === undefined) fail('INVALID_PARAMS', 'displayMode is required');
+        const options = displayOptions(p);
+        applyDisplay(c, s, options);
+        return { session: sessionInfo(s), snapshot: s.emulator.getSnapshot(s.seq) };
       }
       case 'terminal.claim': {
         const s = getSession(p); running(s);
         if (p.cols !== undefined || p.rows !== undefined) {
-          // Validate before changing ownership.
-          size(p.cols, undefined, 400); size(p.rows, undefined, 200);
-          resize(s, p.cols, p.rows);
-        }
+          // Validate before changing ownership or the retained desktop baseline.
+          const viewport = { cols: size(p.cols, undefined, 400), rows: size(p.rows, undefined, 200) };
+          if (c.clientType === 'mobile') applyDisplay(c, s, { displayMode: 'auto', viewport });
+          else resize(s, viewport.cols, viewport.rows, { requestedDisplayMode: 'desktop', desktopSize: undefined });
+        } else if (c.clientType === 'desktop' && s.desktopSize) applyDisplay(c, s, { displayMode: 'desktop' });
+        else if (c.clientType === 'mobile' && s.mobileViewports.has(c)) applyDisplay(c, s, s.mobileViewports.get(c));
         s.owner = c; s.pty.setOwner(c); control(s); return { ownerClientId: c.clientId };
       }
       case 'terminal.release': {
@@ -265,7 +328,21 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
         await s.pty.send(terminalInput(p.data, p.encoding), c.clientId); return { accepted: true };
       }
       case 'terminal.updateViewport': {
-        const s = getSession(p); owned(c, s); resize(s, p.cols, p.rows); return {};
+        const s = getSession(p); owned(c, s); running(s);
+        if (p.subscriptionId !== undefined) subscribed(c, s, p.subscriptionId);
+        const viewport = { cols: size(p.cols, undefined, 400), rows: size(p.rows, undefined, 200) };
+        if (c.clientType === 'mobile') {
+          const previous = s.mobileViewports.get(c);
+          const options = { viewport: { cols: Math.max(20, viewport.cols), rows: Math.max(8, viewport.rows) } };
+          // New clients keep desktop mode unchanged when only their phone frame changes.
+          if (p.subscriptionId !== undefined && s.requestedDisplayMode === 'desktop') {
+            if (previous) previous.viewport = options.viewport;
+          } else {
+            if (p.subscriptionId === undefined) options.displayMode = 'auto';
+            applyDisplay(c, s, options);
+          }
+        } else resize(s, viewport.cols, viewport.rows, { requestedDisplayMode: 'desktop', desktopSize: undefined });
+        return { session: sessionInfo(s) };
       }
       case 'terminal.close': {
         const s = getSession(p);

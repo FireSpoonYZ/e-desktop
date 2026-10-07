@@ -177,6 +177,33 @@ delivered and must be reduced (clear scrollback or use smaller dimensions).
 Unauthenticated connections expire after 15 seconds and have eight attempts.
 Ping/pong reaps dead sockets without touching their shells.
 
+## Mobile display modes
+
+The auth response advertises `capabilities.terminalDisplayMode: true`.
+Sessions include observed `displayMode`: `auto` before fitting, `phone` while a
+mobile fit is held, or `desktop` after an explicit desktop restore.
+
+A mobile `terminal.subscribe` may include `displayMode: 'auto' | 'desktop'`
+and `viewport: {cols, rows}`. Passive subscribers record measurements without
+taking control or resizing the PTY. On mobile claim, the current subscriber's
+measurement is applied. The current owner can call
+`terminal.displayModeSet {sessionId, subscriptionId, displayMode, viewport?}`;
+the result contains both `session` and `snapshot`. The subscription ID must
+match the current registration. Mode changes emit `terminal.snapshot` with
+an additional `displayMode`, including changes that keep the same dimensions.
+New mobile viewport updates carry `subscriptionId`; they only record phone
+measurements while desktop mode is selected. Phone fit has a minimum 20×8
+grid, within the existing 400×200 wire bounds.
+
+The host retains the pre-fit desktop dimensions across replacement subscriptions,
+multiple mobile actors, socket disconnects and periods with no subscribers.
+Like Orca's default `mobileAutoRestoreFitMs: null`, the last unsubscribe holds
+the phone layout indefinitely. Selecting desktop mode or a desktop claim restores
+the retained dimensions. Explicit desktop claim/viewport dimensions supersede
+that baseline. Invalid or retired-subscription requests cannot mutate it.
+Legacy subscribe, input and viewport calls remain accepted; mobile-mode features
+require an updated host.
+
 ## Upstream reuse and attribution
 
 Read-only source: `D:/project/.agent-work/e-terminal/orca-reference`,
@@ -226,7 +253,7 @@ path and rejects non-owner/invalid-byte writes. The real-PTY smoke exercises eve
 sequenced output, observer rejection, takeover, resize snapshot, unsubscribe,
 disconnect survival and close.
 
-Current integrated checks on Windows/Node 26.8.2: host 27 pass/3 Unix skips,
+Current integrated checks on Windows/Node 26.8.2: host 28 pass/3 Unix skips,
 native deployment 6 pass, desktop UI 68 pass; candidate release build and copied
 resource startup/shutdown passed. Native PowerShell/Bash Unicode, binary input,
 queries, reconnect and cleanup passed. Integrated feature-free Bash complete
