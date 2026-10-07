@@ -22,8 +22,6 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     /// Keyboard/command focus changes move the pointer into the focused window.
     pub warp_mouse_to_focus: bool,
-    /// The top-left pixel of each monitor toggles the overview.
-    pub hot_corners: bool,
     /// Held with left drag to move managed windows; null disables.
     pub drag_modifier: Option<DragModifier>,
     /// Logical pixels between tiled windows and around the usable edges. Maximum 256.
@@ -319,7 +317,6 @@ impl Default for Config {
             animation_duration_ms: 160,
             focus_follows_mouse: false,
             warp_mouse_to_focus: false,
-            hot_corners: true,
             drag_modifier: Some(DragModifier::Alt),
             gaps: 0,
             top_bar: true,

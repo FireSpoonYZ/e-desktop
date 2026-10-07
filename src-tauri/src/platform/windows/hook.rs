@@ -29,7 +29,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub enum Raw {
-    /// `pressed`: a mouse button is held (native drags must not open hot corners).
+    /// `pressed`: a mouse button is held (native drags must not focus on hover).
     Move {
         x: i32,
         y: i32,
@@ -80,7 +80,7 @@ pub struct Settings {
     pub modifier: Option<DragModifier>,
     /// Report all plain pointer motion (focus-follows-mouse, revealed bars).
     pub moves: bool,
-    /// Otherwise report motion only when entering or leaving these zones (hot corners, top edges).
+    /// Otherwise report motion only when entering or leaving these zones (top edges).
     pub zones: Vec<Rect>,
     /// Monitor bounds where a foreign window covers the display. Clicks there are not swallowed.
     pub suspended: Vec<Rect>,

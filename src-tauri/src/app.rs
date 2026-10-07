@@ -360,7 +360,6 @@ struct Controller {
     window_drag: bool,
     /// Last window under the pointer: focus-follows-mouse acts on entering a window.
     hovered: Option<String>,
-    in_corner: bool,
     /// False hides every top bar and reserves no space.
     top_bar: bool,
     /// Managed window in the system move/size loop at the last refresh.
@@ -401,7 +400,6 @@ impl Controller {
             gesture: None,
             window_drag: false,
             hovered: None,
-            in_corner: false,
             top_bar: Config::default().top_bar,
             native_drag: None,
             native_move: None,
@@ -1204,7 +1202,7 @@ fn compositor_blocks_native_pointer(composing: bool, raw: &crate::platform::hook
 }
 
 /// lane: rules-spawn-screenshot. While a screenshot runs, hook events start nothing (drags,
-/// hover focus, hot corners, wheel or swipe actions). Releases, the end of native move loops,
+/// hover focus, wheel or swipe actions). Releases, the end of native move loops,
 /// window lifetime events and swipe ends still drain, to finish what the screenshot cancelled.
 #[cfg(target_os = "windows")]
 fn screenshot_blocks_native_pointer(raw: &crate::platform::hook::Raw) -> bool {
@@ -1253,20 +1251,11 @@ impl Controller {
                 .monitors
                 .iter()
                 .filter(|m| !suspended(&m.monitor.id))
-                .flat_map(|m| {
-                    let b = m.monitor.bounds;
-                    let corner = Rect {
-                        width: 1,
-                        height: 1,
-                        ..b
-                    };
-                    let edge = Rect { height: 1, ..b };
-                    [
-                        (enabled && config.hot_corners).then_some(corner),
-                        (self.top_bar && !self.bar_pinned(&m.monitor.id)).then_some(edge),
-                    ]
+                .filter(|m| self.top_bar && !self.bar_pinned(&m.monitor.id))
+                .map(|m| Rect {
+                    height: 1,
+                    ..m.monitor.bounds
                 })
-                .flatten()
                 .collect(),
             suspended: snapshot
                 .monitors
@@ -1315,7 +1304,7 @@ impl Controller {
     }
 
     /// Reveal an unpinned bar at its monitor's top edge; hide it once the pointer leaves it.
-    fn update_bars(&mut self, x: i32, y: i32, corner_active: bool) {
+    fn update_bars(&mut self, x: i32, y: i32) {
         if !self.top_bar {
             self.revealed.clear();
             return;
@@ -1343,8 +1332,7 @@ impl Controller {
                 continue;
             }
             let b = m.monitor.bounds;
-            let edge = inside(Rect { height: 1, ..b }) && !(corner_active && x == b.x as i64);
-            if edge {
+            if inside(Rect { height: 1, ..b }) {
                 self.revealed.insert(id.clone());
             } else if !inside(bar_rect(&m.monitor)) {
                 self.revealed.remove(id);
@@ -1352,20 +1340,13 @@ impl Controller {
         }
     }
 
-    /// Returns an overview toggle request when the pointer enters a hot corner.
-    fn pointer(&mut self, app: &tauri::AppHandle, config: &Config) -> Option<Request> {
-        let mut request = None;
+    fn pointer(&mut self, app: &tauri::AppHandle, config: &Config) {
         for raw in crate::platform::hook::drain() {
-            match self.pointer_event(app, config, raw) {
-                Ok(Some(next)) => request = Some(next),
-                Ok(None) => {}
-                Err(issue) => {
-                    self.gesture = None;
-                    self.record(issue);
-                }
+            if let Err(issue) = self.pointer_event(app, config, raw) {
+                self.gesture = None;
+                self.record(issue);
             }
         }
-        request
     }
 
     fn pointer_event(
@@ -1373,17 +1354,17 @@ impl Controller {
         app: &tauri::AppHandle,
         config: &Config,
         raw: crate::platform::hook::Raw,
-    ) -> Result<Option<Request>, AppError> {
+    ) -> Result<(), AppError> {
         use crate::platform::hook::Raw;
         if crate::screenshot::active() && screenshot_blocks_native_pointer(&raw) {
-            return Ok(None);
+            return Ok(());
         }
         let blocked = compositor_blocks_native_pointer(
             self.backend.as_ref().is_some_and(Backend::composing),
             &raw,
         );
         if blocked && !matches!(raw, Raw::Move { .. }) {
-            return Ok(None);
+            return Ok(());
         }
         match raw {
             Raw::Up => {
@@ -1392,16 +1373,16 @@ impl Controller {
                     self.native_drag = Some(id);
                     self.refresh_within(Duration::from_millis(80));
                 }
-                return Ok(None);
+                return Ok(());
             }
             Raw::Windows => {
                 self.refresh_within(Duration::from_millis(30));
-                return Ok(None);
+                return Ok(());
             }
             // lane: input-gestures
             Raw::Wheel { .. } | Raw::Swipe { .. } => {
                 self.input_gesture(app, raw)?;
-                return Ok(None);
+                return Ok(());
             }
             // A title bar drag of a tiled window previews where it will land.
             Raw::MoveSize {
@@ -1421,7 +1402,7 @@ impl Controller {
                     self.native_move = (moving == Some(true)).then(|| id.clone());
                     splitter::begin_window(id, Some(hwnd), moving);
                 }
-                return Ok(None);
+                return Ok(());
             }
             _ => {}
         }
@@ -1430,21 +1411,21 @@ impl Controller {
         if let (Raw::Release { x, y }, true) = (&raw, self.window_drag) {
             self.window_drag = false;
             splitter::end_window(Some((*x, *y)), enabled);
-            return Ok(None);
+            return Ok(());
         }
         if !enabled {
             self.gesture = None;
             if let Raw::Move { x, y, .. } = raw {
-                self.update_bars(x, y, false);
+                self.update_bars(x, y);
             }
-            return Ok(None);
+            return Ok(());
         }
         let can_focus = snapshot.backend.capabilities.focus;
         let focused = snapshot.focused_window.clone();
         match raw {
             Raw::Grab { hwnd, x, y } => {
                 let Some(id) = self.backend.as_ref().and_then(|b| b.window_for(hwnd)) else {
-                    return Ok(None);
+                    return Ok(());
                 };
                 self.gesture = Gesture::start(snapshot, &id, x, y);
                 if self.gesture.is_some() {
@@ -1471,55 +1452,28 @@ impl Controller {
                     for command in gesture.update(x, y, false) {
                         self.run(command, false)?;
                     }
-                    return Ok(None);
+                    return Ok(());
                 }
-                // The drag overlay follows the pointer itself; no hover focus or hot corner.
+                // The drag overlay follows the pointer itself; no hover focus.
                 if self.window_drag {
-                    return Ok(None);
+                    return Ok(());
                 }
-                self.update_bars(x, y, config.hot_corners);
+                self.update_bars(x, y);
                 if self.point_on_suspended(x, y) {
-                    return Ok(None);
-                }
-                let snapshot = self.engine.snapshot();
-                let corner = snapshot
-                    .monitors
-                    .iter()
-                    .find(|m| {
-                        (m.monitor.bounds.x, m.monitor.bounds.y) == (x, y)
-                            && !snapshot.suspended_monitors.iter().any(|id| id == &m.monitor.id)
-                    })
-                    .filter(|_| config.hot_corners && !pressed)
-                    .map(|m| m.monitor.id.clone());
-                if corner.is_some() != self.in_corner {
-                    self.in_corner = corner.is_some();
-                    if let Some(monitor_id) = corner {
-                        let open = app
-                            .get_webview_window(Surface::Overview.label())
-                            .and_then(|w| w.is_visible().ok())
-                            .unwrap_or(false);
-                        return Ok(Some(if open {
-                            Request::Dismiss(
-                                Surface::Overview,
-                                IpcTrace::begin("native.dismiss_surface"),
-                            )
-                        } else {
-                            Request::Show(Surface::Overview, Some(monitor_id))
-                        }));
-                    }
+                    return Ok(());
                 }
                 if !config.focus_follows_mouse || pressed || !can_focus || blocked {
                     if blocked {
                         self.hovered = None;
                     }
-                    return Ok(None);
+                    return Ok(());
                 }
                 let Some(backend) = &self.backend else {
-                    return Ok(None);
+                    return Ok(());
                 };
                 let hovered = backend.window_at(x, y);
                 if hovered == self.hovered {
-                    return Ok(None);
+                    return Ok(());
                 }
                 self.hovered = hovered.clone();
                 let surface_open = [Surface::Overview, Surface::Commands].iter().any(|s| {
@@ -1534,7 +1488,7 @@ impl Controller {
                 }
             }
         }
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -2152,9 +2106,7 @@ fn run_controller(
             #[cfg(target_os = "windows")]
             Ok(Request::Pointer) => {
                 // lane: rules-spawn-screenshot. pointer_event filters events while capturing.
-                if let Some(request) = controller.pointer(&app, &shortcuts.config) {
-                    let _ = sender.try_send(request);
-                }
+                controller.pointer(&app, &shortcuts.config);
                 if let Some(delay) = controller.refresh_soon.take() {
                     // Give the released window's loop (or a closing app) a moment first.
                     next_refresh = next_refresh.min(Instant::now() + delay);
@@ -2421,7 +2373,7 @@ mod tests {
             animation_duration: Duration::from_millis(160),
             animations: Default::default(),
             preview_session: PreviewSession::default(), gesture: None, window_drag: false,
-            hovered: None, in_corner: false, top_bar: true, native_drag: None,
+            hovered: None, top_bar: true, native_drag: None,
             native_move: None, ignored_foreground: None, refresh_soon: None,
             autohide: false, pinned: BTreeSet::new(), revealed: BTreeSet::new(),
             overview_host: None, commands_host: None,
@@ -2469,7 +2421,7 @@ mod tests {
             animation_duration: Duration::from_millis(160),
             animations: Default::default(),
             preview_session: PreviewSession::default(), gesture: None, window_drag: false,
-            hovered: None, in_corner: false, top_bar: true, native_drag: None,
+            hovered: None, top_bar: true, native_drag: None,
             native_move: None, ignored_foreground: None, refresh_soon: None,
             autohide: false, pinned: BTreeSet::new(), revealed: BTreeSet::new(),
             overview_host: None, commands_host: None,

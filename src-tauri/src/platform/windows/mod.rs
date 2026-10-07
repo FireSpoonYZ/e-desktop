@@ -465,7 +465,7 @@ impl Backend {
     pub fn status(&self) -> BackendStatus {
         BackendStatus { kind: BackendKind::Windows, availability: BackendAvailability::Ready,
             capabilities: Capabilities { enumerate: true, placement: true, focus: true, close: true, minimize: true, clipping: true, focus_follows_pointer: true, ..Capabilities::default() },
-            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. Rectangles are visible DWM frames. Focus border color and corner preference apply on Windows 11. DWM live overview previews for visible sources, best-effort last pre-hide snapshots for minimized sources; low-level mouse hook for pointer focus, modifier drags and hot corners.".into() }
+            message: "Win32 polling backend. Elevated/protected windows excluded; foreground activation may be denied. Layered/RTL windows cannot be clipped. Rectangles are visible DWM frames. Focus border color and corner preference apply on Windows 11. DWM live overview previews for visible sources, best-effort last pre-hide snapshots for minimized sources; low-level mouse hook for pointer focus and modifier drags.".into() }
     }
     /// Top-level windows the pointer hook may grab.
     pub fn pointer_targets(&self) -> HashSet<usize> {
