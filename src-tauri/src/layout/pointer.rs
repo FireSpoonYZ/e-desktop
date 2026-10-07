@@ -188,10 +188,16 @@ impl Engine {
             }
             self.detach(id)?;
             let column = self.column(id.into(), width);
+            let column_id = column.id.clone();
+            let right = x >= vx + vw / 2;
             // Park geometry is what `ensure_visible` already un-hides: a right park at
             // `col_left - view` scrolls to the column's right edge, a left park at
             // `col_left + width` scrolls to its left edge. Row-squeeze still parks.
-            self.queue_column(m, p, column, x >= vx + vw / 2);
+            self.queue_column(m, p, column, right);
+            let columns = &self.snapshot.monitors[m].pages[p].columns;
+            let c = columns.iter().position(|c| c.id == column_id).unwrap();
+            let pair = if right { c.checked_sub(1) } else { Some(c + 1) };
+            self.fit_dropped_column(m, p, c, pair);
             return self.finish_drop_focus(id, m, p);
         }
         // Top-centre drop creates a standalone full-width column, not layout fullscreen.
@@ -229,15 +235,20 @@ impl Engine {
         }
         // (column index, Some(row) to stack into that column, None for a new column there).
         let mut target = (page.columns.len(), None);
+        // A new column pairs with the column the pointer is over (or the last one): `after` it
+        // for its right half or the empty space past the end.
+        let mut after = true;
         let mut left = i64::from(viewport.x) - i64::from(viewport_x.unwrap_or(page.viewport_x));
         for (c, column) in page.columns.iter().enumerate() {
             let right = left + column.width as i64;
             if x < left {
                 target = (c, None);
+                after = false;
                 break;
             }
             if x < right {
                 let quarter = column.width as i64 / 4;
+                after = x >= left + column.width as i64 / 2;
                 target = if x < left + quarter {
                     (c, None)
                 } else if x >= right - quarter {
@@ -293,13 +304,75 @@ impl Engine {
                 self.snapshot.monitors[m].pages[p].columns[c]
                     .windows
                     .insert(row, id.into());
+                // Joining another stack: every row must keep its window's minimum height, else
+                // the window becomes a column beside it and both keep the full height.
+                let joined = !(same_page && target.0 == old_c);
+                let column = &self.snapshot.monitors[m].pages[p].columns[c];
+                if joined
+                    && super::tabbed::shown_tab(column).is_none()
+                    && !self.rows_fit(m, column)
+                {
+                    self.snapshot.monitors[m].pages[p].columns[c].windows.remove(row);
+                    let at = if after { c + 1 } else { c };
+                    let column = self.column(id.into(), width);
+                    self.snapshot.monitors[m].pages[p].columns.insert(at, column);
+                    let pair = if after { at - 1 } else { at + 1 };
+                    self.fit_dropped_column(m, p, at, Some(pair));
+                } else if joined {
+                    self.fill_empty_width(m, p, c);
+                }
             }
             None => {
                 let column = self.column(id.into(), width);
                 self.snapshot.monitors[m].pages[p].columns.insert(c, column);
+                let pair = if after { c.checked_sub(1) } else { Some(c + 1) };
+                self.fit_dropped_column(m, p, c, pair);
             }
         }
         self.finish_drop_focus(id, m, p)
+    }
+
+    /// A window stacked into column `c` can leave screen width no column covers (it came
+    /// from the neighbouring column): the column grows to cover it.
+    fn fill_empty_width(&mut self, m: usize, p: usize, c: usize) {
+        let view = u64::from(self.snapshot.monitors[m].viewport.width);
+        let columns = &mut self.snapshot.monitors[m].pages[p].columns;
+        let total: u64 = columns.iter().map(|column| u64::from(column.width)).sum();
+        if total < view {
+            columns[c].width += (view - total) as u32;
+        }
+    }
+
+    /// Every row of `column` on monitor `m` is at least as tall as its window's minimum.
+    fn rows_fit(&self, m: usize, column: &Column) -> bool {
+        let total = self.snapshot.monitors[m].viewport.height;
+        self.column_heights(column, total)
+            .iter()
+            .zip(&column.windows)
+            .all(|(&height, id)| height >= self.native_min_height(m, id))
+    }
+
+    /// Width of the new column `c` a drop made: a window that cannot be half as wide as the
+    /// screen only gets the full width. Beside a full-width column `pair`, both share the
+    /// screen half and half when both can, otherwise both stay full width.
+    fn fit_dropped_column(&mut self, m: usize, p: usize, c: usize, pair: Option<usize>) {
+        let view = self.snapshot.monitors[m].viewport.width;
+        let half = view / 2;
+        let columns = &self.snapshot.monitors[m].pages[p].columns;
+        let fits_half = |column: &Column| self.settled_column_width(m, column, half) <= half;
+        let pair = pair.filter(|&i| columns.get(i).is_some_and(|column| column.width >= view));
+        let width = if !fits_half(&columns[c]) {
+            view
+        } else if let Some(i) = pair {
+            if fits_half(&columns[i]) { half } else { view }
+        } else {
+            return;
+        };
+        let columns = &mut self.snapshot.monitors[m].pages[p].columns;
+        columns[c].width = width;
+        if let Some(i) = pair.filter(|_| width == half) {
+            columns[i].width = half;
+        }
     }
 
     fn finish_drop_focus(&mut self, id: &str, m: usize, p: usize) -> Result<(), AppError> {
@@ -563,6 +636,137 @@ mod tests {
         };
         assert_eq!(m, 1);
         assert_eq!(e.snapshot.monitors[m].pages[p].columns[c].width, 600);
+    }
+
+    #[test]
+    fn drop_beside_a_full_width_column_splits_in_half_or_keeps_both_full() {
+        let widths = |e: &Engine| -> Vec<(String, u32)> {
+            let monitor = &e.snapshot.monitors[1];
+            let page = monitor.pages.iter().find(|p| p.id == monitor.active_page).unwrap();
+            page.columns.iter().map(|c| (c.windows[0].clone(), c.width)).collect()
+        };
+        let split = [("4".to_string(), 600), ("1".to_string(), 600)];
+        let full = [("4".to_string(), 1200), ("1".to_string(), 1200)];
+        // Monitor b (x -1200..0) holds window 4 alone at full width; window 1 is 50% on a.
+        let setup = |mins: &[(&str, u32)]| {
+            let mut e = engine();
+            e.dispatch(Command::SetWindowColumnWidth {
+                window_id: "4".into(),
+                width: 1200,
+            })
+            .unwrap();
+            e.set_min_widths(mins.iter().map(|(id, w)| ((*id).into(), *w)).collect());
+            e
+        };
+        // Right quarter of the full-width column, and the strip along the right screen edge.
+        for x in [-200, -10] {
+            let mut e = setup(&[]);
+            let command = Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
+                window_id: "1".into(),
+                x,
+                y: 450,
+            };
+            let scene = e.scene(command.clone(), "b", &["1".into()]).unwrap();
+            let tiles: Vec<_> = scene
+                .tiles
+                .iter()
+                .map(|t| (t.title.as_str(), t.rect.x, t.label.as_str()))
+                .collect();
+            assert_eq!(tiles, [("4", 0, "50%"), ("1", 600, "50%")], "x {x}");
+            e.dispatch(command).unwrap();
+            assert_eq!(widths(&e), split, "x {x}");
+        }
+        // Either window cannot be half as wide: both stay full width.
+        for id in ["1", "4"] {
+            let mut e = setup(&[(id, 700)]);
+            drop(&mut e, "1", -200, 450);
+            assert_eq!(widths(&e), full, "minimum on {id}");
+        }
+        // A minimum measured on a 150% monitor converts: 900 px there is 600 px here.
+        for (min, expected) in [(900, split), (960, full)] {
+            let mut e = setup(&[("1", min)]);
+            let mut native = SystemSnapshot {
+                monitors: e.snapshot.monitors.iter().map(|m| m.monitor.clone()).collect(),
+                windows: e.snapshot.windows.iter().map(|w| w.native.clone()).collect(),
+                focused_window: e.snapshot.focused_window.clone(),
+            };
+            native.monitors[0].scale_factor = 1.5;
+            e.reconcile(native).unwrap();
+            drop(&mut e, "1", -200, 450);
+            assert_eq!(widths(&e), expected, "minimum {min}");
+        }
+    }
+
+    #[test]
+    fn stacking_needs_every_row_to_fit_its_minimum_height() {
+        let columns = |e: &Engine| -> Vec<(Vec<String>, u32)> {
+            let monitor = &e.snapshot.monitors[1];
+            let page = monitor.pages.iter().find(|p| p.id == monitor.active_page).unwrap();
+            page.columns.iter().map(|c| (c.windows.clone(), c.width)).collect()
+        };
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        // Monitor b (900 px tall) holds window 4 alone at full width.
+        let setup = |heights: &[(&str, u32)]| {
+            let mut e = engine();
+            e.dispatch(Command::SetWindowColumnWidth {
+                window_id: "4".into(),
+                width: 1200,
+            })
+            .unwrap();
+            e.set_min_heights(heights.iter().map(|(id, h)| ((*id).into(), *h)).collect());
+            e
+        };
+        // Lower half of the column's middle: stacks below when both fit half the height.
+        let mut e = setup(&[("1", 450), ("4", 450)]);
+        drop(&mut e, "1", -500, 600);
+        assert_eq!(columns(&e), [(ids(&["4", "1"]), 1200)]);
+        // Either window too tall for its row: a column beside it, on the pointer's side.
+        for (id, x, expected) in [("1", -500, ["4", "1"]), ("4", -700, ["1", "4"])] {
+            let mut e = setup(&[(id, 451)]);
+            let command = Command::DropWindow {
+                page_id: None,
+                viewport_x: None,
+                window_id: "1".into(),
+                x,
+                y: 600,
+            };
+            let scene = e.scene(command.clone(), "b", &["1".into()]).unwrap();
+            let labels: Vec<_> = scene.tiles.iter().map(|t| t.label.as_str()).collect();
+            assert_eq!(labels, ["50%", "50%"], "minimum on {id}");
+            e.dispatch(command).unwrap();
+            assert_eq!(
+                columns(&e),
+                [(ids(&[expected[0]]), 600), (ids(&[expected[1]]), 600)],
+                "minimum on {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn stacking_the_last_neighbour_widens_the_column_to_the_freed_screen() {
+        // Monitor a (x 0..1200): columns 1, 2, 3 of 600 px; 1 and 2 on screen.
+        let mut e = engine();
+        let columns = |e: &Engine| -> Vec<(Vec<String>, u32)> {
+            let page = &e.snapshot.monitors[0].pages[0];
+            page.columns.iter().map(|c| (c.windows.clone(), c.width)).collect()
+        };
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        drop(&mut e, "3", 900, 600); // Column 1 still covers the other half: widths stay.
+        assert_eq!(columns(&e), [(ids(&["1"]), 600), (ids(&["2", "3"]), 600)]);
+        let command = Command::DropWindow {
+            page_id: None,
+            viewport_x: None,
+            window_id: "1".into(),
+            x: 900,
+            y: 100,
+        };
+        let scene = e.scene(command.clone(), "a", &["1".into()]).unwrap();
+        assert!(scene.tiles.iter().all(|t| t.rect.width == 1200 && t.label.starts_with("100% ×")));
+        e.dispatch(command).unwrap();
+        assert_eq!(columns(&e), [(ids(&["1", "2", "3"]), 1200)]);
+        assert_eq!(e.snapshot.monitors[0].pages[0].viewport_x, 0);
     }
 
     #[test]

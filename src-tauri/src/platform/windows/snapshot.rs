@@ -508,6 +508,7 @@ mod tests {
             region_box: None,
             at_bottom: false,
             min_width: None,
+            reported_min: None,
             placed_visible: Some(Rect {
                 x: 100,
                 y: 100,

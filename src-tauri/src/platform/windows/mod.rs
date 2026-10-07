@@ -79,6 +79,8 @@ struct Entry {
     /// Observed width constraint (window DPI, visible width), valid until a smaller normal
     /// frame is accepted or DPI changes. A refused/no-op placement alone is not a minimum.
     min_width: Option<(u32, u32)>,
+    /// Minimum visible (width, height) the app reports (WM_GETMINMAXINFO) at that window DPI.
+    reported_min: Option<(u32, (u32, u32))>,
     /// Visible rectangle last applied by this manager. Still matching it is our geometry,
     /// even when that rectangle fills the monitor bounds.
     placed_visible: Option<Rect>,
@@ -341,6 +343,33 @@ fn constrained_width(
         .then_some(actual.width)
 }
 
+/// The app's minimum visible (width, height) from WM_GETMINMAXINFO (Windows marshals it
+/// across processes), so a layout can avoid a slot the window would refuse. 0 when it sets
+/// none or does not answer within 50 ms.
+fn reported_min_size(h: HWND, pad: [i32; 4]) -> (u32, u32) {
+    let mut info: MINMAXINFO = unsafe { zeroed() };
+    let mut result = 0;
+    let answered = unsafe {
+        SendMessageTimeoutW(
+            h,
+            WM_GETMINMAXINFO,
+            0,
+            &mut info as *mut _ as LPARAM,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            50,
+            &mut result,
+        )
+    } != 0;
+    if !answered {
+        return (0, 0);
+    }
+    let visible = |outer: i32, a: i32, b: i32| {
+        (i64::from(outer) - i64::from(a) - i64::from(b)).clamp(0, i64::from(u32::MAX)) as u32
+    };
+    let min = info.ptMinTrackSize;
+    (visible(min.x, pad[0], pad[2]), visible(min.y, pad[1], pad[3]))
+}
+
 /// Use a measured border while DWM cannot report it (minimized or region-clipped).
 fn scaled_pad(pad: [i32; 4], from: u32, to: u32) -> [i32; 4] {
     pad.map(|p| {
@@ -414,9 +443,22 @@ impl Backend {
         self.entries
             .iter()
             .filter_map(|(id, e)| {
-                let (dpi, width) = e.min_width?;
                 let now = unsafe { GetDpiForWindow(e.hwnd as HWND) };
-                (now != 0 && now == dpi).then(|| (id.clone(), width))
+                let at_now = |m: Option<(u32, u32)>| m.filter(|(dpi, _)| *dpi == now).map(|m| m.1);
+                let reported = e.reported_min.map(|(dpi, (width, _))| (dpi, width));
+                let width = at_now(e.min_width).max(at_now(reported))?;
+                (now != 0 && width > 0).then(|| (id.clone(), width))
+            })
+            .collect()
+    }
+    /// Minimum visible heights the apps report, at each window's current DPI.
+    pub fn min_heights(&self) -> BTreeMap<String, u32> {
+        self.entries
+            .iter()
+            .filter_map(|(id, e)| {
+                let now = unsafe { GetDpiForWindow(e.hwnd as HWND) };
+                let (dpi, (_, height)) = e.reported_min?;
+                (now != 0 && dpi == now && height > 0).then(|| (id.clone(), height))
             })
             .collect()
     }
@@ -703,6 +745,7 @@ impl Backend {
                         region_box: None,
                         at_bottom: false,
                         min_width: None,
+                        reported_min: None,
                         placed_visible: None,
                     },
                 );
@@ -721,11 +764,15 @@ impl Backend {
             let visible = rect(r);
             let accepted_width =
                 (!minimized && !zoomed && visible.height > 0).then_some(visible.width);
-            invalidate_min_width(
-                &mut self.entries.get_mut(&id).unwrap().min_width,
-                dpi,
-                accepted_width,
-            );
+            let entry = self.entries.get_mut(&id).unwrap();
+            invalidate_min_width(&mut entry.min_width, dpi, accepted_width);
+            // Ask again after a DPI change: per-monitor aware apps scale their minimum.
+            if !minimized && dpi != 0 && entry.reported_min.is_none_or(|(d, _)| d != dpi) {
+                let pad = known
+                    .or_else(|| dwm_frame(h).map(|visible| frame_pad(outer, visible)))
+                    .unwrap_or_default();
+                entry.reported_min = Some((dpi, reported_min_size(h, pad)));
+            }
             let mut title = vec![0u16; 32768];
             let n = unsafe { GetWindowTextW(h, title.as_mut_ptr(), title.len() as i32) }.max(0)
                 as usize;
@@ -865,16 +912,29 @@ impl Backend {
                     clip,
                     minimized,
                 } => {
-                    if let Err(mut failure) = self.place(window_id, *rect, *clip, *minimized) {
-                        failure.window_id = Some(window_id.clone());
-                        // In particular, never leave our temporary empty region on a failed move.
-                        if let Err(restore) = self.restore_one(window_id) {
-                            failure.message.push_str(&format!(
-                                " Restoration also failed: {}",
-                                restore.message
+                    match self.place(window_id, *rect, *clip, *minimized) {
+                        Ok(true) => {}
+                        // The window took the slot at its own size (a minimum): leave it
+                        // there. Restoring would carry it back to where it was before the
+                        // layout, possibly another monitor, while its slot stays empty.
+                        Ok(false) => {
+                            return Err(error(
+                                ErrorCode::OperationDenied,
+                                "Window constrained requested size/position; refresh required",
+                                Some(window_id),
                             ));
                         }
-                        return Err(failure);
+                        Err(mut failure) => {
+                            failure.window_id = Some(window_id.clone());
+                            // In particular, never leave our temporary empty region on a failed move.
+                            if let Err(restore) = self.restore_one(window_id) {
+                                failure.message.push_str(&format!(
+                                    " Restoration also failed: {}",
+                                    restore.message
+                                ));
+                            }
+                            return Err(failure);
+                        }
                     }
                 }
                 NativeAction::Focus { window_id } => {
@@ -953,7 +1013,7 @@ impl Backend {
         target: Rect,
         clip: Option<Rect>,
         minimized: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let r = native(target)?;
         let h = self.entry(id)?.hwnd as HWND;
         let mut work = None;
@@ -990,7 +1050,7 @@ impl Backend {
                 self.show(h, SW_SHOWMINNOACTIVE, true, id)?;
                 self.entries.get_mut(id).unwrap().minimized = true;
             }
-            return Ok(());
+            return Ok(true);
         }
         let iconic = unsafe { IsIconic(h) } != 0;
         // Mask BEFORE moving/restoring with the part visible both before and after the move,
@@ -1147,14 +1207,10 @@ impl Backend {
                     entry.min_width = Some((dpi, width));
                 }
             }
-            return Err(error(
-                ErrorCode::OperationDenied,
-                "Window constrained requested size/position; refresh required",
-                Some(id),
-            ));
+            return Ok(false);
         }
         self.entries.get_mut(id).unwrap().placed_visible = Some(target);
-        Ok(())
+        Ok(true)
     }
     /// Focus border and corners for managed windows. Unchanged windows are not touched.
     pub fn set_decorations(

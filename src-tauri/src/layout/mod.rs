@@ -57,6 +57,8 @@ pub struct Engine {
     size_floating: BTreeSet<WindowId>,
     /// Minimum widths windows enforce natively; their columns are never narrower (niri).
     min_widths: BTreeMap<WindowId, u32>,
+    /// Minimum heights windows report natively; a drop does not stack a window below them.
+    min_heights: BTreeMap<WindowId, u32>,
     disconnected_monitors: BTreeMap<MonitorId, monitors::DisconnectedMonitor>,
     monitor_order: Vec<MonitorId>,
     /// Explicit moves into borrowed pages stay on their chosen host when the owner returns.
@@ -233,6 +235,7 @@ impl Engine {
             pending_rule_floating: BTreeSet::new(),
             size_floating: BTreeSet::new(),
             min_widths: BTreeMap::new(),
+            min_heights: BTreeMap::new(),
             disconnected_monitors: BTreeMap::new(),
             monitor_order: vec![],
             hotplug_pinned: BTreeMap::new(),
@@ -355,6 +358,10 @@ impl Engine {
 
     pub fn set_min_widths(&mut self, min_widths: BTreeMap<WindowId, u32>) {
         self.min_widths = min_widths;
+    }
+
+    pub fn set_min_heights(&mut self, min_heights: BTreeMap<WindowId, u32>) {
+        self.min_heights = min_heights;
     }
 
     pub fn set_gaps(&mut self, gaps: u32) {
@@ -934,18 +941,18 @@ impl Engine {
             .map(|slot| slot.page_id.clone())
             .collect();
         let named: BTreeSet<PageId> = self.snapshot.named_pages.iter().cloned().collect();
-        let gaps = self.snapshot.gaps;
         for m in 0..self.snapshot.monitors.len() {
+            let mins: Vec<u32> = self.snapshot.monitors[m]
+                .pages
+                .iter()
+                .flat_map(|page| &page.columns)
+                .map(|column| self.native_min_width(m, column))
+                .collect();
+            let mut mins = mins.into_iter();
             let monitor = &mut self.snapshot.monitors[m];
-            let gap = 2 * half_gap(gaps, monitor.monitor.scale_factor);
             for page in &mut monitor.pages {
                 for column in &mut page.columns {
-                    let min = column
-                        .windows
-                        .iter()
-                        .filter_map(|id| self.min_widths.get(id))
-                        .max()
-                        .map_or(0, |w| w + gap);
+                    let min = mins.next().unwrap_or(0);
                     column.width = column.width.max(min).min(monitor.viewport.width).max(1);
                 }
                 page.columns.retain(|c| !c.windows.is_empty());
@@ -1404,10 +1411,23 @@ impl Engine {
                 delta,
             } => {
                 let m = self.monitor_index(&monitor_id)?;
+                let half_ok: Vec<bool> = {
+                    let monitor = &self.snapshot.monitors[m];
+                    let half = monitor.viewport.width / 2;
+                    monitor
+                        .pages
+                        .iter()
+                        .find(|p| p.id == monitor.active_page)
+                        .map_or(vec![], |page| {
+                            page.columns
+                                .iter()
+                                .map(|column| self.native_min_width(m, column) <= half)
+                                .collect()
+                        })
+                };
                 let monitor = &mut self.snapshot.monitors[m];
                 let view = monitor.viewport.width;
                 let snap = snap_distance(monitor.monitor.scale_factor, view);
-                let gap = 2 * half_gap(self.snapshot.gaps, monitor.monitor.scale_factor);
                 let page = monitor
                     .pages
                     .iter_mut()
@@ -1440,15 +1460,7 @@ impl Engine {
                     if let Some(clipped) = clipped {
                         // At the middle snap, bring the clipped neighbour fully on screen too,
                         // but only if both columns' real minimums allow the half-width split.
-                        let can_split = page.columns[edge - 1..=edge].iter().all(|column| {
-                            column
-                                .windows
-                                .iter()
-                                .filter_map(|id| self.min_widths.get(id))
-                                .max()
-                                .map_or(0, |width| width + gap)
-                                <= half
-                        });
+                        let can_split = half_ok[edge - 1] && half_ok[edge];
                         if widths[clipped] > half
                             && edges::edge_position(&widths, x, edge) == i64::from(half)
                             && can_split

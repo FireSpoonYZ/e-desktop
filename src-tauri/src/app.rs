@@ -529,6 +529,8 @@ impl Controller {
         self.engine.set_backend(backend.status());
         #[cfg(target_os = "windows")]
         self.engine.set_min_widths(backend.min_widths());
+        #[cfg(target_os = "windows")]
+        self.engine.set_min_heights(backend.min_heights());
         let mut system = system?;
         #[cfg(target_os = "windows")]
         {
@@ -759,8 +761,8 @@ impl Controller {
                 .apply(std::slice::from_ref(action));
             if let Err(issue) = result {
                 // One window refusing its slot (minimum size, layered clip, ...) must not
-                // end the whole session: the backend already restored that window, so
-                // report it, leave it untouched until its plan changes, and keep going.
+                // end the whole session: the backend left it at its own size or restored
+                // it, so report it, leave it untouched until its plan changes, and keep going.
                 if let (
                     NativeAction::Placement {
                         window_id,

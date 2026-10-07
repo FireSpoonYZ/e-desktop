@@ -351,6 +351,7 @@ impl Backend {
                 region_box: None,
                 at_bottom: false,
                 min_width: None,
+                reported_min: None,
                 placed_visible: None,
             });
         }

@@ -362,18 +362,46 @@ impl Engine {
         let scale = monitor.monitor.scale_factor;
         let gap = 2 * half_gap(self.snapshot.gaps, scale);
         let (min, max) = rule_width_bounds(&self.size_limits, column, scale, gap);
-        let native = column
-            .windows
-            .iter()
-            .filter_map(|id| self.min_widths.get(id))
-            .max()
-            .map_or(0, |w| w.saturating_add(gap));
+        let native = self.native_min_width(m, column);
         width
             .min(max)
             .max(min)
             .max(native)
             .min(monitor.viewport.width)
             .max(1)
+    }
+
+    /// Native minimum width of `column`'s windows on monitor `m`, plus the gap; 0 when none
+    /// is known. Minimums are measured on each window's current monitor and converted by
+    /// scale factor, so a drop onto another monitor can be checked before the window gets there.
+    pub(super) fn native_min_width(&self, m: usize, column: &Column) -> u32 {
+        column
+            .windows
+            .iter()
+            .filter_map(|id| self.native_min(m, id, &self.min_widths))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Native minimum height of window `id` on monitor `m`, plus the gap; 0 when unknown.
+    pub(super) fn native_min_height(&self, m: usize, id: &str) -> u32 {
+        self.native_min(m, id, &self.min_heights).unwrap_or(0)
+    }
+
+    /// `mins[id]` converted to monitor `m`'s scale, plus the gap.
+    fn native_min(&self, m: usize, id: &str, mins: &BTreeMap<WindowId, u32>) -> Option<u32> {
+        let monitors = &self.snapshot.monitors;
+        let scale = monitors[m].monitor.scale_factor;
+        let gap = 2 * half_gap(self.snapshot.gaps, scale);
+        let min = f64::from(*mins.get(id)?);
+        let source = self
+            .snapshot
+            .windows
+            .iter()
+            .find(|w| w.native.id == id)
+            .and_then(|w| monitors.iter().find(|x| x.monitor.id == w.native.monitor_id))
+            .map_or(scale, |x| x.monitor.scale_factor);
+        Some(((min * scale / source).round() as u32).saturating_add(gap))
     }
 
     /// Settle the column widths of page `p` on monitor `m` now, so a scroll computed before
