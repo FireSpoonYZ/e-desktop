@@ -165,7 +165,8 @@ stripped. Text, ANSI, modes, scrollback, Unicode widths and kitty flags are
 supported; image protocols and OSC hyperlink restoration are not claimed.
 Orca's position-only DECSC snapshot trade-off remains: saved pen/charset is not
 fully serialized. This is not a durable session-restart service: app exit ends
-shells; only credentials/certificate persist.
+shells (on Windows also a forced kill, through a kill-on-close job object);
+only credentials/certificate persist.
 
 Bounds: 32 sessions (including exited), 64 sockets, 100 saved devices, 16 pending
 pairing codes, 256 KiB request payload, 64 KiB input writes, 400 columns × 200 rows,

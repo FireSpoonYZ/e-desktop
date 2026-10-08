@@ -120,6 +120,29 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// A force-killed e-desktop never runs `stop`; the job still ends the host and its shells
+/// when the app's last handle closes, so no orphan keeps `node-pty` loaded.
+#[cfg(windows)]
+fn kill_with_app(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::*;
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as _,
+            std::mem::size_of_val(&limits) as u32,
+        );
+        job as usize
+    });
+    // Failure leaves the old behaviour: the host only stops through `stop`.
+    unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
+}
+
 #[cfg(any(unix, test))]
 fn descendant_pids(root: u32, processes: &[(u32, u32)]) -> Vec<u32> {
     let mut descendants = vec![root];
@@ -191,6 +214,8 @@ impl TerminalHost {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("Unable to start terminal host: {e}"))?;
+        #[cfg(windows)]
+        kill_with_app(&child);
         let stdout = child
             .stdout
             .take()
