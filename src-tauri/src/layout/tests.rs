@@ -1531,6 +1531,246 @@ fn closing_the_focused_window_focuses_its_layout_neighbour() {
     assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
 }
 
+fn without(ids: &[&str]) -> SystemSnapshot {
+    let mut native = system();
+    native.windows.retain(|w| !ids.contains(&w.id.as_str()));
+    native.focused_window = None;
+    native
+}
+
+fn active_widths(e: &Engine) -> (Vec<u32>, i32) {
+    let page = &e.snapshot.monitors[0].pages[0];
+    (widths(page), page.viewport_x)
+}
+
+#[test]
+fn a_leaving_window_scrolls_empty_space_away_without_resizing() {
+    // Monitor a: columns 1, 2, 3 of 600 px; focusing 3 shows 2 and 3.
+    let focus_last = || {
+        let mut e = engine();
+        e.dispatch(Command::FocusWindow {
+            window_id: "3".into(),
+        })
+        .unwrap();
+        assert_eq!(active_widths(&e), (vec![600, 600, 600], 600));
+        e
+    };
+    let mut e = focus_last();
+    let t = e.reconcile(without(&["3"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "closed");
+    assert_eq!(placement(&t.actions, "1").0.x, 0);
+    assert_eq!(placement(&t.actions, "2").0.x, 600);
+
+    let mut e = focus_last();
+    set_minimized(&mut e, "3", true, false);
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "user-minimized");
+    set_minimized(&mut e, "3", false, false);
+    assert_eq!(active_layout(&e, 0).0, [["1"], ["2"], ["3"]]);
+
+    let mut e = focus_last();
+    let tail = e.snapshot.monitors[0].pages.last().unwrap().id.clone();
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "3".into(),
+        page_id: tail,
+    })
+    .unwrap();
+    assert_eq!(
+        active_widths(&e),
+        (vec![600, 600], 0),
+        "moved to another desktop"
+    );
+
+    let mut e = focus_last();
+    e.dispatch(Command::ToggleFloating).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "floated");
+
+    // A middle column leaves: 3 would cover only the left half.
+    let mut e = focus_last();
+    e.reconcile(without(&["2"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "middle closed");
+
+    // Centering 1 leaves space left of it; a window leaving slides the view right.
+    let mut e = engine();
+    e.dispatch(Command::CenterFocused).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600, 600], -300));
+    e.reconcile(without(&["2"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "left gap");
+}
+
+#[test]
+fn a_lone_column_takes_the_full_width_until_a_second_column_returns() {
+    // No empty space after the leave: 3 was fully off screen, or its stack keeps a window.
+    let mut e = engine();
+    e.reconcile(without(&["3"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "off screen");
+    let mut stacked = engine();
+    stacked
+        .dispatch(Command::FocusWindow {
+            window_id: "2".into(),
+        })
+        .unwrap();
+    stacked.dispatch(Command::ConsumeWindowIntoColumn).unwrap();
+    assert_eq!(
+        active_layout(&stacked, 0),
+        (vec![vec!["1".into()], vec!["2".into(), "3".into()]], 0)
+    );
+    stacked.reconcile(without(&["3"])).unwrap();
+    assert_eq!(
+        active_widths(&stacked),
+        (vec![600, 600], 0),
+        "stack remains"
+    );
+
+    // 2 is minimized: 1 is alone and takes the full width, then gets 600 back with 2.
+    set_minimized(&mut e, "2", true, false);
+    assert_eq!(active_widths(&e), (vec![1200], 0), "minimized");
+    set_minimized(&mut e, "2", false, false);
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "restored");
+    assert!(e.widened_columns.is_empty());
+
+    // A new window opening beside the widened column.
+    set_minimized(&mut e, "2", true, false);
+    assert_eq!(active_widths(&e), (vec![1200], 0));
+    let mut native = native_of(&e);
+    native.windows.push(window("5", "a"));
+    native.focused_window = Some("5".into());
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(active_layout(&e, 0).0, [["1"], ["5"]]);
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "opened");
+    assert_eq!(placement(&t.actions, "5").0.x, 600);
+
+    // A window moved in from monitor b: the old width is back before 4 is scrolled into view.
+    e.reconcile(without(&["2", "3", "5"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![1200], 0));
+    let page = e.snapshot.monitors[0].active_page.clone();
+    let b_width = e.snapshot.monitors[1].pages[0].columns[0].width;
+    e.dispatch(Command::MoveWindowToPage {
+        window_id: "4".into(),
+        page_id: page,
+    })
+    .unwrap();
+    assert_eq!(active_widths(&e), (vec![600, b_width], 0), "moved in");
+}
+
+#[test]
+fn a_lone_stack_fills_the_screen_and_a_manual_width_is_kept() {
+    // 2 joins 1's column: [[1, 2], [3]].
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0));
+    let mut native = without(&["3"]);
+    native.focused_window = Some("2".into());
+    let t = e.reconcile(native).unwrap();
+    assert_eq!(active_widths(&e), (vec![1200], 0));
+    assert_eq!(placement(&t.actions, "1").0.width, 1200);
+    assert_eq!(placement(&t.actions, "2").0.width, 1200);
+
+    e.dispatch(Command::SetColumnWidth { width: 900 }).unwrap();
+    let mut native = native_of(&e);
+    native.windows.push(window("5", "a"));
+    native.focused_window = Some("5".into());
+    e.reconcile(native).unwrap();
+    assert_eq!(active_layout(&e, 0).0, [vec!["1", "2"], vec!["5"]]);
+    assert_eq!(active_widths(&e).0[0], 900);
+}
+
+#[test]
+fn narrow_columns_left_after_a_close_widen_the_last_until_a_column_returns() {
+    let mut e = engine();
+    for id in ["1", "2", "3"] {
+        e.dispatch(Command::FocusWindow {
+            window_id: id.into(),
+        })
+        .unwrap();
+        e.dispatch(Command::SetColumnWidth { width: 300 }).unwrap();
+    }
+    assert_eq!(active_widths(&e), (vec![300, 300, 300], 0));
+    let t = e.reconcile(without(&["2"])).unwrap();
+    assert_eq!(active_widths(&e), (vec![300, 900], 0), "closed");
+    assert_eq!(placement(&t.actions, "3").0.width, 900);
+
+    // A new window opens right of 3: 3 is 300 again.
+    let mut native = native_of(&e);
+    native.windows.push(window("5", "a"));
+    native.focused_window = Some("5".into());
+    e.reconcile(native).unwrap();
+    assert_eq!(active_layout(&e, 0).0, [["1"], ["3"], ["5"]]);
+    assert_eq!(active_widths(&e).0[..2], [300, 300], "opened");
+    assert!(e.widened_columns.is_empty());
+
+    // 5 is minimized and restored: 3 widens over its space, then gives it back.
+    let five = active_widths(&e).0[2];
+    set_minimized(&mut e, "5", true, false);
+    assert_eq!(active_widths(&e), (vec![300, 900], 0), "minimized");
+    set_minimized(&mut e, "5", false, false);
+    assert_eq!(active_widths(&e).0, [300, 300, five], "restored");
+}
+
+#[test]
+fn a_column_merged_away_scrolls_or_fills_like_a_leaving_window() {
+    // Focusing 3 shows 2 and 3; 3 joins 2's column, leaving the right half empty.
+    let mut e = engine();
+    e.dispatch(Command::FocusWindow {
+        window_id: "3".into(),
+    })
+    .unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600, 600], 600));
+    e.dispatch(Command::MoveWindow {
+        direction: Direction::Left,
+    })
+    .unwrap();
+    assert_eq!(active_layout(&e, 0).0, [vec!["1"], vec!["2", "3"]]);
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "scrolled left");
+
+    // Merged into one column: full width, until a window leaves the stack as a second column.
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    e.dispatch(Command::ConsumeWindowIntoColumn).unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], 0), "same column count");
+    e.dispatch(Command::ConsumeWindowIntoColumn).unwrap();
+    assert_eq!(active_layout(&e, 0).0, [vec!["1", "2", "3"]]);
+    assert_eq!(active_widths(&e), (vec![1200], 0), "one column");
+    e.dispatch(Command::ExpelWindowFromColumn).unwrap();
+    assert_eq!(active_layout(&e, 0).0, [vec!["2", "3"], vec!["1"]]);
+    assert_eq!(active_widths(&e).0, [600, 1200], "expelled");
+}
+
+#[test]
+fn focus_after_a_close_keeps_the_screen_filled_while_centering() {
+    let mut e = engine();
+    e.set_layout_options(options::LayoutOptions {
+        center_focused_column: options::CenterFocusedColumn::Always,
+        ..options::LayoutOptions::default()
+    });
+    e.dispatch(Command::FocusWindow {
+        window_id: "2".into(),
+    })
+    .unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600, 600], 300));
+    // Focus moves on to 3, which centering alone would show with empty space on its right.
+    let t = e.reconcile(without(&["2"])).unwrap();
+    assert_eq!(e.snapshot.focused_window.as_deref(), Some("3"));
+    assert_eq!(active_widths(&e), (vec![600, 600], 0));
+    assert_eq!(placement(&t.actions, "1").0.x, 0);
+    assert_eq!(placement(&t.actions, "3").0.x, 600);
+
+    // Without a window leaving, focus still centers, empty space included.
+    e.dispatch(Command::FocusWindow {
+        window_id: "1".into(),
+    })
+    .unwrap();
+    assert_eq!(active_widths(&e), (vec![600, 600], -300));
+}
+
 #[test]
 fn slide_column_reveals_and_focuses_the_next_column() {
     // Monitor a: columns 1, 2, 3 of 600 px on a 1200 px view; 1 and 2 are visible.

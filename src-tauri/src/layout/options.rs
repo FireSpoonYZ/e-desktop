@@ -509,8 +509,13 @@ impl Engine {
             previous,
             options,
         );
-        // Keep an already visible column in place, including explicit centering/queue gaps.
-        page.viewport_x = clamp_scroll_relaxed(page, viewport, target);
+        // Keep an already visible column in place, including explicit centering/queue gaps;
+        // after `fill_gaps` ran on the page, centering must not bring empty space back.
+        page.viewport_x = if self.filled_pages.contains(&page.id) {
+            clamp_scroll(page, viewport, target)
+        } else {
+            clamp_scroll_relaxed(page, viewport, target)
+        };
         Ok(())
     }
 }

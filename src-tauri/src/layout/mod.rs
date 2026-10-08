@@ -36,6 +36,16 @@ struct MinimizedSlot {
     left: Vec<ColumnId>,
 }
 
+/// Column `fill_gaps` widened to cover empty screen width when its page had `columns`
+/// columns. It gets `width` back once the page has more columns while it is still `widened` wide.
+#[derive(Clone)]
+struct WidenedColumn {
+    column_id: ColumnId,
+    width: u32,
+    widened: u32,
+    columns: usize,
+}
+
 /// Pure, transactional layout state. Native effects are returned to the caller, never applied here.
 #[derive(Clone)]
 pub struct Engine {
@@ -50,6 +60,14 @@ pub struct Engine {
     height_weights: BTreeMap<WindowId, u32>,
     /// User-minimized tiled windows, kept out of columns until restored.
     minimized_slots: Vec<MinimizedSlot>,
+    /// Columns (their windows) of each monitor's active page at the last cleanup. When one of
+    /// those windows has left the page's columns, or the page has fewer columns, by the next
+    /// cleanup, `fill_gaps` runs on the page.
+    active_columns: BTreeMap<PageId, Vec<Vec<WindowId>>>,
+    widened_columns: BTreeMap<PageId, WidenedColumn>,
+    /// Pages `fill_gaps` ran on since the current reconcile, dispatch or layout restore began.
+    /// A focus scroll there keeps the strict clamp, so it cannot bring empty space back.
+    filled_pages: BTreeSet<PageId>,
     window_rules: Vec<WindowRule>,
     pending_rule_floating: BTreeSet<WindowId>,
     /// Floating only because they were not resizable when discovered (Chromium drops the
@@ -231,6 +249,9 @@ impl Engine {
             fullscreen_restore: BTreeMap::new(),
             height_weights: BTreeMap::new(),
             minimized_slots: vec![],
+            active_columns: BTreeMap::new(),
+            widened_columns: BTreeMap::new(),
+            filled_pages: BTreeSet::new(),
             window_rules: vec![],
             pending_rule_floating: BTreeSet::new(),
             size_floating: BTreeSet::new(),
@@ -462,6 +483,7 @@ impl Engine {
 
     pub fn reconcile(&mut self, system: SystemSnapshot) -> Result<Transition, AppError> {
         let mut next = self.clone();
+        next.filled_pages.clear();
         let native_focus = system.focused_window.clone();
         next.reconcile_inner(system)?;
         if next.outputs_suspended {
@@ -941,6 +963,17 @@ impl Engine {
             .map(|slot| slot.page_id.clone())
             .collect();
         let named: BTreeSet<PageId> = self.snapshot.named_pages.iter().cloned().collect();
+        if self.snapshot.enabled {
+            for page_id in self.widened_columns.keys().cloned().collect::<Vec<_>>() {
+                match self.page_pos(&page_id) {
+                    Some((m, p)) => self.restore_widened_column(m, p),
+                    None => {
+                        self.widened_columns.remove(&page_id);
+                    }
+                }
+            }
+            self.fill_gaps();
+        }
         for m in 0..self.snapshot.monitors.len() {
             let mins: Vec<u32> = self.snapshot.monitors[m]
                 .pages
@@ -1018,6 +1051,97 @@ impl Engine {
         if let Some(id) = self.snapshot.focused_window.clone() {
             self.remember_column_focus(&id);
         }
+        self.active_columns = self
+            .snapshot
+            .monitors
+            .iter()
+            .filter_map(|monitor| {
+                let page = monitor.pages.iter().find(|p| p.id == monitor.active_page)?;
+                let columns = page.columns.iter().map(|c| c.windows.clone());
+                Some((page.id.clone(), columns.collect()))
+            })
+            .collect();
+    }
+
+    /// On a page that was active at the last cleanup, a tiled window has since left its
+    /// columns (closed, user-minimized, moved to another page or monitor, floated) or a whole
+    /// column merged into another: no screen space stays empty. Column widths stay and the
+    /// view scrolls until neither side shows empty space; when all columns together are
+    /// narrower than the screen, the last one grows to cover the rest and remembers its old
+    /// width in `widened_columns` (a lone column so takes the full width).
+    fn fill_gaps(&mut self) {
+        for (page_id, before) in std::mem::take(&mut self.active_columns) {
+            let Some((m, p)) = self.page_pos(&page_id) else {
+                continue;
+            };
+            let page = &mut self.snapshot.monitors[m].pages[p];
+            page.columns.retain(|c| !c.windows.is_empty());
+            let left = before
+                .iter()
+                .flatten()
+                .any(|id| !page.columns.iter().any(|c| c.windows.contains(id)));
+            if !left && page.columns.len() >= before.len() {
+                continue;
+            }
+            self.filled_pages.insert(page_id.clone());
+            let last = page.columns.len().checked_sub(1);
+            let filled = last.and_then(|c| self.fill_empty_width(m, p, c).map(|old| (c, old)));
+            if let Some((c, old)) = filled {
+                let page = &self.snapshot.monitors[m].pages[p];
+                let column = &page.columns[c];
+                // Widened again before a column came back: keep the width it had first.
+                let width = match self.widened_columns.get(&page_id) {
+                    Some(record) if record.column_id == column.id => record.width,
+                    _ => old,
+                };
+                let record = WidenedColumn {
+                    column_id: column.id.clone(),
+                    width,
+                    widened: column.width,
+                    columns: page.columns.len(),
+                };
+                self.widened_columns.insert(page_id, record);
+            }
+            let view = self.snapshot.monitors[m].viewport.width;
+            let page = &mut self.snapshot.monitors[m].pages[p];
+            page.viewport_x = clamp_scroll(page, view, page.viewport_x.into());
+        }
+    }
+
+    /// Once page `p` of monitor `m` has more columns than when `fill_gaps` widened one of
+    /// them, that column gets its old width back. The record is dropped instead when that
+    /// column left the page or its width was changed meanwhile.
+    fn restore_widened_column(&mut self, m: usize, p: usize) {
+        if !self.snapshot.enabled {
+            return;
+        }
+        let page = &self.snapshot.monitors[m].pages[p];
+        let Some(record) = self.widened_columns.get(&page.id) else {
+            return;
+        };
+        let (width, widened, columns) = (record.width, record.widened, record.columns);
+        let Some(c) = page
+            .columns
+            .iter()
+            .position(|c| c.id == record.column_id && !c.windows.is_empty())
+            .filter(|&c| page.columns[c].width == widened)
+        else {
+            self.widened_columns.remove(&page.id);
+            return;
+        };
+        if page
+            .columns
+            .iter()
+            .filter(|c| !c.windows.is_empty())
+            .count()
+            <= columns
+        {
+            return;
+        }
+        let width = self.settled_column_width(m, &page.columns[c], width);
+        let page_id = page.id.clone();
+        self.snapshot.monitors[m].pages[p].columns[c].width = width;
+        self.widened_columns.remove(&page_id);
     }
 
     fn remember_column_focus(&mut self, id: &str) {
@@ -1141,6 +1265,7 @@ impl Engine {
 
     pub fn dispatch(&mut self, command: Command) -> Result<Transition, AppError> {
         let mut next = self.clone();
+        next.filled_pages.clear();
         let actions = next.dispatch_inner(command)?;
         next.update_pending_rule_floating(&actions);
         next.track_layout_history(&self.snapshot); // lane: layout-actions

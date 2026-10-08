@@ -407,6 +407,7 @@ impl Engine {
     /// Settle the column widths of page `p` on monitor `m` now, so a scroll computed before
     /// the next `cleanup` already sees the final widths.
     pub(super) fn settle_column_widths(&mut self, m: usize, p: usize) {
+        self.restore_widened_column(m, p);
         let widths: Vec<u32> = self.snapshot.monitors[m].pages[p]
             .columns
             .iter()

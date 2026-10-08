@@ -332,15 +332,21 @@ impl Engine {
         self.finish_drop_focus(id, m, p)
     }
 
-    /// A window stacked into column `c` can leave screen width no column covers (it came
-    /// from the neighbouring column): the column grows to cover it.
-    fn fill_empty_width(&mut self, m: usize, p: usize, c: usize) {
+    /// Screen width no column covers (a window was stacked into column `c` from its
+    /// neighbour, or a column left the page): column `c` grows to cover it, as far as the
+    /// width `cleanup` settles it at allows. Returns its old width when it grew.
+    pub(super) fn fill_empty_width(&mut self, m: usize, p: usize, c: usize) -> Option<u32> {
         let view = u64::from(self.snapshot.monitors[m].viewport.width);
-        let columns = &mut self.snapshot.monitors[m].pages[p].columns;
+        let columns = &self.snapshot.monitors[m].pages[p].columns;
         let total: u64 = columns.iter().map(|column| u64::from(column.width)).sum();
-        if total < view {
-            columns[c].width += (view - total) as u32;
+        let empty = view.checked_sub(total).filter(|&empty| empty > 0)?;
+        let old = columns[c].width;
+        let width = self.settled_column_width(m, &columns[c], old + empty as u32);
+        if width <= old {
+            return None;
         }
+        self.snapshot.monitors[m].pages[p].columns[c].width = width;
+        Some(old)
     }
 
     /// Every row of `column` on monitor `m` is at least as tall as its window's minimum.

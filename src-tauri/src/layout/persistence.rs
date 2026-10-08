@@ -118,6 +118,7 @@ impl Engine {
     /// Returns how many windows were put back. Transactional like `dispatch`.
     pub fn restore_layout(&mut self, saved: &LayoutState) -> Result<usize, AppError> {
         let mut next = self.clone();
+        next.filled_pages.clear();
         let restored = next.restore_inner(saved)?;
         *self = next;
         Ok(restored)
