@@ -27,8 +27,15 @@ hashes, exports, and prohibited fallback candidates. A runtime mismatch is an
 explicit startup error; rebuild for the resolved runtime. Permit required
 npm install scripts and keep build dependencies until the build has finished.
 
+The desktop copies this runtime to its local application data directory in
+`terminal-host/<build id>/` before starting it detached; a running service never
+loads node-pty from the repository or release resource tree. Direct CLI launches
+use the entry path supplied above instead.
+
 No runtime path depends on the working directory. Required `--data-dir` is
-resolved at startup. Optional `--port` defaults to 7768 (0 selects a free port),
+resolved at startup. Optional `--build-id` identifies the copied runtime
+(empty by default).
+Optional `--port` defaults to 7768 (0 selects a free port),
 and `--address` defaults to 0.0.0.0. Local WS always binds 127.0.0.1 on a free port.
 Pairing candidates are filtered against the actual listener address: IPv4 wildcard
 advertises IPv4 only, IPv6 wildcard advertises IPv6 only (no link-local addresses),
@@ -39,12 +46,17 @@ Open the remote TCP port in the firewall only for trusted LAN/Tailscale networks
 Stdout contains exactly one record:
 
 ```json
-{"type":"ready","protocolVersion":1,"localUrl":"ws://127.0.0.1:12345","remotePort":7768,"adminToken":"SECRET"}
+{"type":"ready","protocolVersion":1,"buildId":"BUILD_ID","localUrl":"ws://127.0.0.1:12345","remotePort":7768,"adminToken":"SECRET"}
 ```
 
-The parent consumes it privately; do not log it or place the token in a URL.
-Diagnostics go to stderr. Write `shutdown\n` to stdin, close stdin, or send
-SIGINT/SIGTERM for explicit application shutdown. This kills hosted PTYs.
+The parent consumes it privately, then closes the stdout pipe; EPIPE is ignored.
+Do not log this record or place the token in a URL. Diagnostics go to stderr
+(the desktop app appends them to `terminals/host.log`). Stdin is ignored.
+The loopback HTTP listener accepts `GET /health` and `POST /shutdown` with
+`Authorization: Bearer <adminToken>`. Health returns pid, buildId,
+protocolVersion and the number of running PTYs. Shutdown returns 202 before
+stopping hosted PTYs; unknown routes/methods and invalid auth return 404.
+SIGINT/SIGTERM also request explicit host shutdown.
 The host begins root birth/session-identity capture immediately after spawn;
 input waits for that initial observation before it can exit the shell. This
 observation does not block output/subscription. Close and shutdown refresh owned
@@ -164,9 +176,22 @@ live-write gate, never from replay. PTY streams are not
 stripped. Text, ANSI, modes, scrollback, Unicode widths and kitty flags are
 supported; image protocols and OSC hyperlink restoration are not claimed.
 Orca's position-only DECSC snapshot trade-off remains: saved pen/charset is not
-fully serialized. This is not a durable session-restart service: app exit ends
-shells (on Windows also a forced kill, through a kill-on-close job object);
-only credentials/certificate persist.
+fully serialized. The desktop starts a detached background service from a
+relocated runtime under `app_local_data_dir()/terminal-host/<build id>/`, not
+the repository/resource tree, so a running host does not lock build dependencies.
+The host and shells survive e-desktop exit, crash or force-kill. A restarted app
+finds `app_data_dir()/terminals/host.json` (pid, buildId, protocolVersion,
+localUrl, remotePort and private adminToken) and authenticates through
+`/health`, then reconnects and reopens running-session windows.
+An older-build host keeps running while it has live sessions; when it has none,
+the app may explicitly shut it down and start the new build. The host exits after
+60 seconds with no running PTYs and no local/remote WebSocket clients, including
+when nobody adopts it after startup. Exited, inspectable sessions do not keep it
+alive. Close all sessions and disconnect views to let it stop, or explicitly end
+the host's Node process. On Windows the host's own kill-on-close job reaps its
+shells when the host dies; e-desktop does not own that job.
+This is process-lifetime persistence, not shell restoration after host death or
+a machine reboot; credentials/certificate still persist on disk.
 
 Bounds: 32 sessions (including exited), 64 sockets, 100 saved devices, 16 pending
 pairing codes, 256 KiB request payload, 64 KiB input writes, 400 columns × 200 rows,
@@ -247,7 +272,8 @@ npm audit --prefix terminal-host
 Tests cover snapshot roundtrip (normal/alt/cursor/Unicode/partial CSI/kitty),
 query authority, wrap-pending, local auth, remote pinned TLS and wrong-pin
 rejection, pairing single-use, persistence/revocation, exact CLI readiness and
-stdin shutdown with a live PTY, parent stdin EOF shutdown, and gated ConPTY
+authenticated HTTP shutdown with a live PTY, survival after parent stdin EOF,
+health authentication and client-aware idle shutdown, and gated ConPTY
 DA1 replies including split queries, raw-byte validation and Windows node-pty
 Buffer transport. The real-PTY smoke sends commands through the binary wire
 path and rejects non-owner/invalid-byte writes. The real-PTY smoke exercises every available requested shell,

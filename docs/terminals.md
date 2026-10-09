@@ -19,11 +19,24 @@ bypass the PID filter; terminal OSC output never sets these native titles.
 - Reopen a session from the manager to recover its authoritative snapshot.
 - Disconnects and timeouts reject pending requests, never replay input or mutations.
   Reconnect explicitly; a timed-out operation may already have happened.
-- Exiting e-desktop restores managed windows, then sends stdin `shutdown\n`
-  to the sidecar. After twelve seconds a stuck host gets process-tree termination
-  (Windows taskkill /T; Unix ps descendant traversal plus process-group fallback), followed by child reaping.
-- Sidecar data (certificate, paired devices, etc.) is under Tauri's application
-  data directory in `terminals/`. An app exit intentionally ends all hosted PTYs.
+- Exiting e-desktop restores managed windows but leaves the background terminal
+  service and shells running, including on app crash or force-kill.
+- The service runs from a relocated copy under Tauri's local application data
+  directory in `terminal-host/<build id>/`, so rebuilding the repository does
+  not replace files held open by the running host.
+- Service data (certificate, paired devices, etc.) is under Tauri's application
+  data directory in `terminals/`. A restarted app reads the private
+  `terminals/host.json` record and authenticates through loopback `/health`
+  to reuse the host; running-session windows reopen automatically.
+- With no running shells and no connected clients, the host exits after 60 seconds
+  (also if nobody adopts it after startup). Exited sessions do not keep it alive.
+  Close all sessions and disconnect views to stop it, or explicitly end the host's
+  Node process. Stdin and app exit are not shutdown requests.
+- A host from an older build keeps running while it has live sessions. Once it
+  has none, the app can request authenticated HTTP shutdown and start the new
+  build. A stuck verified host gets process-tree termination after twelve seconds.
+  On Windows, the host's own kill-on-close job reaps its shells when the host dies;
+  no app-owned job ties it to e-desktop. Sessions do not survive host death/reboot.
 
 The view uses patched xterm, native composition/paste/selection behavior,
 scrollback, explicit control, and font-size controls. Only the owner publishes
@@ -66,10 +79,12 @@ bundle.active=false policy is retained: enable the desired Tauri installer
 target separately if producing an installer. Resource mapping is configured
 for release builds independently of installer creation.
 
-Rust uses a compile-time absolute source path in debug, and
-Tauri resource_dir()/terminal-host/src/server.mjs in release. Neither depends
-on launch CWD. Rust discovers an absolute installed Node executable from PATH,
-or accepts an absolute `E_DESKTOP_NODE` override, checks Node >=22 and gives
+Rust uses a compile-time absolute source directory in debug, and
+Tauri resource_dir()/terminal-host/ in release, then copies that tree to the
+versioned local-data runtime before launching it detached. A stat-based build ID
+tracks relative paths, sizes and modification times, excluding test, .git and .pi.
+Neither lookup depends on launch CWD. Rust discovers an absolute installed Node
+executable from PATH, or accepts an absolute `E_DESKTOP_NODE` override, checks Node >=22 and gives
 an actionable error if unavailable. Restart the app after installing Node
 so it receives the updated PATH. No admin token appears in a URL or log;
 the readiness endpoint reaches local views only through Tauri IPC.
@@ -77,8 +92,8 @@ the readiness endpoint reaches local views only through Tauri IPC.
 Pairing descriptors deliberately contain a single-use, five-minute code and
 certificate fingerprint. Share only with your own phone, on LAN/Tailscale.
 The remote default port is 7768; firewall/network configuration remains explicit.
-The local admin endpoint is loopback-only WS; CSP permits only that WS origin
-in addition to the existing IPC origins.
+The local admin endpoint is loopback-only WS with authenticated HTTP
+health/shutdown; CSP permits only that WS origin in addition to the existing IPC origins.
 
 ## Reuse and validation
 

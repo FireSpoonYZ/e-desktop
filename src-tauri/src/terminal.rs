@@ -1,29 +1,47 @@
-//! Local sidecar lifetime and explicitly registered terminal windows.
+//! Persistent background terminal service and explicitly registered terminal windows.
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, hash_map::DefaultHasher},
+    fs::{self, OpenOptions},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
+    net::{SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+fn ready_kind() -> String {
+    "ready".into()
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Endpoint {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "ready_kind", skip_serializing)]
     kind: String,
     protocol_version: u32,
+    build_id: String,
     local_url: String,
     remote_port: u16,
     admin_token: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct Host {
-    child: Child,
+    pid: u32,
+    #[serde(flatten)]
     endpoint: Endpoint,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Health {
+    pid: u32,
+    build_id: String,
+    protocol_version: u32,
+    live_sessions: u32,
 }
 #[derive(Default)]
 pub struct TerminalHost(Mutex<Option<Host>>);
@@ -74,31 +92,101 @@ fn hide_console(command: &mut Command) {
     let _ = command;
 }
 
-fn stop(child: &mut Child) {
-    if let Some(mut input) = child.stdin.take() {
-        let _ = input.write_all(b"shutdown\n");
+fn local_port(endpoint: &Endpoint) -> Result<u16, String> {
+    endpoint
+        .local_url
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| "Invalid terminal host endpoint or protocol".into())
+}
+fn validate_endpoint(endpoint: &Endpoint) -> Result<(), String> {
+    local_port(endpoint)?;
+    if endpoint.kind != "ready"
+        || endpoint.protocol_version != 1
+        || endpoint.admin_token.is_empty()
+        || endpoint.admin_token.contains(['\r', '\n'])
+    {
+        return Err("Invalid terminal host endpoint or protocol".into());
     }
-    let deadline = Instant::now() + Duration::from_secs(12);
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+    Ok(())
+}
+fn host_request(host: &Host, method: &str, path: &str) -> Result<(u16, String), String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], local_port(&host.endpoint)?));
+    let timeout = Duration::from_secs(2);
+    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    write!(stream, "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", host.endpoint.admin_token)
+        .map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream
+        .take(16384)
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("Invalid host HTTP response")?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .ok_or("Invalid host HTTP status")?;
+    Ok((status, body.into()))
+}
+fn health(host: &Host) -> Result<Health, String> {
+    validate_endpoint(&host.endpoint)?;
+    let (status, body) = host_request(host, "GET", "/health")?;
+    if status != 200 {
+        return Err("Terminal host health unavailable".into());
+    }
+    let health: Health = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    if health.pid != host.pid || health.protocol_version != 1 {
+        return Err("Terminal host identity or protocol mismatch".into());
+    }
+    Ok(health)
+}
+fn pid_exists(pid: u32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::*};
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let mut code = 0;
+        let alive = GetExitCodeProcess(process, &mut code) != 0 && code == 259;
+        CloseHandle(process);
+        alive
     }
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
         let mut command = Command::new("taskkill");
         hide_console(&mut command);
         let _ = command
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     }
     #[cfg(unix)]
     {
-        // PTY shells may call setsid(), so killing only the Node process group
-        // is insufficient. Snapshot descendants before killing their parent.
-        let processes = Command::new("ps").args(["-axo", "pid=,ppid="]).output();
-        if let Ok(output) = processes {
+        // PTY shells may call setsid(); snapshot descendants before killing the parent.
+        if let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).output() {
             let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter_map(|line| {
@@ -106,41 +194,111 @@ fn stop(child: &mut Child) {
                     Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
                 })
                 .collect();
-            for pid in descendant_pids(child.id(), &pairs).into_iter().rev() {
+            for target in descendant_pids(pid, &pairs).into_iter().rev() {
                 let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
+                    .args(["-KILL", &target.to_string()])
                     .status();
             }
         }
         let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{pid}")])
             .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+fn stop(host: &Host) {
+    let _ = host_request(host, "POST", "/shutdown");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        if !pid_exists(host.pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    kill_tree(host.pid);
 }
 
-/// A force-killed e-desktop never runs `stop`; the job still ends the host and its shells
-/// when the app's last handle closes, so no orphan keeps `node-pty` loaded.
-#[cfg(windows)]
-fn kill_with_app(child: &Child) {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::JobObjects::*;
-    static JOB: OnceLock<usize> = OnceLock::new();
-    let job = *JOB.get_or_init(|| unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &limits as *const _ as _,
-            std::mem::size_of_val(&limits) as u32,
-        );
-        job as usize
-    });
-    // Failure leaves the old behaviour: the host only stops through `stop`.
-    unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
+fn source_paths(source: &Path, relative: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(source.join(relative))?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if matches!(entry.file_name().to_str(), Some("test" | ".git" | ".pi")) {
+            continue;
+        }
+        let path = relative.join(entry.file_name());
+        paths.push(path.clone());
+        if entry.file_type()?.is_dir() {
+            source_paths(source, &path, paths)?;
+        }
+    }
+    Ok(())
+}
+fn build_id(source: &Path, paths: &[PathBuf]) -> Result<String, String> {
+    let mut hash = DefaultHasher::new();
+    for path in paths {
+        let metadata = fs::metadata(source.join(path)).map_err(|e| e.to_string())?;
+        path.hash(&mut hash);
+        metadata.len().hash(&mut hash);
+        metadata
+            .modified()
+            .map_err(|e| e.to_string())?
+            .hash(&mut hash);
+    }
+    Ok(format!("{:016x}", hash.finish()))
+}
+fn relocate(source: &Path, root: &Path, id: &str, paths: &[PathBuf]) -> Result<PathBuf, String> {
+    let destination = root.join(id);
+    if destination.is_dir() {
+        return Ok(destination);
+    }
+    fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let temp = root.join(format!(".{id}-{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        fs::create_dir(&temp)?;
+        for path in paths {
+            let from = source.join(path);
+            let to = temp.join(path);
+            if fs::metadata(&from)?.is_dir() {
+                fs::create_dir(&to)?;
+            } else {
+                fs::copy(from, to)?;
+            }
+        }
+        fs::rename(&temp, &destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temp);
+    }
+    result.map_err(|e| format!("Unable to relocate terminal host: {e}"))?;
+    Ok(destination)
+}
+fn cleanup_copies(root: &Path, active: &str) {
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name != active
+                && name.len() == 16
+                && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+fn save_record(path: &Path, host: &Host) -> Result<(), String> {
+    let temp = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).map_err(|e| e.to_string())?;
+    file.write_all(&serde_json::to_vec(host).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    drop(file);
+    fs::rename(temp, path).map_err(|e| e.to_string())
 }
 
 #[cfg(any(unix, test))]
@@ -160,62 +318,108 @@ fn descendant_pids(root: u32, processes: &[(u32, u32)]) -> Vec<u32> {
 }
 
 impl TerminalHost {
-    pub fn shutdown(&self) {
-        if let Ok(mut host) = self.0.lock() {
-            if let Some(mut host) = host.take() {
-                stop(&mut host.child);
-            }
-        }
-    }
     fn endpoint(&self, app: &tauri::AppHandle) -> Result<Endpoint, String> {
         let mut state = self
             .0
             .lock()
             .map_err(|_| "Terminal host state unavailable")?;
-        if let Some(host) = state.as_mut() {
-            if host.child.try_wait().map_err(|e| e.to_string())?.is_none() {
-                return Ok(host.endpoint.clone());
-            }
-            *state = None;
-        }
-        let entry = if cfg!(debug_assertions) {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../terminal-host/src/server.mjs")
+        let source = if cfg!(debug_assertions) {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../terminal-host")
         } else {
             app.path()
                 .resource_dir()
                 .map_err(|e| e.to_string())?
-                .join("terminal-host/src/server.mjs")
+                .join("terminal-host")
         };
-        if !entry.is_file() {
+        if !source.join("src/server.mjs").is_file() {
             return Err(format!(
                 "Terminal host not installed at {}. Run npm run prepare:terminal-host before building Tauri.",
-                entry.display()
+                source.display()
             ));
         }
+        let mut paths = Vec::new();
+        source_paths(&source, Path::new(""), &mut paths).map_err(|e| e.to_string())?;
+        let id = build_id(&source, &paths)?;
+        let root = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("terminal-host");
         let data = app
             .path()
             .app_data_dir()
             .map_err(|e| e.to_string())?
             .join("terminals");
-        std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+        let record = data.join("host.json");
+        let recorded = fs::read(&record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Host>(&bytes).ok());
+        for mut host in [state.take(), recorded].into_iter().flatten() {
+            if let Ok(health) = health(&host) {
+                host.endpoint.build_id = health.build_id;
+                if host.endpoint.build_id == id || health.live_sessions > 0 {
+                    // Live sessions win: older host code stays until its shells end.
+                    save_record(&record, &host)?;
+                    cleanup_copies(&root, &host.endpoint.build_id);
+                    let endpoint = host.endpoint.clone();
+                    *state = Some(host);
+                    return Ok(endpoint);
+                }
+                stop(&host);
+                break;
+            }
+            // Failed health proves no identity: never kill an unverified recorded PID.
+        }
+        let _ = fs::remove_file(&record);
+        let runtime = relocate(&source, &root, &id, &paths)?;
         let mut command = Command::new(find_node()?);
-        hide_console(&mut command);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{
+                CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+            };
+            command.creation_flags(
+                CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command
-            .arg(entry)
+        command
+            .current_dir(&runtime)
+            .arg(runtime.join("src/server.mjs"))
             .arg("--data-dir")
-            .arg(data)
-            .stdin(Stdio::piped())
+            .arg(&data)
+            .arg("--build-id")
+            .arg(&id)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| format!("Unable to start terminal host: {e}"))?;
+            .stderr(Stdio::from(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(data.join("host.log"))
+                    .map_err(|e| e.to_string())?,
+            ));
+        let spawned = command.spawn();
         #[cfg(windows)]
-        kill_with_app(&child);
+        let spawned = match spawned {
+            Err(error) if error.raw_os_error() == Some(5) => {
+                use std::os::windows::process::CommandExt;
+                use windows_sys::Win32::System::Threading::{
+                    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+                };
+                command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+                command.spawn()
+            }
+            result => result,
+        };
+        let mut child = spawned.map_err(|e| format!("Unable to start terminal host: {e}"))?;
+        let pid = child.id();
         let stdout = child
             .stdout
             .take()
@@ -223,14 +427,10 @@ impl TerminalHost {
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut line = String::new();
-            let result = BufReader::new(stdout)
-                .take(16384)
-                .read_line(&mut line)
+            let result = BufReader::new(stdout).take(16384).read_line(&mut line)
                 .map_err(|_| "Cannot read terminal host readiness".to_string())
-                .and_then(|_| {
-                    serde_json::from_str::<Endpoint>(&line)
-                        .map_err(|_| "Terminal host exited before valid readiness. Check Node/dependencies and whether TCP port 7768 is already in use".to_string())
-                });
+                .and_then(|_| serde_json::from_str::<Endpoint>(&line)
+                    .map_err(|_| "Terminal host exited before valid readiness. Check Node/dependencies and whether TCP port 7768 is already in use".to_string()));
             let _ = tx.send(result);
         });
         let ready = rx
@@ -238,31 +438,30 @@ impl TerminalHost {
             .map_err(|_| "Terminal host did not become ready within 20 seconds".to_string())
             .and_then(|result| result)
             .and_then(|endpoint| {
-                let port = endpoint
-                    .local_url
-                    .strip_prefix("ws://127.0.0.1:")
-                    .and_then(|value| value.parse::<u16>().ok());
-                if endpoint.kind != "ready"
-                    || endpoint.protocol_version != 1
-                    || port == Some(0)
-                    || port.is_none()
-                    || endpoint.admin_token.is_empty()
-                {
-                    Err("Invalid terminal host endpoint or protocol".into())
-                } else {
-                    Ok(endpoint)
+                validate_endpoint(&endpoint)?;
+                if endpoint.build_id != id {
+                    return Err("Invalid terminal host build ID".into());
                 }
+                Ok(endpoint)
             });
+        // Dropping Child closes only our process handle; it never waits or kills.
+        drop(child);
         match ready {
             Ok(endpoint) => {
-                *state = Some(Host {
-                    child,
+                let host = Host {
+                    pid,
                     endpoint: endpoint.clone(),
-                });
+                };
+                if let Err(error) = save_record(&record, &host) {
+                    stop(&host);
+                    return Err(error);
+                }
+                *state = Some(host);
+                cleanup_copies(&root, &id);
                 Ok(endpoint)
             }
             Err(error) => {
-                stop(&mut child);
+                kill_tree(pid);
                 Err(error)
             }
         }

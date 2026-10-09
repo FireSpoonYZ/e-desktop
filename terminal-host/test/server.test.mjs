@@ -52,3 +52,45 @@ test('wire authentication, pinned TLS, one-use pairing, persistence and device r
     clients.forEach(c => c.close()); await host?.stop(); rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('local health requires bearer auth and idle service stops only without clients', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'e-terminal-idle-'));
+  let host, connection;
+  async function waitForStopped(url) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      try { await fetch(url + '/health', { headers: { Connection: 'close' } }); }
+      catch { return; }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.fail('Idle host still accepts connections');
+  }
+  try {
+    host = await startHost({ dataDir: dir, port: 0, buildId: 'health-build', idleTimeoutMs: 500 });
+    const url = host.ready.localUrl.replace('ws:', 'http:');
+    connection = await client(host.ready.localUrl);
+    for (const authorization of ['Bearer wrong', host.ready.adminToken]) {
+      assert.equal((await fetch(url + '/health', {
+        headers: { Authorization: authorization }
+      })).status, 404);
+    }
+    const response = await fetch(url + '/health', {
+      headers: { Authorization: 'Bearer ' + host.ready.adminToken }
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      pid: process.pid, buildId: 'health-build', protocolVersion: 1, liveSessions: 0
+    });
+    await new Promise(resolve => setTimeout(resolve, 650));
+    assert.equal((await fetch(url + '/health', {
+      headers: { Authorization: 'Bearer ' + host.ready.adminToken }
+    })).status, 200, 'A connected client must cancel idle shutdown');
+    connection.close();
+    await waitForStopped(url);
+    await host.stop();
+    host = await startHost({ dataDir: dir, port: 0, idleTimeoutMs: 100 });
+    await waitForStopped(host.ready.localUrl.replace('ws:', 'http:'));
+  } finally {
+    connection?.close(); await host?.stop(); rmSync(dir, { recursive: true, force: true });
+  }
+});

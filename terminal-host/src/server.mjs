@@ -54,13 +54,27 @@ export function pairingAddresses(boundAddress, interfaces = networkInterfaces())
     .map(i => i.address))];
 }
 
-export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
+export async function startHost({ dataDir, port = 7768, address = '0.0.0.0', buildId = '', idleTimeoutMs = 60000 }) {
   // Check before binding sockets or accepting credentials under the selected runtime.
   checkNativeDeployment();
   const security = await credentials(dataDir);
   const adminToken = secret();
   const sessions = new Map(), connections = new Set(), pairingCodes = new Map();
-  let stopping = false, remotePort, work = Promise.resolve(), pendingRequests = 0;
+  let stopping = false, remotePort, work = Promise.resolve(), pendingRequests = 0, idleTimer;
+  const liveSessions = () => [...sessions.values()].filter(s => s.status === 'running' && !s.exitResult).length;
+  function updateIdle() {
+    if (stopping || connections.size || liveSessions()) {
+      clearTimeout(idleTimer); idleTimer = undefined;
+    } else if (!idleTimer) {
+      idleTimer = setTimeout(() => {
+        idleTimer = undefined;
+        void stop().catch(() => {
+          console.error('Terminal cleanup failed; host retained for retry.');
+          updateIdle();
+        });
+      }, idleTimeoutMs);
+    }
+  }
   // ponytail: one host queue makes snapshot/subscribe/resize boundaries atomic;
   // per-session queues only if measured multi-session throughput requires them.
   function enqueue(action) {
@@ -141,9 +155,11 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
     s.status = 'exited'; s.exitCode = s.exitResult.exitCode; s.owner = null; s.pty.setOwner(null); control(s);
     event({ event: 'terminal.exit', sessionId: s.id, exitCode: s.exitCode }, s);
     event({ event: 'terminal.listChanged' });
+    updateIdle();
   }
   function disconnect(c) {
     connections.delete(c);
+    updateIdle();
     c.auth = false;
     for (const s of sessions.values()) {
       s.mobileViewports.delete(c);
@@ -271,6 +287,7 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
           fail('SPAWN_FAILED', 'Could not launch shell; check executable, permissions and patched native deployment');
         }
         sessions.set(s.id, s);
+        updateIdle();
         // Start lifecycle observation immediately, without blocking output or
         // subscribe. Input waits for this initial observation before it can exit
         // the root. Failed observation is not evidence of successful cleanup.
@@ -359,6 +376,7 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
     if (connections.size >= 64 || stopping) { ws.close(1013, 'Connection limit'); return; }
     const c = { ws, local, auth: false, subscriptions: new Map(), pending: 0, requests: new Set(), attempts: 0, alive: true };
     connections.add(c);
+    updateIdle();
     const authTimer = setTimeout(() => { if (!c.auth) ws.close(1008, 'Authentication timeout'); }, 15000);
     ws.on('pong', () => { c.alive = true; });
     ws.on('error', () => {});
@@ -392,7 +410,24 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
       }).finally(() => { c.pending--; pendingRequests--; }).catch(() => {});
     });
   }
-  const localServer = http.createServer((_, res) => { res.writeHead(404); res.end(); });
+  const localServer = http.createServer((req, res) => {
+    const authorization = req.headers.authorization;
+    const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : undefined;
+    if (token && equal(token, adminToken)) {
+      if (req.method === 'GET' && req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ pid: process.pid, buildId, protocolVersion: 1, liveSessions: liveSessions() }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/shutdown') {
+        res.writeHead(202);
+        res.end();
+        void stop().catch(() => console.error('Terminal cleanup failed; host retained for retry.'));
+        return;
+      }
+    }
+    res.writeHead(404); res.end();
+  });
   const remoteServer = https.createServer({ ...security.tls, minVersion: 'TLSv1.2' },
     (_, res) => { res.writeHead(404); res.end(); });
   const localWss = new WebSocketServer({ server: localServer, maxPayload: MAX_REQUEST, perMessageDeflate: false });
@@ -416,6 +451,7 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
   function stop() {
     if (stopPromise) return stopPromise;
     stopping = true;
+    clearTimeout(idleTimer); idleTimer = undefined;
     stopPromise = enqueue(async () => {
       const results = await Promise.allSettled([...sessions.values()].map(async s => {
         await terminateSession(s);
@@ -433,38 +469,31 @@ export async function startHost({ dataDir, port = 7768, address = '0.0.0.0' }) {
     });
     return stopPromise;
   }
-  return { ready: { type: 'ready', protocolVersion: 1,
+  updateIdle();
+  return { ready: { type: 'ready', protocolVersion: 1, buildId,
     localUrl: 'ws://127.0.0.1:' + localServer.address().port, remotePort, adminToken }, stop };
 }
 
 async function main() {
   const args = process.argv.slice(2), options = {};
   for (let i = 0; i < args.length; i += 2) {
-    if (!['--data-dir', '--port', '--address'].includes(args[i]) || args[i + 1] === undefined)
-      throw new Error('Usage: node src/server.mjs --data-dir <private-directory> [--port 7768] [--address 0.0.0.0]');
+    if (!['--data-dir', '--port', '--address', '--build-id'].includes(args[i]) || args[i + 1] === undefined)
+      throw new Error('Usage: node src/server.mjs --data-dir <private-directory> [--port 7768] [--address 0.0.0.0] [--build-id <string>]');
     options[args[i].slice(2)] = args[i + 1];
   }
   if (!options['data-dir']) throw new Error('--data-dir is required');
   const port = options.port === undefined ? 7768 : Number(options.port);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid --port');
-  const host = await startHost({ dataDir: resolve(options['data-dir']), port, address: options.address });
+  const host = await startHost({ dataDir: resolve(options['data-dir']), port, address: options.address, buildId: options['build-id'] });
   const shutdown = () => {
-    process.stdin.destroy();
     host.stop().then(() => { process.exitCode = 0; }, () => {
       console.error('Terminal cleanup failed; host retained for retry via terminal.close or shutdown signal.');
       process.exitCode = 1;
     });
   };
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
-  // Parent writes exactly "shutdown\\n"; EOF is also an explicit parent exit.
-  process.stdin.setEncoding('utf8');
-  let input = '';
-  process.stdin.on('data', chunk => {
-    input += chunk;
-    if (input.length > 1024) input = input.slice(-1024);
-    if (input.split(/\r?\n/).includes('shutdown')) shutdown();
-  });
-  process.stdin.once('end', shutdown);
+  // The detached host has no parent stdin; readiness is its only stdout write.
+  process.stdout.on('error', error => { if (error.code !== 'EPIPE') throw error; });
   process.stdout.write(JSON.stringify(host.ready) + '\n');
 }
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {

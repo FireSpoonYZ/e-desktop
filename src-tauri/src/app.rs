@@ -2316,7 +2316,6 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build e-desktop")
         .run(|app, event| {
-            if matches!(event, tauri::RunEvent::Exit) { app.state::<crate::terminal::TerminalHost>().shutdown(); }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 let state = app.state::<AppState>();
                 if !state.can_exit.load(Ordering::Acquire) {
